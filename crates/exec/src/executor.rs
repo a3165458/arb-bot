@@ -123,6 +123,17 @@ impl Executor {
         Some(total)
     }
 
+    /// 已结束仓位 `[from, until]` 内两条腿实际结算的资金费合计。任一家没接入或没查到就是 `None`。
+    pub(crate) async fn funding_window(
+        &self,
+        venues: &[Venue],
+        symbol: &arb_core::Symbol,
+        from: chrono::DateTime<Utc>,
+        until: chrono::DateTime<Utc>,
+    ) -> Option<Decimal> {
+        funding_window(&self.brokers, venues, symbol, from, until).await
+    }
+
     /// 这个场所账户现在的可用保证金（计价币）。没接入或查不到是 `None`：不知道不等于不够。
     pub async fn free_collateral(&self, venue: Venue) -> Option<Decimal> {
         match self.brokers.get(&venue)?.free_collateral().await {
@@ -281,6 +292,7 @@ impl Executor {
             realized_fee_usdt: Decimal::ZERO,
             realized_source: None,
             realized_funding_usdt: None,
+            funding_checked_at: None,
             closed_externally: false,
             entry_legs: None,
             pnl_unattributed: None,
@@ -465,12 +477,10 @@ impl Executor {
             .zip(position.short.as_ref())
             .map(|(long, short)| (long.average_price, short.average_price));
         let entry_notional = position.long.as_ref().map(|leg| leg.notional_usdt);
-        // 两腿都在时才查资金费：重试时只剩一条腿，只查那条会漏掉另一条的。
-        let funding_venues: Option<Vec<Venue>> = position
-            .long
-            .as_ref()
-            .zip(position.short.as_ref())
-            .map(|(long, short)| vec![long.venue, short.venue]);
+        // 资金费按开仓时的两条腿算（从台账历史找）：重试时只剩一条腿，只查那条会漏掉另一条的。
+        let funding_venues = position_venues(&self.ledger, position)
+            .await
+            .map_err(ArbError::from)?;
         // 对冲中的一腿平不掉时停手：继续平另一腿会把对冲变成裸敞口。
         let (failures, exits) = self.exit_legs(position, true).await?;
         if !failures.is_empty() {
@@ -489,11 +499,16 @@ impl Executor {
         position.status = PositionStatus::Closed;
         position.closed_at = Some(Utc::now());
         position.realized_source = Some(RealizedSource::Executor);
-        if let Some(venues) = funding_venues {
-            position.realized_funding_usdt = self
-                .funding_total(&venues, &position.symbol, position.opened_at)
-                .await;
-        }
+        // 只算 [开仓, 平仓] 窗口。刚结算完的那一笔两家的流水可能一前一后出现，这里的数是初值；
+        // 平仓后稍等一会儿由后台按同一窗口重新核对（[`crate::desk::recheck_funding`]）。
+        position.realized_funding_usdt = self
+            .funding_window(
+                &funding_venues,
+                &position.symbol,
+                position.opened_at,
+                position.closed_at.unwrap_or_else(Utc::now),
+            )
+            .await;
         position.note = Some(realized_note(
             position,
             entry_prices,
@@ -946,6 +961,70 @@ fn side_label(side: Side) -> &'static str {
 
 /// 平仓后的备注：按实际成交算的已实现盈亏（含全部手续费，不含资金费），以及开、平仓
 /// 两次的成交价差 —— 不再用标记价的纸面数。
+/// 一笔仓位开过腿的全部场所（按台账历史找）。平仓重试、外部平仓时当前记录里可能只剩一条腿、
+/// 甚至一条都不剩；资金费必须按开仓时的两条腿算，否则会漏掉已经平掉那条腿的收付。
+pub async fn position_venues(
+    ledger: &Ledger,
+    position: &PairPosition,
+) -> std::io::Result<Vec<Venue>> {
+    let mut venues = Vec::new();
+    let mut add = |venue: Venue| {
+        if !venues.contains(&venue) {
+            venues.push(venue);
+        }
+    };
+    for record in ledger.position_history(&position.id).await? {
+        for leg in [record.long, record.short].into_iter().flatten() {
+            add(leg.venue);
+        }
+        if let Some(entry) = record.entry_legs {
+            add(entry.long.venue);
+            add(entry.short.venue);
+        }
+    }
+    for leg in [position.long.as_ref(), position.short.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        add(leg.venue);
+    }
+    if let Some(entry) = &position.entry_legs {
+        add(entry.long.venue);
+        add(entry.short.venue);
+    }
+    Ok(venues)
+}
+
+/// `venues` 在 `[from, until]` 内结算的资金费合计。任何一家没连上、没接入或没查到
+/// 就返回 `None`：不能拿只查到的一部分冒充合计。少于两家也是 `None`（对冲仓位一定有两条腿）。
+pub async fn funding_window(
+    brokers: &HashMap<Venue, Arc<dyn Broker>>,
+    venues: &[Venue],
+    symbol: &arb_core::Symbol,
+    from: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> Option<Decimal> {
+    if venues.len() < 2 {
+        return None;
+    }
+    let mut total = Decimal::ZERO;
+    for venue in venues {
+        match brokers
+            .get(venue)?
+            .funding_between(symbol, from, until)
+            .await
+        {
+            Ok(Some(funding)) => total += funding.usdt,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(%venue, %symbol, "资金费流水没查成：{error}");
+                return None;
+            }
+        }
+    }
+    Some(total)
+}
+
 fn realized_note(
     position: &PairPosition,
     entry_prices: Option<(Decimal, Decimal)>,
@@ -1230,6 +1309,7 @@ mod tests {
             realized_fee_usdt: Decimal::ZERO,
             realized_source: None,
             realized_funding_usdt: None,
+            funding_checked_at: None,
             closed_externally: false,
             entry_legs: None,
             pnl_unattributed: None,
@@ -1285,6 +1365,7 @@ mod tests {
             realized_fee_usdt: Decimal::ZERO,
             realized_source: None,
             realized_funding_usdt: None,
+            funding_checked_at: None,
             closed_externally: false,
             entry_legs: None,
             pnl_unattributed: None,
@@ -1380,6 +1461,7 @@ mod tests {
             realized_fee_usdt: Decimal::ZERO,
             realized_source: None,
             realized_funding_usdt: None,
+            funding_checked_at: None,
             closed_externally: false,
             entry_legs: None,
             pnl_unattributed: None,
@@ -1574,6 +1656,7 @@ mod tests {
             realized_fee_usdt: Decimal::ZERO,
             realized_source: None,
             realized_funding_usdt: None,
+            funding_checked_at: None,
             closed_externally: false,
             entry_legs: None,
             pnl_unattributed: None,
@@ -1865,6 +1948,7 @@ mod tests {
             realized_fee_usdt: Decimal::ZERO,
             realized_source: None,
             realized_funding_usdt: None,
+            funding_checked_at: None,
             closed_externally: false,
             entry_legs: None,
             pnl_unattributed: None,

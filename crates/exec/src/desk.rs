@@ -966,24 +966,20 @@ pub async fn adopt_external_closes(
             .zip(position.short.clone())
             .map(|(long, short)| crate::EntryLegs { long, short });
         position.closed_externally = true;
-        let mut funding = Decimal::ZERO;
-        let mut funding_known = true;
-        for leg in [position.long.as_ref(), position.short.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            match brokers.get(&leg.venue) {
-                Some(broker) => match broker
-                    .funding_since(&position.symbol, position.opened_at)
-                    .await
-                {
-                    Ok(Some(total)) => funding += total.usdt,
-                    _ => funding_known = false,
-                },
-                None => funding_known = false,
-            }
-        }
+        // 资金费按开仓时的两条腿算：平仓重试中只剩一条腿时，另一条（已经平掉的）也要算。
+        // 2026-10-02 PONS 就是只算了剩下的 arcus，漏掉了 lighter-rh 付出的 2.83 USDT。
+        let venues = crate::executor::position_venues(ledger, &position).await?;
         let now = chrono::Utc::now();
+        let funding = crate::executor::funding_window(
+            brokers,
+            &venues,
+            &position.symbol,
+            position.opened_at,
+            now,
+        )
+        .await;
+        let funding_known = funding.is_some();
+        let funding = funding.unwrap_or_default();
         position.realized_funding_usdt = funding_known.then_some(funding);
         position.note = Some(format!(
             "在交易所外部平仓：{} 对账发现两腿都已没有仓位，台账据此结束这笔。实际盈亏稍后按交易所的成交记录核算；开仓以来资金费{}",
@@ -1227,24 +1223,20 @@ pub async fn settle_closed_from_fills(
         Ok(settlement) => settlement,
         Err(reason) => return Ok(SettleOutcome::Retry(reason)),
     };
-    let funding = match position.realized_funding_usdt {
+    // 资金费按开仓时的两条腿、[开仓, 平仓] 窗口重新查：不沿用识别外部平仓时记下的数
+    // （那时可能只查了一条腿、或没有截止时间）。查不到时才退回那个数。
+    let venues = [entry.long.venue, entry.short.venue];
+    let funding = match crate::executor::funding_window(
+        brokers,
+        &venues,
+        &position.symbol,
+        position.opened_at,
+        until,
+    )
+    .await
+    {
         Some(funding) => Some(funding),
-        None => {
-            let mut total = Some(Decimal::ZERO);
-            for leg in [&entry.long, &entry.short] {
-                total = match (total, brokers.get(&leg.venue)) {
-                    (Some(sum), Some(broker)) => match broker
-                        .funding_since(&position.symbol, position.opened_at)
-                        .await
-                    {
-                        Ok(Some(funding)) => Some(sum + funding.usdt),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-            }
-            total
-        }
+        None => position.realized_funding_usdt,
     };
     let mut settled = position.clone();
     settled.realized_pnl_usdt = settlement.price_pnl_usdt();
@@ -1285,6 +1277,96 @@ pub async fn mark_pnl_unattributed(
         .append(&crate::Record::Position(Box::new(marked)))
         .await?;
     Ok(())
+}
+
+/// 平仓后等多久再核对资金费：两家结算流水出现的时间可能差几十秒到几分钟。
+pub const FUNDING_RECHECK_AFTER: chrono::Duration = chrono::Duration::minutes(10);
+
+/// 一次资金费核对的结果。
+#[derive(Debug, Clone, PartialEq)]
+pub enum FundingCheck {
+    /// 还没到时候、已经核对过、或不是已平仓的实盘仓位。
+    NotDue,
+    /// 与台账一致，只记下核对时刻。
+    Confirmed,
+    /// 不一致，已更正：（旧值, 新值）。
+    Corrected(Option<Decimal>, Decimal),
+    /// 这次查不到（场所没连上 / 流水没查成），下次再试，台账不动。
+    Unavailable,
+}
+
+/// 已平仓仓位的资金费事后核对：按开仓时的两条腿、[开仓, 平仓] 窗口重新查交易所流水。
+///
+/// 一致就只追加一条带 `funding_checked_at` 的记录；不一致就追加更正记录（重放取最新），
+/// 并在备注里写明旧值、新值与修正后的净额。只追加，不改写任何旧行。**只读交易所、不下单。**
+///
+/// `force`：已经核对过的也再核一次（修正历史记录时用）。
+pub async fn recheck_funding(
+    ledger: &Ledger,
+    brokers: &HashMap<Venue, Arc<dyn Broker>>,
+    position: &PairPosition,
+    now: chrono::DateTime<chrono::Utc>,
+    force: bool,
+) -> Result<FundingCheck> {
+    let Some(closed_at) = position.closed_at else {
+        return Ok(FundingCheck::NotDue);
+    };
+    // 只核有两条腿成交的已平仓仓位：回滚掉的（Unwound）和外部平仓还没核算出价格盈亏的不核。
+    if position.status != PositionStatus::Closed
+        || position.realized_source.is_none()
+        || (!force && position.funding_checked_at.is_some())
+        || (!force && now < closed_at + FUNDING_RECHECK_AFTER)
+    {
+        return Ok(FundingCheck::NotDue);
+    }
+    let venues = crate::executor::position_venues(ledger, position).await?;
+    let Some(actual) = crate::executor::funding_window(
+        brokers,
+        &venues,
+        &position.symbol,
+        position.opened_at,
+        closed_at,
+    )
+    .await
+    else {
+        return Ok(FundingCheck::Unavailable);
+    };
+    let actual = actual.round_dp(9);
+    let mut checked = position.clone();
+    checked.funding_checked_at = Some(now);
+    let previous = position.realized_funding_usdt;
+    // 小于 0.0001 USDT 的差异是小数位舍入，不算不一致。
+    let same = previous.is_some_and(|old| (old - actual).abs() < Decimal::new(1, 4));
+    let outcome = if same {
+        FundingCheck::Confirmed
+    } else {
+        checked.realized_funding_usdt = Some(actual);
+        let net = |funding: Decimal| {
+            (position.realized_pnl_usdt - position.realized_fee_usdt + funding)
+                .round_dp(4)
+                .normalize()
+        };
+        let correction = format!(
+            "资金费已按交易所流水更正（{} 核对，两条腿、开仓至平仓）：{} → {} USDT，净额 {} → {} USDT",
+            now.format("%Y-%m-%d %H:%M UTC"),
+            previous.map_or("未知".to_string(), |old| old
+                .round_dp(4)
+                .normalize()
+                .to_string()),
+            actual.round_dp(4).normalize(),
+            previous.map_or("未知".to_string(), |old| net(old).to_string()),
+            net(actual),
+        );
+        checked.note = Some(match &position.note {
+            Some(note) if !note.is_empty() => format!("{note}；{correction}"),
+            _ => correction,
+        });
+        FundingCheck::Corrected(previous, actual)
+    };
+    ledger
+        .append(&crate::Record::Position(Box::new(checked)))
+        .await?;
+    Ok(outcome)
 }
 
 /// 仓位两条腿涉及的场所。
@@ -2311,6 +2393,7 @@ mod tests {
                 realized_fee_usdt: Decimal::ZERO,
                 realized_source: None,
                 realized_funding_usdt: None,
+                funding_checked_at: None,
                 closed_externally: false,
                 entry_legs: None,
                 pnl_unattributed: None,
@@ -2557,6 +2640,7 @@ mod tests {
                 realized_fee_usdt: Decimal::ZERO,
                 realized_source: None,
                 realized_funding_usdt: None,
+                funding_checked_at: None,
                 closed_externally: false,
                 entry_legs: None,
                 pnl_unattributed: None,
@@ -2895,7 +2979,14 @@ mod tests {
         struct Venue_ {
             venue: Venue,
             fills: Option<Vec<VenueFill>>,
-            funding: Decimal,
+            /// 资金费流水（时刻, 金额）。旧用例只给一个总数：放在开仓后第 30 秒一笔。
+            funding: Vec<(chrono::DateTime<chrono::Utc>, Decimal)>,
+            /// 资金费流水查询失败。
+            funding_down: bool,
+        }
+
+        fn flow(total: Decimal) -> Vec<(chrono::DateTime<chrono::Utc>, Decimal)> {
+            vec![(at(30), total)]
         }
 
         #[async_trait]
@@ -2924,13 +3015,18 @@ mod tests {
             async fn funding_since(
                 &self,
                 _: &Symbol,
-                _: chrono::DateTime<chrono::Utc>,
+                since: chrono::DateTime<chrono::Utc>,
             ) -> ArbResult<Option<crate::broker::FundingTotal>> {
-                Ok(Some(crate::broker::FundingTotal {
-                    usdt: self.funding,
-                    payments: 3,
-                    last_at: None,
-                }))
+                if self.funding_down {
+                    return Err(arb_core::ArbError::venue(
+                        self.venue.as_str(),
+                        "流水查询超时",
+                    ));
+                }
+                Ok(Some(crate::broker::FundingTotal::from_rows(
+                    self.funding.clone(),
+                    since,
+                )))
             }
             async fn fills_between(
                 &self,
@@ -2988,6 +3084,7 @@ mod tests {
                 realized_fee_usdt: Decimal::ZERO,
                 realized_source: None,
                 realized_funding_usdt: None,
+                funding_checked_at: None,
                 closed_externally: false,
                 entry_legs: None,
                 pnl_unattributed: None,
@@ -3025,7 +3122,8 @@ mod tests {
                     Arc::new(Venue_ {
                         venue: Venue::LighterRh,
                         fills: long_fills,
-                        funding: dec!(-0.5410),
+                        funding: flow(dec!(-0.5410)),
+                        funding_down: false,
                     }) as Arc<dyn Broker>,
                 ),
                 (
@@ -3033,7 +3131,8 @@ mod tests {
                     Arc::new(Venue_ {
                         venue: Venue::Arcus,
                         fills: short_fills,
-                        funding: dec!(0.7096),
+                        funding: flow(dec!(0.7096)),
+                        funding_down: false,
                     }) as Arc<dyn Broker>,
                 ),
             ])
@@ -3437,6 +3536,231 @@ mod tests {
             }
             let _ = tokio::fs::remove_file(&path).await;
         }
+
+        /// 资金费流水：开仓前、窗口内、平仓后（下一笔同合约仓位）各有结算。
+        fn windowed(venue: Venue, rows: &[(u32, Decimal)], down: bool) -> (Venue, Arc<dyn Broker>) {
+            (
+                venue,
+                Arc::new(Venue_ {
+                    venue,
+                    fills: None,
+                    funding: rows
+                        .iter()
+                        .map(|(sec, amount)| (at(*sec), *amount))
+                        .collect(),
+                    funding_down: down,
+                }) as Arc<dyn Broker>,
+            )
+        }
+
+        #[tokio::test]
+        async fn funding_between_counts_only_the_window_including_its_last_instant() {
+            let (_, broker) = windowed(
+                Venue::Arcus,
+                &[(0, dec!(100)), (10, dec!(1)), (20, dec!(2)), (21, dec!(50))],
+                false,
+            );
+            let symbol = Symbol::perp("PONS", "USDT");
+            let total = broker
+                .funding_between(&symbol, at(5), at(20))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (total.usdt, total.payments),
+                (dec!(3), 2),
+                "开仓前与平仓后的都不算，恰好在平仓那一刻的算"
+            );
+            assert_eq!(
+                total.last_at, None,
+                "窗口之后还有结算时，窗口内最后一笔的时刻未知"
+            );
+            let tail = broker
+                .funding_between(&symbol, at(15), at(59))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!((tail.usdt, tail.last_at), (dec!(52), Some(at(21))));
+        }
+
+        /// 2026-10-02 PONS：平仓重试时台账里只剩 arcus 一条腿，lighter-rh 已经平掉。资金费必须仍按两条腿算，
+        /// 而且不能把之后同合约仓位的结算算进来。
+        #[tokio::test]
+        async fn funding_uses_both_entry_legs_and_stops_at_the_close() {
+            let (ledger, path) = ledger("funding-legs").await;
+            let open = open_position();
+            ledger
+                .append(&crate::Record::Position(Box::new(open.clone())))
+                .await
+                .unwrap();
+            let mut closing = open.clone();
+            closing.long = None; // lighter-rh 已平，arcus 还在重试
+            closing.status = PositionStatus::Closing;
+            ledger
+                .append(&crate::Record::Position(Box::new(closing.clone())))
+                .await
+                .unwrap();
+            let brokers = HashMap::from([
+                windowed(
+                    Venue::LighterRh,
+                    &[(30, dec!(-2.829355)), (58, dec!(-9))],
+                    false,
+                ),
+                windowed(Venue::Arcus, &[(30, dec!(6.622370)), (58, dec!(9))], false),
+            ]);
+            let venues = crate::executor::position_venues(&ledger, &closing)
+                .await
+                .unwrap();
+            assert_eq!(venues.len(), 2, "已平掉的腿也要从历史里找回来：{venues:?}");
+            let funding = crate::executor::funding_window(
+                &brokers,
+                &venues,
+                &closing.symbol,
+                closing.opened_at,
+                at(50),
+            )
+            .await;
+            assert_eq!(funding, Some(dec!(3.793015)));
+            // 只有一家的流水：不知道就是不知道，不拿一条腿冒充合计。
+            let one = crate::executor::funding_window(
+                &brokers,
+                &[Venue::Arcus],
+                &closing.symbol,
+                at(0),
+                at(50),
+            )
+            .await;
+            assert_eq!(one, None);
+            // 外部平仓识别：两条腿、截止到识别时刻之前的结算都算上（这里窗口到「现在」之前的 58 秒那笔也在内，
+            // 识别时还不知道真正的平仓时刻；事后核对按平仓时刻截）。
+            let adopted =
+                adopt_external_closes(&ledger, &brokers, &[&closing], &[closing.id.clone()])
+                    .await
+                    .unwrap();
+            assert!(
+                adopted[0].realized_funding_usdt.is_some(),
+                "两家都查得到就不该是未知"
+            );
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        /// 2026-09-30 LIT：平仓那一刻 arcus 已经出了最后一笔、lighter-rh 还没出。事后按同一窗口重查，
+        /// 不一致就追加更正（只追加、不改旧行），一致就只记核对时刻；查不到就什么都不写。
+        #[tokio::test]
+        async fn a_closed_position_is_rechecked_once_and_corrected_append_only() {
+            let (ledger, path) = ledger("funding-recheck").await;
+            let mut closed = open_position();
+            closed.status = PositionStatus::Closed;
+            closed.closed_at = Some(at(40));
+            closed.realized_source = Some(crate::RealizedSource::Executor);
+            closed.realized_pnl_usdt = dec!(0.915308);
+            closed.realized_fee_usdt = dec!(1.352440077);
+            closed.realized_funding_usdt = Some(dec!(0.586956679));
+            closed.note = Some("已实现盈亏 0.1498 USDT".into());
+            ledger
+                .append(&crate::Record::Position(Box::new(open_position())))
+                .await
+                .unwrap();
+            ledger
+                .append(&crate::Record::Position(Box::new(closed.clone())))
+                .await
+                .unwrap();
+            let brokers = HashMap::from([
+                windowed(
+                    Venue::LighterRh,
+                    &[(10, dec!(-1.078742)), (39, dec!(-0.207642))],
+                    false,
+                ),
+                windowed(
+                    Venue::Arcus,
+                    &[(10, dec!(1.547093388)), (39, dec!(0.118605612))],
+                    false,
+                ),
+            ]);
+            let soon = at(40) + chrono::Duration::minutes(1);
+            assert_eq!(
+                recheck_funding(&ledger, &brokers, &closed, soon, false)
+                    .await
+                    .unwrap(),
+                FundingCheck::NotDue,
+                "平仓后要等一会儿，两家的流水才都出来"
+            );
+            let later = at(40) + FUNDING_RECHECK_AFTER;
+            let outcome = recheck_funding(&ledger, &brokers, &closed, later, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                FundingCheck::Corrected(Some(dec!(0.586956679)), dec!(0.379315))
+            );
+            let lines = tokio::fs::read_to_string(&path).await.unwrap();
+            assert_eq!(lines.lines().count(), 3, "只追加一行，旧行原样保留");
+            assert!(lines.contains("0.586956679"));
+            let (replayed, _) = ledger.replay().await.unwrap();
+            let fixed = &replayed.positions["pons"];
+            assert_eq!(fixed.realized_funding_usdt, Some(dec!(0.379315)));
+            assert_eq!(fixed.funding_checked_at, Some(later));
+            assert_eq!(
+                (fixed.realized_pnl_usdt, fixed.realized_fee_usdt),
+                (closed.realized_pnl_usdt, closed.realized_fee_usdt)
+            );
+            let note = fixed.note.as_deref().unwrap();
+            assert!(
+                note.starts_with("已实现盈亏 0.1498 USDT；资金费已按交易所流水更正"),
+                "{note}"
+            );
+            assert!(
+                note.contains("0.587 → 0.3793") && note.contains("0.1498 → -0.0578"),
+                "{note}"
+            );
+            // 核过一次就不再核（除非 force）；force 时一致只记时刻。
+            assert_eq!(
+                recheck_funding(&ledger, &brokers, fixed, later, false)
+                    .await
+                    .unwrap(),
+                FundingCheck::NotDue
+            );
+            assert_eq!(
+                recheck_funding(&ledger, &brokers, fixed, later, true)
+                    .await
+                    .unwrap(),
+                FundingCheck::Confirmed
+            );
+            // 流水查不到：不写任何东西，下次再试。
+            let down = HashMap::from([
+                windowed(Venue::LighterRh, &[], true),
+                windowed(Venue::Arcus, &[(10, dec!(1))], false),
+            ]);
+            let before = tokio::fs::read_to_string(&path)
+                .await
+                .unwrap()
+                .lines()
+                .count();
+            assert_eq!(
+                recheck_funding(&ledger, &down, &closed, later, true)
+                    .await
+                    .unwrap(),
+                FundingCheck::Unavailable
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(&path)
+                    .await
+                    .unwrap()
+                    .lines()
+                    .count(),
+                before
+            );
+            // 回滚掉的、还没核算出价格盈亏的外部平仓：不核。
+            let mut unattributed = closed.clone();
+            unattributed.realized_source = None;
+            assert_eq!(
+                recheck_funding(&ledger, &brokers, &unattributed, later, true)
+                    .await
+                    .unwrap(),
+                FundingCheck::NotDue
+            );
+            let _ = tokio::fs::remove_file(&path).await;
+        }
     }
 
     #[test]
@@ -3773,6 +4097,7 @@ mod tests {
                 realized_fee_usdt: Decimal::ZERO,
                 realized_source: None,
                 realized_funding_usdt: None,
+                funding_checked_at: None,
                 closed_externally: false,
                 entry_legs: None,
                 pnl_unattributed: None,
@@ -4072,6 +4397,7 @@ mod tests {
                 realized_fee_usdt: Decimal::ZERO,
                 realized_source: None,
                 realized_funding_usdt: None,
+                funding_checked_at: None,
                 closed_externally: false,
                 entry_legs: None,
                 pnl_unattributed: None,

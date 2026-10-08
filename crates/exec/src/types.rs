@@ -409,6 +409,11 @@ pub struct PairPosition {
     /// 持仓期间交易所实际结算的资金费（正 = 收到）。没查到时为 `None`。
     #[serde(default)]
     pub realized_funding_usdt: Option<Decimal>,
+    /// 平仓后按 [开仓, 平仓] 窗口、两条腿重新核对过资金费的时刻。`None` = 还没核对（包括旧台账）。
+    /// 平仓那一刻两家的流水可能一前一后出现（2026-09-30 LIT：arcus 已经有第 8 笔、lighter-rh 还没有），
+    /// 所以平仓后稍等再查一次，数不同就更正。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding_checked_at: Option<DateTime<Utc>>,
     /// 这笔是在交易所被外部（手动）平掉的，台账只是事后发现并结束它。
     #[serde(default)]
     pub closed_externally: bool,
@@ -593,6 +598,7 @@ mod tests {
             realized_fee_usdt: Decimal::ZERO,
             realized_source: None,
             realized_funding_usdt: None,
+            funding_checked_at: None,
             closed_externally: false,
             entry_legs: None,
             pnl_unattributed: None,
@@ -649,6 +655,7 @@ mod tests {
             realized_fee_usdt: Decimal::ZERO,
             realized_source: None,
             realized_funding_usdt: None,
+            funding_checked_at: None,
             closed_externally: false,
             entry_legs: None,
             pnl_unattributed: None,

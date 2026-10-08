@@ -113,6 +113,33 @@ pub trait Broker: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// 这个账户在这个合约上 `[from, until]` 内实际收付的资金费。
+    ///
+    /// 已平仓的仓位必须用它而不是 [`Broker::funding_since`]：流水按（账户, 合约）记，
+    /// 之后在同一合约上开的仓位的资金费也会被「自开仓以来」算进来。
+    /// 默认实现 = 自 `from` 起的合计 − 自 `until` 之后的合计，对所有接入了流水的场所都成立。
+    async fn funding_between(
+        &self,
+        symbol: &Symbol,
+        from: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> ArbResult<Option<FundingTotal>> {
+        let Some(all) = self.funding_since(symbol, from).await? else {
+            return Ok(None);
+        };
+        // 恰好落在 `until` 的那一笔属于窗口内：从它之后 1 毫秒开始算「之后」。
+        let after = self
+            .funding_since(symbol, until + chrono::Duration::milliseconds(1))
+            .await?
+            .ok_or_else(|| {
+                arb_core::ArbError::venue(
+                    self.venue().as_str(),
+                    "资金费流水第二次查询返回未接入，窗口合计不可信",
+                )
+            })?;
+        Ok(Some(all.minus(&after)))
+    }
+
     /// 这条腿在交易所**实际**的保证金与强平价。
     ///
     /// 台账里记的是开仓时的保证金（名义 ÷ 杠杆）；之后在交易所补保证金、调杠杆、亏损吃掉
@@ -227,6 +254,21 @@ impl FundingTotal {
             total.last_at = total.last_at.max(Some(at));
         }
         total
+    }
+
+    /// `self` 是自某时刻起的合计、`later` 是更晚时刻起的合计：两者之差就是中间那一段。
+    pub fn minus(&self, later: &Self) -> Self {
+        let payments = self.payments.saturating_sub(later.payments);
+        Self {
+            usdt: self.usdt - later.usdt,
+            payments,
+            // 窗口之后没有结算时，最近一笔就在窗口内；否则窗口内的最后一笔时刻未知。
+            last_at: if later.payments == 0 && payments > 0 {
+                self.last_at
+            } else {
+                None
+            },
+        }
     }
 }
 

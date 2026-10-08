@@ -1119,6 +1119,7 @@ mod tests {
             realized_fee_usdt: Decimal::ZERO,
             realized_source: None,
             realized_funding_usdt: None,
+            funding_checked_at: None,
             closed_externally: false,
             entry_legs: None,
             pnl_unattributed: None,

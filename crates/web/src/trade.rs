@@ -284,6 +284,8 @@ type FundingResult = Result<Option<FundingTotal>, String>;
 /// 资金费流水缓存多久。结算是按小时的；后台每隔这么久为实盘持仓刷新一次，持仓页
 /// 打开时读缓存，不必等。Lighter 查一次要先拉市场表，RH 部署限频紧，别查得太勤。
 const FUNDING_CACHE_TTL: Duration = Duration::from_secs(300);
+/// 每轮最多核对几笔已平仓仓位的资金费：每笔每条腿要查两次流水，Lighter RH 按出口 IP 限频极紧。
+const FUNDING_RECHECKS_PER_ROUND: usize = 2;
 
 /// 一条腿开仓以来实际收付的资金费。
 #[derive(Debug, Clone, Serialize)]
@@ -508,6 +510,53 @@ impl LiveDesk {
     /// 补算已平仓仓位的实际盈亏（外部平仓的，和早于逐笔记账上线、当时没记下的）：按交易所的
     /// 成交记录核，数量逐腿对上才记。**只读交易所、不下单。**
     /// 每次调用对每笔待核算的仓位试一次；连续 [`PNL_ATTEMPTS`] 次都不行就把原因记进台账。
+    /// 平仓 [`desk::FUNDING_RECHECK_AFTER`] 之后，按两条腿、[开仓, 平仓] 窗口重新核对已平仓仓位的
+    /// 资金费；不一致就追加更正记录并推送。**只读交易所、不下单。** 调用方必须已持有 `self.lock`。
+    async fn recheck_closed_funding(&self) {
+        let replayed = match self.ledger.replay().await {
+            Ok((replayed, _)) => replayed,
+            Err(error) => {
+                warn!("核对资金费时读不了实盘台账：{error}");
+                return;
+            }
+        };
+        let now = chrono::Utc::now();
+        let mut due: Vec<&PairPosition> = replayed
+            .positions
+            .values()
+            .filter(|position| {
+                position.status == arb_exec::PositionStatus::Closed
+                    && position.realized_source.is_some()
+                    && position.funding_checked_at.is_none()
+            })
+            .collect();
+        due.sort_by_key(|position| position.closed_at);
+        // 每轮最多核几笔：每笔每条腿要查两次流水，Lighter RH 按出口 IP 限频极紧，一次打太多会让
+        // 场所进入冷却、连带实盘的对账与查询一起失败。其余的下一轮（约 5 分钟后）再核。
+        for position in due.into_iter().take(FUNDING_RECHECKS_PER_ROUND) {
+            match desk::recheck_funding(&self.ledger, &self.brokers, position, now, false).await {
+                Ok(desk::FundingCheck::Corrected(old, new)) => {
+                    warn!(position = %position.id, ?old, %new, "已平仓仓位的资金费与交易所流水不一致，已更正");
+                    self.alerts.notify_always(format!(
+                        "🧾 {} {} 的资金费已按交易所流水更正：{} → {} USDT（两条腿、开仓至平仓）",
+                        position.id,
+                        position.symbol,
+                        old.map_or("未知".to_string(), |old| old
+                            .round_dp(4)
+                            .normalize()
+                            .to_string()),
+                        new.round_dp(4).normalize()
+                    ));
+                }
+                Ok(desk::FundingCheck::Confirmed) => {
+                    info!(position = %position.id, "已平仓仓位的资金费已与交易所流水核对一致");
+                }
+                Ok(desk::FundingCheck::Unavailable | desk::FundingCheck::NotDue) => {}
+                Err(error) => warn!(position = %position.id, "核对资金费失败：{error:#}"),
+            }
+        }
+    }
+
     async fn backfill_external_pnl(&self) {
         let replayed = match self.ledger.replay().await {
             Ok((replayed, _)) => replayed,
@@ -974,6 +1023,7 @@ impl Trade {
                 // 所以要占交易台的锁：不和下单、规则轮同时追加，停机排空也会等它写完。忙就跳过，下个周期再来。
                 if let Ok(_guard) = live.lock.try_lock() {
                     live.backfill_external_pnl().await;
+                    live.recheck_closed_funding().await;
                 }
                 // 比缓存有效期略短：页面读到的永远是后台刚刷新过的。
                 tokio::time::sleep(FUNDING_CACHE_TTL - Duration::from_secs(10)).await;
