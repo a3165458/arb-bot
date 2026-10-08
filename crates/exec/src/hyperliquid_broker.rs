@@ -2035,12 +2035,18 @@ fn now_ms() -> ArbResult<u64> {
 
 fn next_nonce() -> ArbResult<u64> {
     let now = now_ms()?;
-    let previous = NONCE
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
-            old.checked_add(1).map(|next| next.max(now))
-        })
-        .map_err(|_| error("nonce overflow"))?;
-    Ok((previous + 1).max(now))
+    // compare_exchange 循环：fetch_update 在新版本里已弃用，try_update 又高于最低支持版本（1.88）。
+    let mut previous = NONCE.load(Ordering::SeqCst);
+    loop {
+        let next = previous
+            .checked_add(1)
+            .map(|next| next.max(now))
+            .ok_or_else(|| error("nonce overflow"))?;
+        match NONCE.compare_exchange(previous, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Ok(next),
+            Err(actual) => previous = actual,
+        }
+    }
 }
 
 fn client_cloid(id: &ClientOrderId) -> String {
@@ -2117,7 +2123,7 @@ fn decode_hex<const N: usize>(value: &str) -> ArbResult<[u8; N]> {
         }
     }
     let mut out = [0u8; N];
-    for (index, pair) in raw.chunks_exact(2).enumerate() {
+    for (index, pair) in raw.as_chunks::<2>().0.iter().enumerate() {
         out[index] = digit(pair[0])? * 16 + digit(pair[1])?;
     }
     Ok(out)

@@ -2234,7 +2234,7 @@ fn decode_hex<const N: usize>(raw: &str) -> ArbResult<[u8; N]> {
             .ok_or_else(|| err("不是十六进制"))
     };
     let mut out = [0u8; N];
-    for (index, pair) in hex.chunks_exact(2).enumerate() {
+    for (index, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
         out[index] = digit(pair[0])? << 4 | digit(pair[1])?;
     }
     Ok(out)

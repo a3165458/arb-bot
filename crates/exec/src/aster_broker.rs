@@ -1422,7 +1422,7 @@ fn decode_hex(value: &str, expected_len: usize) -> ArbResult<Vec<u8>> {
         }
     }
     let mut out = Vec::with_capacity(expected_len);
-    for pair in raw.chunks_exact(2) {
+    for pair in raw.as_chunks::<2>().0 {
         out.push((digit(pair[0])? << 4) | digit(pair[1])?);
     }
     Ok(out)
