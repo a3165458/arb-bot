@@ -24,7 +24,8 @@ function harness(storage = new Map()) {
       state, RULE_FIELDS, positionRuleForm, positionRulesEditor, ruleFields,
       rememberPositionRuleValues, rulePreferenceKey, ruleDraftKey, wirePositionRules,
       savePositionRules, saveStrategyParams, tradeBody, marginModeError, ruleFormError,
-      pnlSummary, bookExitText, rhRow, rhStatus, renderRhSpread,
+      pnlSummary, bookExitText, rhRow, rhStatus, renderRhSpread, rhOrderTarget, rhOriginNote, openRhInStrategy,
+      mockShowPage(fn) { showPage = fn; },
       mockApi(fn) { api = fn; },
       mockRefresh(fn) { loadPositions = fn; },
     };
@@ -318,4 +319,44 @@ test('RH spread rows show normal basis, direction, both net figures and honest w
   assert.match(app.rhStatus({ ...line, note: 'Arcus 盘口 20 秒没更新，不计算' }, view), /没更新/);
   const noNormal = app.rhRow({ ...line, normal: null, z: null, long_arcus: { ...leg, net_to_normal_pct: null }, best: { ...line.best, signal: false, net_usdt: null } }, view);
   assert.doesNotMatch(noNormal, /rh-signal/);
+});
+
+test('clicking an RH spread row opens the spread order form with the depth-chosen direction and a back-to-normal target', () => {
+  const { app } = harness();
+  const leg = { entry_pct: '0.17324', exit_cross_pct: '0.018', net_to_zero_pct: '0.11', net_to_normal_pct: '0.04' };
+  const line = {
+    base: 'NVDA', session: 'rth', basis_pct: '-0.196',
+    normal: { median: -0.111645, minutes: 1297 }, long_arcus: leg, long_lighter: null,
+    best: { direction: 'long_arcus', signal: false },
+  };
+  // 多 Arcus / 空 RH：持仓基差 = 空 − 多 = RH − Arcus = −(RH 页基差)，所以目标是 −中位数。
+  const order = plain(app.rhOrderTarget(line));
+  assert.deepEqual(
+    [order.symbol, order.long, order.short, order.target, order.negativeEntry],
+    ['NVDA/USDT', 'arcus', 'lighter-rh', '0.112', false],
+  );
+  const reverse = app.rhOrderTarget({ ...line, long_arcus: null, long_lighter: leg, best: { direction: 'long_lighter' } });
+  assert.deepEqual([reverse.long, reverse.short, reverse.target], ['lighter-rh', 'arcus', '-0.112']);
+  // 没有正常样本：不带目标；目标超出规则允许的 ±5% 也不带（不截断）。
+  assert.equal(app.rhOrderTarget({ ...line, normal: null }).target, null);
+  assert.equal(app.rhOrderTarget({ ...line, normal: { median: 7 } }).target, null);
+  // 可成交价差不为正：提前说明预览会被拒绝。
+  const negative = app.rhOrderTarget({ ...line, long_arcus: { ...leg, entry_pct: '-0.05' } });
+  assert.ok(negative.negativeEntry);
+  assert.match(app.rhOriginNote(negative), /预览会被拒绝/);
+
+  let shown = null;
+  app.mockShowPage((page) => { shown = page; });
+  app.state.strategy.view = 'funding';
+  app.state.strategy.form.basisExit = { on: false, value: '0.1' };
+  app.openRhInStrategy(line);
+  const s = app.state.strategy;
+  assert.equal(shown, 'strategy');
+  assert.deepEqual([s.view, s.a, s.b, s.userPicked], ['spread', 'arcus', 'lighter-rh', true]);
+  assert.deepEqual([s.selected.symbol, s.selected.long, s.selected.short], ['NVDA/USDT', 'arcus', 'lighter-rh']);
+  assert.deepEqual(plain(s.form.basisExit), { on: true, value: '0.112' });
+  assert.equal(app.ruleFields(s.form, 'spread').basis_exit, '0.112');
+  assert.match(app.rhOriginNote(s.selected.fromRh), /0\.112%/);
+  // 打开下单界面不会发任何请求、不会下单：只切页面和表单。
+  assert.equal(app.state.trade.preview, null);
 });

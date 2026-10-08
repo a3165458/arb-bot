@@ -1010,7 +1010,10 @@ async function loadPairs({ quiet = false } = {}) {
   // 也保留 —— 开仓计划按合约现算，不依赖它在不在表里；场所换了才清掉。
   if (s.selected) {
     const row = s.board.rows.find((r) => String(r.symbol) === s.selected.symbol);
-    if (row && row.long && row.short) {
+    if (s.selected.fromRh) {
+      // 从 RH 价差页带来的方向是按两边深度、对照正常基差选的，不被标记价方向覆盖；场所换了才清掉。
+      if (![s.a, s.b].includes(s.selected.long) || ![s.a, s.b].includes(s.selected.short)) s.selected = null;
+    } else if (row && row.long && row.short) {
       s.selected = { symbol: String(row.symbol), long: row.long, short: row.short };
     } else if (![s.a, s.b].includes(s.selected.long) || ![s.a, s.b].includes(s.selected.short)) {
       s.selected = null;
@@ -1331,7 +1334,7 @@ function renderPlanShell() {
     card.innerHTML = `<div class="plan-empty"><b>开仓计划</b>在左边选一个合约，这里会给出两腿的保证金、强平价、每日资金费、成本和规则校验。</div>`;
     return;
   }
-  const key = `${s.view}|${s.selected.symbol}|${s.selected.long}|${s.selected.short}`;
+  const key = `${s.view}|${s.selected.symbol}|${s.selected.long}|${s.selected.short}|${s.selected.fromRh ? `rh:${s.selected.fromRh.target}` : ''}`;
   if (card.dataset.key === key) return;
   card.dataset.key = key;
   const f = s.form;
@@ -1343,6 +1346,7 @@ function renderPlanShell() {
       <span class="sym">${esc(s.selected.symbol)}</span>
       <span class="small">${legsText(s.selected.long, s.selected.short)}</span>
     </div>
+    ${rhOriginNote(s.selected.fromRh)}
     <div class="form-grid">
       <label class="field"><span>单腿名义 (USDT)</span><input type="number" id="plan-size" value="${esc(f.size)}" min="1" step="100" /></label>
       <label class="field"><span>杠杆（两腿相同）</span><select id="plan-leverage">
@@ -2759,7 +2763,7 @@ function rhRow(line, view) {
   const zText = z === null ? '<span class="muted">—</span>' : `<span class="${Math.abs(z) >= 3 ? 'neg' : 'muted'}">${z > 0 ? '+' : ''}${z.toFixed(1)}</span>`;
   const net = leg?.net_to_normal_pct;
   const usdText = line.best?.net_usdt == null ? '' : ` <span class="muted small">≈ ${pnlUsd(line.best.net_usdt)}</span>`;
-  return `<tr class="${line.best?.signal ? 'rh-signal' : ''}">
+  return `<tr class="${line.best?.signal ? 'rh-signal' : ''}" data-rh-base="${esc(line.base)}" title="点击打开下单界面：带上方向和回到正常基差的收敛目标（仍需预览确认）">
     <td><b>${esc(line.base)}</b> <span class="muted small">${esc((line.category || '').toLowerCase())}</span></td>
     <td>${esc(RH_SESSION[line.session] || line.session)}</td>
     <td class="num ${cls(line.basis_pct)}">${pctRaw(line.basis_pct, 3)}</td>
@@ -2774,6 +2778,73 @@ function rhRow(line, view) {
 }
 
 const RH_SESSION = { rth: '盘中', off: '盘后', weekend: '周末', all: '全天' };
+
+// RH 价差页的一行 → 策略页（价差视角）的下单参数。
+// 基差口径不同：RH 页是 (Arcus − RH) / 均值；持仓规则是 (空腿 − 多腿) / 均值。
+// 多 Arcus / 空 RH 时持仓基差 = −RH 页基差，所以「回到正常」的收敛目标 = −正常中位数；反方向就是中位数本身。
+function rhOrderTarget(line) {
+  const direction = line.best?.direction;
+  const long = direction === 'long_arcus' ? 'arcus' : direction === 'long_lighter' ? 'lighter-rh' : null;
+  const short = long === 'arcus' ? 'lighter-rh' : long ? 'arcus' : null;
+  const leg = direction ? line[direction] : null;
+  const median = num(line.normal?.median);
+  let target = null;
+  if (long && median !== null) {
+    const raw = direction === 'long_arcus' ? -median : median;
+    // 规则只接受 ±5%；超出就不带目标（不截断成一个意思不同的数）。
+    if (Math.abs(raw) <= 5) target = (Math.round(raw * 1000) / 1000).toFixed(3);
+  }
+  return {
+    symbol: `${line.base}/USDT`,
+    long,
+    short,
+    target,
+    direction,
+    entryPct: leg?.entry_pct ?? null,
+    netToNormalPct: leg?.net_to_normal_pct ?? null,
+    session: line.session,
+    // 价差单要求空腿卖得出的价高于多腿要买的价：可成交价差不为正时预览会被拒绝。
+    negativeEntry: leg ? num(leg.entry_pct) <= 0 : false,
+  };
+}
+
+function rhOriginNote(origin) {
+  if (!origin) return '';
+  const parts = [`来自 RH 价差页（${esc(RH_SESSION[origin.session] || origin.session || '')}）：方向按两边深度、对照同时段正常基差选出`];
+  parts.push(origin.target != null
+    ? `基差收敛目标已设为 <b>${esc(origin.target)}%</b>（回到正常水平就平仓）`
+    : '还没有正常基差样本，收敛目标沿用你原来的设置');
+  if (origin.netToNormalPct != null) parts.push(`RH 页估算回到正常净收益 ${pctRaw(origin.netToNormalPct, 3)}`);
+  const warn = origin.negativeEntry
+    ? `<br><b>注意：</b>这个方向当前可成交价差为 ${pctRaw(origin.entryPct, 3)}（不为正），价差单要求空腿卖价高于多腿买价，预览会被拒绝。`
+    : '';
+  return `<div class="alert ${origin.negativeEntry ? 'warn' : 'info'} small">${parts.join('；')}。下单前仍需预览并确认。${warn}</div>`;
+}
+
+// 点 RH 价差页的一行：切到策略页价差视角，选好 Arcus ↔ Lighter RH、合约、方向和收敛目标。不下单。
+function openRhInStrategy(line) {
+  const order = rhOrderTarget(line);
+  const s = state.strategy;
+  s.userPicked = true;
+  s.a = 'arcus';
+  s.b = 'lighter-rh';
+  if (s.view !== 'spread') {
+    s.view = 'spread';
+    try {
+      localStorage.setItem('arb-web-strategy-view', 'spread');
+    } catch {
+      // 存不了就只在本次会话里生效。
+    }
+  }
+  if (order.target != null) s.form.basisExit = { ...s.form.basisExit, on: true, value: order.target };
+  s.selected = order.long
+    ? { symbol: order.symbol, long: order.long, short: order.short, fromRh: order }
+    : { symbol: order.symbol, long: null, short: null };
+  s.plan = null;
+  const card = $('plan-card');
+  if (card) card.dataset.key = '';
+  showPage('strategy');
+}
 
 function renderRhSpread() {
   const view = state.rh;
@@ -2800,6 +2871,12 @@ function renderRhSpread() {
   $('rh-notice').innerHTML = notices.join('');
   const shown = $('rh-signal-only').checked ? signals : lines;
   $('rh-rows').innerHTML = shown.map((line) => rhRow(line, view)).join('');
+  for (const tr of $('rh-rows').querySelectorAll('tr[data-rh-base]')) {
+    tr.addEventListener('click', () => {
+      const line = (state.rh?.lines || []).find((l) => l.base === tr.getAttribute('data-rh-base'));
+      if (line) openRhInStrategy(line);
+    });
+  }
   $('rh-empty').textContent = shown.length ? '' : (lines.length ? '当前没有信号。' : '等待行情…');
 }
 

@@ -253,11 +253,11 @@
 <!-- Lighter RH ↔ Arcus 同名合约价差监控（只读） -->
 <main class="page hidden" id="page-rhspread">
   <section class="section-head">
-    <span class="eyebrow sky">monitor · read-only</span>
+    <span class="eyebrow sky">monitor</span>
     <h2>Lighter RH ↔ Arcus 价差</h2>
     <p>两家同名合约的实时可成交价差（行情 WebSocket，每秒更新）。按这笔名义吃完两边深度的均价算，扣掉往返手续费和平仓穿价；
       并与该合约<b>同一时段</b>（盘中 / 盘后 / 周末 / 加密币全天）过去 7 天的「正常基差」比较 —— 股票类合约休市时常有系统性偏差，
-      现价差大不代表会收敛到 0。<b>只读，不下单。</b></p>
+      现价差大不代表会收敛到 0。本页只读；<b>点击某一行</b>会跳到策略页的下单界面，带上方向和「回到正常基差」的收敛目标，仍需预览并确认才会下单。</p>
   </section>
   <section class="controls card">
     <span class="small" id="rh-status"></span>
