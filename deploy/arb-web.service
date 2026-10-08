@@ -1,0 +1,65 @@
+# arb-web 的 systemd 单元（不用 pm2 时）。安装：
+#   sudo useradd --system --home /opt/arb-bot --shell /usr/sbin/nologin arb
+#   sudo install -d -o arb -g arb -m 0750 /opt/arb-bot /var/lib/arb-bot
+#   sudo install -m 0755 target/release/arb-web /opt/arb-bot/arb-web
+#   sudo install -m 0600 -o arb -g arb .env /etc/arb-bot.env      # 密钥只放这里
+#   sudo install -m 0644 deploy/arb-web.service /etc/systemd/system/arb-web.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now arb-web
+#
+# 台账、订单意图日志、暂停状态都写在 WorkingDirectory（/var/lib/arb-bot）：那是唯一可写的目录，
+# 也是**不能丢**的状态 —— 备份它，别删里面的 *.jsonl（见 README「实盘执行」）。
+[Unit]
+Description=arb-bot 看板与实盘交易台
+After=network-online.target
+Wants=network-online.target
+# 连续崩溃时别无限重启：5 分钟内启动 5 次失败就停下，等人看。
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=arb
+Group=arb
+WorkingDirectory=/var/lib/arb-bot
+EnvironmentFile=/etc/arb-bot.env
+Environment=ARB_BIND_HOST=127.0.0.1
+Environment=ARB_HTTP_PORT=8123
+Environment=ARB_LOG=info
+ExecStart=/opt/arb-bot/arb-web
+Restart=on-failure
+RestartSec=5
+
+# 优雅停机：arb-web 收到 SIGTERM 后最多等 ARB_SHUTDOWN_GRACE_SEC（默认 120）秒让进行中的下单做完，
+# 所以 systemd 的等待必须更长 —— 否则会在排空中途 SIGKILL，把两条腿之间的下单劈开。
+# 改了 ARB_SHUTDOWN_GRACE_SEC 要同步改这里（建议 = 它 + 30）。
+KillSignal=SIGTERM
+TimeoutStopSec=150
+# mixed：SIGTERM 只发给主进程（让它自己排空），超时后 SIGKILL 才发给整个 cgroup。
+KillMode=mixed
+
+# ---- 沙箱 ----
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+# 只允许普通联网（行情、交易所、Telegram）与本地套接字。
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+# 唯一可写的目录。
+ReadWritePaths=/var/lib/arb-bot
+# 内存：与 pm2 的 max_memory_restart 同量级；超了让 systemd 干净地杀掉重启，不拖垮整机。
+MemoryMax=1G
+
+# 注意：加载 Lighter 官方签名库（dlopen .so）需要对它所在目录可读、且不能开
+# MemoryDenyWriteExecute —— 这里没有开它，别加。
+# ARB_LIGHTER_SIGNER_LIB 指向的文件放在 /opt/lighter/ 即可（ProtectSystem=strict 下只读可读）。
+
+[Install]
+WantedBy=multi-user.target

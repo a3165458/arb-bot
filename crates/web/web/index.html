@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>arb-bot · 跨场所套利</title>
+<script>
+  // 首帧前定主题，免得白天模式先闪一下深色。选过就用选过的，没选过跟随系统。
+  (function () {
+    var theme = null;
+    try { theme = localStorage.getItem('arb-web-theme'); } catch (e) {}
+    if (theme !== 'light' && theme !== 'dark') {
+      theme = window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    }
+    document.documentElement.setAttribute('data-theme', theme);
+  })();
+</script>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header class="app-header">
+  <div class="brand">
+    <span class="logo">arb<b>·</b>bot</span>
+    <span class="badge" id="mode-badge" title="看板模式">paper</span>
+  </div>
+  <nav class="nav" id="nav">
+    <button class="nav-item active" type="button" data-page="opps">机会</button>
+    <button class="nav-item" type="button" data-page="strategy">策略</button>
+    <button class="nav-item" type="button" data-page="positions">持仓</button>
+    <button class="nav-item" type="button" data-page="rhspread">RH 价差</button>
+  </nav>
+  <div class="header-right">
+    <div class="chips" id="chips"></div>
+    <label class="auto"><input id="auto" type="checkbox" checked /> 自动刷新</label>
+    <span class="age" id="age"></span>
+    <button class="btn ghost theme-btn" id="theme-btn" type="button"></button>
+    <button class="btn ghost token-btn" id="token-btn" type="button" title="交易模式（纸面 / 实盘）与交易令牌">令牌</button>
+  </div>
+</header>
+
+<!-- 交易模式与令牌：模式在这里选一次，策略页下单与持仓页都按它，不再各自切换。
+     令牌只存在本浏览器里，每个交易请求放在 Authorization 头 -->
+<section class="token-panel hidden" id="token-panel">
+  <div class="token-inner card">
+    <div class="field mode-field"><span>交易模式（策略下单与持仓都按它）</span>
+      <div class="seg" id="mode-seg" role="group" aria-label="交易模式">
+        <button type="button" data-mode="paper">纸面</button>
+        <button type="button" data-mode="live">实盘</button>
+      </div>
+      <small class="muted" id="mode-note"></small>
+    </div>
+    <label class="field"><span>交易令牌（与服务端 ARB_WEB_TOKEN 相同）</span>
+      <input id="token-input" type="password" autocomplete="off" placeholder="粘贴令牌" /></label>
+    <button class="btn primary" id="token-save" type="button">保存</button>
+    <button class="btn ghost" id="token-clear" type="button">清除</button>
+    <span class="muted small" id="token-note"></span>
+  </div>
+</section>
+
+<!-- 机会：两条榜 -->
+<main class="page" id="page-opps">
+  <section class="section-head">
+    <span class="eyebrow sky">scanner</span>
+    <h2>全市场机会</h2>
+    <p>所有场所两两配对，按资金费或可成交价差排序。排名与命令行 <code>arb-scan</code> 是同一份计算。</p>
+  </section>
+
+  <nav class="views" id="views">
+    <button class="view-tab active" data-view="funding"
+      title="按资金费差排序；假设入场基差保持不变，逆风进场由门槛挡住">资金费套利</button>
+    <button class="view-tab" data-view="spread"
+      title="按基差收敛排序；假设基差收敛到 0，持有期内的资金费照收照付">跨所价差套利</button>
+  </nav>
+
+  <section class="controls card">
+    <label>币种 <input id="symbols" placeholder="BTC,ETH（留空 = 全部）" size="22" /></label>
+    <label>单边费率 <input id="fee" size="8" placeholder="0.0005" /></label>
+    <label>持有 <select id="amortize">
+      <option value="1">1 天</option>
+      <option value="3">3 天</option>
+      <option value="7" selected>7 天</option>
+      <option value="14">14 天</option>
+      <option value="30">30 天</option>
+    </select></label>
+    <label>价差持有 <select id="spread-hold">
+      <option value="1">1 天</option>
+      <option value="3" selected>3 天</option>
+      <option value="7">7 天</option>
+      <option value="14">14 天</option>
+    </select></label>
+    <label>基差门槛 <input id="basis-gate" size="6" placeholder="0.5 或 off"
+      title="不利入场基差的上限（%）。进场时空腿比多腿便宜超过这个数就不推荐 —— 那要靠基差反向扩大才赚得回来。填 off 关闭。" /></label>
+    <label title="两腿各自的逐仓杠杆。只影响强平距离与保证金年化，不改变排名；超过场所上限时按上限算。">杠杆 <select id="leverage">
+      <option value="1">1x</option>
+      <option value="2">2x</option>
+      <option value="3" selected>3x</option>
+      <option value="5">5x</option>
+      <option value="10">10x</option>
+      <option value="20">20x</option>
+    </select></label>
+    <label title="费差列的显示口径。只是把服务端给的日化费差换算成每 8 小时 / 每小时，排名不变。">费差口径 <select id="norm">
+      <option value="day" selected>日化</option>
+      <option value="8h">每 8h</option>
+      <option value="1h">每 1h</option>
+    </select></label>
+    <label>显示前 <select id="top">
+      <option value="20">20</option>
+      <option value="50" selected>50</option>
+      <option value="100">100</option>
+      <option value="300">300</option>
+    </select></label>
+    <span class="grow"></span>
+    <button id="measure" class="btn ghost" type="button"
+      title="跳过没有公开 K 线的场所，对价差榜里两腿都能拉 K 线的前 20 条拟合半衰期。只在点击时请求，不会跟着自动刷新重复打。">实测收敛</button>
+    <button id="refresh" class="btn primary" type="button">刷新</button>
+  </section>
+
+  <p class="hint" id="caliber"></p>
+  <div id="notices"></div>
+
+  <div class="table-wrap card">
+    <table id="opps">
+      <thead>
+        <tr>
+          <th class="num">#</th>
+          <th>合约</th>
+          <th>做多</th>
+          <th>做空</th>
+          <th class="num" id="spread-head">日化费差</th>
+          <th class="num">毛年化</th>
+          <th class="num">往返费</th>
+          <th class="num">穿价</th>
+          <th class="num">入场基差</th>
+          <th class="num">资金费年化</th>
+          <th class="num" title="收敛到 0 时这一笔赚到的净价差，不按持有天数重复折年">价差净收益</th>
+          <th class="num" title="按所选杠杆开仓时，两腿里更近的那个强平距离。先被强平的那条腿决定这笔对冲能扛多远。">强平距离</th>
+          <th class="num" title="资金费年化 × 名义 ÷ 两腿保证金合计。假设基差不变、两腿都不被强平。">保证金年化</th>
+          <th>下次结算</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p class="empty" id="empty"></p>
+  </div>
+
+  <section id="detail" class="detail card hidden"></section>
+</main>
+
+<!-- 策略：选两家场所 → 挑合约 → 纸面开仓计划 -->
+<main class="page hidden" id="page-strategy">
+  <section class="section-head">
+    <span class="eyebrow sky">delta-neutral</span>
+    <div class="strategy-title">
+      <h2 id="strategy-title">跨场所资金费套利</h2>
+      <div class="seg" id="strategy-view" role="group" aria-label="策略">
+        <button type="button" data-view="funding" class="on">资金费套利</button>
+        <button type="button" data-view="spread">价差套利</button>
+      </div>
+    </div>
+    <p id="strategy-intro">一家做多、一家做空，等额两腿对冲掉价格，费差就是收益。选两家场所，挑一个合约，右边给出开仓计划；配置了令牌时可以直接在右边预览并下单，纸面还是实盘在右上角「令牌」里选。</p>
+  </section>
+
+  <div class="strategy-grid">
+    <div class="col-main">
+      <div class="card pair-card">
+        <div class="pair-pickers">
+          <label class="picker"><span>场所 A</span><select id="venue-a"></select></label>
+          <button id="swap" class="btn ghost icon" type="button" title="交换两家场所">⇄</button>
+          <label class="picker"><span>场所 B</span><select id="venue-b"></select></label>
+        </div>
+        <div class="pair-diagram" id="pair-diagram"></div>
+      </div>
+
+      <section class="block">
+        <div class="row-head">
+          <h3>Top 机会</h3>
+          <span class="muted small" id="top-caption"></span>
+          <span class="grow"></span>
+          <div class="seg" id="apr-seg" role="group" aria-label="费率口径">
+            <button type="button" data-norm="apr" class="on">APR</button>
+            <button type="button" data-norm="8h">8h</button>
+            <button type="button" data-norm="1h">1h</button>
+          </div>
+        </div>
+        <div class="top-cards" id="top-cards"></div>
+      </section>
+
+      <section class="card block">
+        <div class="row-head">
+          <h3>市场</h3>
+          <input id="market-search" class="search" placeholder="搜索合约，如 TSLA" />
+          <label class="small pc-only" title="只显示按右边的金额、杠杆、平仓规则和右上角的纸面 / 实盘，后台预检能下单的合约。取消勾选可以看全部合约和不能下的原因。"><input type="checkbox" id="pc-only" checked /> 只显示能下单的</label>
+          <span class="grow"></span>
+          <span class="muted small" id="market-count"></span>
+        </div>
+        <p class="hint pc-caption" id="precheck-caption"></p>
+        <div class="table-wrap">
+          <table class="market-table">
+            <thead>
+              <tr>
+                <th>合约</th>
+                <th class="num" id="head-a">A</th>
+                <th class="num" id="head-b">B</th>
+                <th>方向</th>
+                <th class="num" id="head-c" title="两边费率之差，不扣成本">费差</th>
+                <th class="num" id="head-d" title="扣掉往返手续费与穿价（按持有天数摊销）之后">摊费后</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody id="market-rows"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="market-empty"></p>
+      </section>
+    </div>
+
+    <aside class="col-side">
+      <div class="card plan-card" id="plan-card"></div>
+    </aside>
+  </div>
+</main>
+
+<!-- 持仓：台账 + 监控评估 + 平仓 -->
+<main class="page hidden" id="page-positions">
+  <section class="section-head">
+    <span class="eyebrow coral">manage</span>
+    <h2 id="pos-title">纸面持仓</h2>
+    <p id="pos-intro">台账里的双腿仓位，按当前行情评估每笔仓位的规则。配置了令牌时可以在这里平仓、手动跑一轮规则。</p>
+  </section>
+  <section class="controls card" id="pos-toolbar">
+    <span class="small" id="pos-round"></span>
+    <span class="grow"></span>
+    <button class="btn ghost" id="pos-account-btn" type="button">刷新实盘账户</button>
+    <button class="btn ghost" id="pos-monitor" type="button">执行一轮规则</button>
+  </section>
+  <div id="pos-flash"></div>
+  <div id="pos-account"></div>
+  <div class="stats" id="pos-stats"></div>
+  <div id="pos-open"></div>
+  <section class="card block" id="pos-closed-wrap">
+    <div class="row-head"><h3>最近结束</h3></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>仓位</th><th>合约</th><th>两腿</th><th>状态</th><th>开仓</th><th>结束</th><th class="num" title="已实现盈亏 = 价格盈亏 − 手续费 + 持仓期间实际收付的资金费。看板自己平仓的按逐笔成交记，交易所里手动平仓的按交易所成交记录核算（数量逐腿对上才记）。">已实现盈亏</th><th>备注</th></tr></thead>
+        <tbody id="pos-closed"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="pos-closed-empty"></p>
+  </section>
+</main>
+
+<!-- Lighter RH ↔ Arcus 同名合约价差监控（只读） -->
+<main class="page hidden" id="page-rhspread">
+  <section class="section-head">
+    <span class="eyebrow sky">monitor · read-only</span>
+    <h2>Lighter RH ↔ Arcus 价差</h2>
+    <p>两家同名合约的实时可成交价差（行情 WebSocket，每秒更新）。按这笔名义吃完两边深度的均价算，扣掉往返手续费和平仓穿价；
+      并与该合约<b>同一时段</b>（盘中 / 盘后 / 周末 / 加密币全天）过去 7 天的「正常基差」比较 —— 股票类合约休市时常有系统性偏差，
+      现价差大不代表会收敛到 0。<b>只读，不下单。</b></p>
+  </section>
+  <section class="controls card">
+    <span class="small" id="rh-status"></span>
+    <span class="grow"></span>
+    <label class="small"><input type="checkbox" id="rh-signal-only" /> 只看信号</label>
+  </section>
+  <div class="stats" id="rh-stats"></div>
+  <div id="rh-notice"></div>
+  <div class="table-wrap card">
+    <table class="rh-table">
+      <thead>
+        <tr>
+          <th>合约</th>
+          <th>时段</th>
+          <th class="num" title="(Arcus 中间价 − Lighter RH 中间价) / 均值">当前基差</th>
+          <th class="num" title="过去 7 天同一时段的分钟中位数（括号里是 p10 ~ p90）">正常基差</th>
+          <th class="num" title="当前基差偏离正常水平几个 MAD（中位数绝对偏差）">偏离</th>
+          <th>方向</th>
+          <th class="num" title="按这笔名义吃完两边深度的开仓价差（已含开仓穿价）">可成交价差</th>
+          <th class="num" title="可成交价差 − 平仓穿价 − 往返手续费">收敛到 0 净收益</th>
+          <th class="num" title="假设基差回到正常水平就平仓：实际能拿到的部分">回到正常净收益</th>
+          <th>状态</th>
+        </tr>
+      </thead>
+      <tbody id="rh-rows"></tbody>
+    </table>
+    <p class="empty" id="rh-empty"></p>
+  </div>
+</main>
+
+<footer>
+  <p>
+    排名里的穿价只用一档。点开某一行会再拉多档深度，按 1000 USDT 估算滑点；
+    「实测收敛」会跳过没有公开 K 线的场所，只对两腿都能拉 K 线的前 20 条拟合半衰期，不会写进自动刷新。
+  </p>
+  <p>
+    强平距离按逐仓、最低风险档算（Hyperliquid 官方公式，含维持保证金率）：≥ 20% 健康、≥ 8% 注意、更近危险。
+    只有 Hyperliquid（含 HIP-3）、Lighter 与 Arcus 公开维持保证金率，其它场所显示未知，不拿典型值顶上。
+    标「OI 上限」的配对至少一条腿已触及持仓量上限，只能减仓、开不了新仓。
+  </p>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

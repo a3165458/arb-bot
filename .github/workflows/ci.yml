@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+# 同一分支上新的提交取代还没跑完的旧运行。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 测试不碰网络、不读任何凭据：CI 里不配、也不该配任何 ARB_* 密钥。
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml 指定 stable + rustfmt + clippy；rustup 会按它安装。
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Position rules UI tests
+        run: node --test crates/web/web/position-rules.test.cjs
+
+      # 发布二进制必须能在 release 配置（fat LTO）下构建；只在主分支上跑，PR 里太慢。
+      - name: Release build
+        if: github.event_name == 'push'
+        run: cargo build --release --workspace --locked
