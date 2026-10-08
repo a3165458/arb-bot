@@ -191,6 +191,9 @@ async fn main() -> anyhow::Result<()> {
                         .collect::<Vec<_>>()
                         .join("、")
                 ),
+                None if state.trade.live_mode() != trade::LiveMode::Off => {
+                    "实盘账户暂时连不上，后台每分钟重连（行情、价差监控照常）".to_string()
+                }
                 None => "实盘未开启（纸面）".to_string(),
             }
         ) + "。发 /menu 打开菜单（状态、持仓、盈亏、保证金、机会）。",
@@ -378,6 +381,7 @@ async fn metrics_page(State(state): State<Arc<AppState>>) -> Response {
             dirty_rounds: health.dirty_rounds,
             stalled: health.stalled,
             opens_paused: health.opens_paused,
+            disconnected: health.disconnected,
         });
     let scrape = metrics::Scrape {
         snapshot_age_s: snapshot
@@ -860,6 +864,11 @@ fn live_gap(state: &AppState, key: &precheck::WatchKey) -> Option<String> {
         return None;
     }
     let Some(connected) = state.trade.live_venues() else {
+        if state.trade.live_mode() != trade::LiveMode::Off {
+            return Some(
+                "实盘账户暂时连不上（交易所维护或限频），后台重连成功前不做实盘预检".into(),
+            );
+        }
         return Some("看板没有开启实盘（ARB_WEB_LIVE=off），实盘预检不可用".into());
     };
     let missing: Vec<&str> = [key.a, key.b]

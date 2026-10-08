@@ -425,3 +425,7 @@ footer p { margin: 0 0 6px; max-width: 980px; }
 /* RH 价差 */
 .rh-table td, .rh-table th { white-space: nowrap; }
 .rh-table tr.rh-signal td { background: var(--positive-bg); }
+
+/* 实盘暂时连不上的横幅 */
+.live-pending { margin: 0 auto; max-width: 1400px; padding: 10px 16px; border: 1px solid #ef535066; border-radius: var(--radius); background: var(--danger-bg); color: var(--danger-text); font-size: 13px; }
+.live-pending.hidden { display: none; }

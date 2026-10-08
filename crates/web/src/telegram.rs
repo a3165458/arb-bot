@@ -705,6 +705,22 @@ impl Backend for AppBackend {
             }
             match state.trade.live_health().await {
                 None => lines.push("实盘：未开启（纸面）".into()),
+                Some(live) if live.disconnected => {
+                    let detail = state.trade.live_pending().map_or(String::new(), |pending| {
+                        format!(
+                            "（{} 起，已重试 {} 次：{}）",
+                            pending.since.format("%m-%d %H:%M UTC"),
+                            pending.attempts,
+                            crate::alert::redact(&pending.error)
+                                .chars()
+                                .take(160)
+                                .collect::<String>()
+                        )
+                    });
+                    lines.push(format!(
+                        "🚨 实盘账户暂时连不上{detail}：下单、规则与对账暂停，后台每分钟自动重连"
+                    ));
+                }
                 Some(live) => {
                     lines.push(format!(
                         "实盘：{} · 规则轮 {} · 对账 {}",

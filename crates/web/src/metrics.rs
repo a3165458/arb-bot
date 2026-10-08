@@ -91,6 +91,8 @@ pub struct LiveSample {
     pub dirty_rounds: u32,
     pub stalled: bool,
     pub opens_paused: bool,
+    /// 实盘开着但账户暂时连不上。
+    pub disconnected: bool,
 }
 
 /// 写成 Prometheus 文本格式。
@@ -237,6 +239,13 @@ pub fn render(scrape: &Scrape) -> String {
             "1 = 开新仓被暂停（手动 /pause 或连续失败熔断）；平仓、规则、对账不受影响。",
         );
         let _ = writeln!(out, "arb_live_opens_paused {}", u8::from(live.opens_paused));
+        header(
+            &mut out,
+            "arb_live_connected",
+            "gauge",
+            "1 = 实盘账户已连上；0 = 开着实盘但暂时连不上（下单、规则、对账暂停，后台每分钟重连）。",
+        );
+        let _ = writeln!(out, "arb_live_connected {}", u8::from(!live.disconnected));
     }
 
     if !scrape.positions.is_empty() {
@@ -351,6 +360,7 @@ mod tests {
                 dirty_rounds: 2,
                 stalled: false,
                 opens_paused: true,
+                disconnected: false,
             }),
             positions: vec![("open".into(), 2), ("unwound".into(), 1)],
             alerts_suppressed: 7,
@@ -379,6 +389,7 @@ mod tests {
         assert!(text.contains("arb_venue_cooldown_seconds{venue=\"lighter-rh\"} 118"));
         assert!(text.contains("arb_live_reconciliation_clean 0"));
         assert!(text.contains("arb_live_opens_paused 1"));
+        assert!(text.contains("arb_live_connected 1"));
         assert!(text.contains("arb_ledger_positions{status=\"unwound\"} 1"));
     }
 

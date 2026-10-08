@@ -451,7 +451,14 @@ f = i·(t − e) / (i·t + 100·l)，i = 1 − l（多）或 1 + l（空），e/
 留空或写 `auto` 时**按凭据自动识别**：凭据填齐、格式也对的每一家都连上（至少两家）。
 Hyperliquid 的钥匙齐全时，主站与 HIP-3 的 `hyperliquid-xyz` / `hyperliquid-io` 一起连上（共用钥匙，
 但各 dex 的保证金互相独立：要在哪个 dex 开仓，就得在哪个 dex 有保证金）。
-自动识别只看变量填没填、格式对不对，不联网；凭据填了但连不上时照样启动失败，不会悄悄少连一家。
+自动识别只看变量填没填、格式对不对，不联网；凭据填了但连不上时 `arb-live` 照样启动失败，不会悄悄少连一家。
+
+**看板（`arb-web`）的实盘连不上时不阻塞启动**：配置错误（滑点、场所名、凭据格式、令牌）仍然启动即报错退出；
+但交易所**暂时**连不上（维护、限频、网关 404/5xx）时，看板先启动 —— 行情、机会榜、价差监控、纸面、Telegram 照常 ——
+实盘下单、持仓规则与对账暂停，后台每 60 秒重连。实盘连接仍是**全有或全无**：不会带着缺一家的半个实盘运行
+（缺一家时对账会把那家的腿当成不存在，规则会作用在错误的数量上）。断开期间：实盘接口返回 `503` 并说明原因；
+页面顶部显示红色横幅、徽章为 `live·down`；`/healthz` 返回 503（`live.disconnected=true`）；`/metrics` 的
+`arb_live_connected` 为 0；Telegram 启动时推送一次、之后每 30 分钟提醒一次，连上时再推送一次；`/status` 也会显示。
 
 | 子命令 | 做什么 | 需要下单权限 |
 | --- | --- | --- |
@@ -658,7 +665,7 @@ ARB_WEB_TOKEN=... ARB_WEB_LIVE=trade ARB_WEB_MARKET_SLIPPAGE=0.003 ./target/rele
   是否成功 / 耗时 / 读数条数 / 限频冷却剩余、实盘规则轮是否停摆 / 上一轮多久前 / 对账是否干净 / 连续不一致轮数 /
   是否暂停开仓、台账里各状态的仓位数，以及下单 / 平仓 / 规则操作的成败次数、令牌校验失败次数、后台任务 panic 次数、
   是否正在停机、常驻内存。告警建议：`arb_live_rules_stalled == 1`、`arb_live_reconciliation_clean == 0` 持续数分钟、
-  `arb_snapshot_age_seconds > 3 × 扫描间隔`、`arb_venue_up == 0` 持续、`arb_live_opens_paused == 1`。
+  `arb_snapshot_age_seconds > 3 × 扫描间隔`、`arb_venue_up == 0` 持续、`arb_live_opens_paused == 1`、`arb_live_connected == 0`（实盘账户暂时连不上）。
 - **安全响应头与令牌失败**：所有响应带 `X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`、
   `Referrer-Policy: no-referrer`、`Content-Security-Policy: frame-ancestors 'none'`、`Cache-Control: no-store`。令牌校验失败
   计数并在累计次数为 2 的幂时 WARN（不记提供的内容）。

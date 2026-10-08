@@ -31,6 +31,7 @@ let state = {
   page: 'opps',
   rh: null,
   rhTimer: null,
+  livePendingTimer: null,
   config: null,
   data: null,
   selected: null,
@@ -312,11 +313,23 @@ async function api(url, { method = 'GET', body, auth = false } = {}) {
   return { ok: response.ok, status: response.status, body: parsed };
 }
 
+// 实盘没连上时多久重新取一次交易配置（看后台是否已经重连成功）。
+const LIVE_PENDING_POLL_MS = 30000;
+
 async function loadTradeConfig() {
   const { ok, body } = await api('/api/trade/config');
   if (!ok) return;
+  const wasPending = Boolean(state.tradeConfig?.live_pending);
   state.tradeConfig = body;
   renderModeControls();
+  renderLivePending();
+  clearTimeout(state.livePendingTimer);
+  if (body.live_pending) {
+    state.livePendingTimer = setTimeout(() => loadTradeConfig().catch(() => {}), LIVE_PENDING_POLL_MS);
+  } else if (wasPending && body.live) {
+    // 刚刚重连成功：当前页按实盘重新取数。
+    refresh();
+  }
   // 实盘模式下策略页只列已连接实盘的场所：配置到了再按它重取一次表。
   if (state.page === 'strategy' && state.mode === 'live') reloadPairsSoon(0);
 }
@@ -367,6 +380,10 @@ function renderModeControls() {
     badge.textContent = 'paper';
     badge.className = 'badge';
     badge.title = '纸面交易：真实盘口、纸面成交，不碰真实资金';
+  } else if (!live && state.tradeConfig?.live_pending) {
+    badge.textContent = 'live·down';
+    badge.className = 'badge live-trade';
+    badge.title = '实盘开着，但交易所账户暂时连不上：下单、规则与对账暂停，后台每分钟自动重连';
   } else if (!live) {
     badge.textContent = 'live·off';
     badge.className = 'badge live-ro';
@@ -2119,7 +2136,23 @@ function wirePositionRules() {
 }
 
 // 看的是实盘、但看板没开实盘：没有台账可看，改为展示交易所账户识别。
-const liveSetup = () => state.mode === 'live' && !state.tradeConfig?.live;
+// 实盘开着但暂时没连上（live_pending）不算「没开」：页面显示横幅，持仓接口返回 503 原因。
+const liveSetup = () => state.mode === 'live' && !state.tradeConfig?.live && !state.tradeConfig?.live_pending;
+
+// 实盘开着但交易所账户暂时连不上：每个页面顶部都显示，直到后台重连成功。
+function livePendingText(pending) {
+  if (!pending) return '';
+  const since = when(pending.since);
+  return `⚠️ 实盘账户暂时连不上（${esc(since)} 起，已重试 ${Number(pending.attempts) || 0} 次）：实盘下单、持仓规则与对账暂停，后台每分钟自动重连。行情、价差监控、纸面不受影响。<span class="muted small" title="${esc(pending.error || '')}">原因：${esc(String(pending.error || '').slice(0, 140))}</span>`;
+}
+
+function renderLivePending() {
+  const el = $('live-pending');
+  if (!el) return;
+  const pending = state.tradeConfig?.live_pending;
+  el.classList.toggle('hidden', !pending);
+  el.innerHTML = livePendingText(pending);
+}
 
 async function loadCredentials() {
   const { ok, body } = await api('/api/trade/accounts', { auth: true });

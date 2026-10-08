@@ -270,6 +270,8 @@ pub struct LiveHealth {
     pub stalled: bool,
     /// 开新仓被暂停了。
     pub opens_paused: bool,
+    /// 实盘开着但账户暂时没连上（交易所维护、限频）：下单、规则、对账都暂停。
+    pub disconnected: bool,
 }
 
 /// 外部平仓的实际盈亏最多试几次（每次隔一个刷新周期，约 5 分钟）：成交记录可能要过几分钟
@@ -946,7 +948,22 @@ const DIRTY_ROUNDS_TO_ALERT: u32 = 3;
 pub struct Trade {
     token: Option<String>,
     pub paper: Arc<PaperDesk>,
-    pub live: Option<Arc<LiveDesk>>,
+    /// 实盘交易台。开着实盘但启动时连不上（某家交易所维护、限频）时先空着，后台重连成功后填上：
+    /// 行情、价差监控、Telegram、纸面不跟着停摆。**连接是全有或全无的** —— 不带着缺一家的
+    /// 半个实盘运行：缺一家时对账会把那家的腿当成不存在，规则也会作用在错误的数量上。
+    live_slot: Arc<std::sync::OnceLock<Arc<LiveDesk>>>,
+    /// 实盘开着（`ARB_WEB_LIVE` 不是 `off`）。
+    live_wanted: Option<LiveMode>,
+    /// 实盘还没连上时最近一次失败的原因（给页面、/healthz、Telegram）。
+    live_pending: Arc<std::sync::Mutex<Option<LivePending>>>,
+}
+
+/// 实盘还没连上：从什么时候开始、试了几次、最近一次为什么失败。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LivePending {
+    pub since: chrono::DateTime<Utc>,
+    pub attempts: u32,
+    pub error: String,
 }
 
 impl Trade {
@@ -987,48 +1004,135 @@ impl Trade {
         });
 
         let mode = LiveMode::from_env()?;
-        let live = if mode == LiveMode::Off {
-            None
-        } else {
-            if token.is_none() {
-                bail!(
-                    "ARB_WEB_LIVE={} 需要先配置 ARB_WEB_TOKEN：实盘账户不能在没有鉴权的页面上暴露",
-                    mode.as_str()
-                );
-            }
-            Some(Arc::new(
-                connect_live(settings, client, mode, Arc::clone(alerts)).await?,
-            ))
+        let trade = Self {
+            token,
+            paper,
+            live_slot: Arc::new(std::sync::OnceLock::new()),
+            live_wanted: (mode != LiveMode::Off).then_some(mode),
+            live_pending: Arc::new(std::sync::Mutex::new(None)),
         };
-        Ok(Self { token, paper, live })
+        if mode == LiveMode::Off {
+            return Ok(trade);
+        }
+        if trade.token.is_none() {
+            bail!(
+                "ARB_WEB_LIVE={} 需要先配置 ARB_WEB_TOKEN：实盘账户不能在没有鉴权的页面上暴露",
+                mode.as_str()
+            );
+        }
+        // 配置错误（滑点、场所名、凭据格式、台账打不开）仍然立刻报错退出：那不会自己好。
+        // 只有交易所连不上 / 限频 / 维护这类**暂时的**失败，才让看板先起来、后台重连。
+        let plan = LivePlan::from_env(settings, mode)?;
+        match connect_live(&plan, client, Arc::clone(alerts)).await {
+            Ok(desk) => {
+                let _ = trade.live_slot.set(Arc::new(desk));
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                error!(
+                    "实盘账户暂时连不上，先启动看板（行情、价差监控、Telegram、纸面照常），后台每 {} 秒重连：{message}",
+                    LIVE_RETRY.as_secs()
+                );
+                alerts.notify_always(format!(
+                    "⚠️ 实盘账户暂时连不上：{}。看板已先启动（行情、价差监控、Telegram 照常），实盘下单、规则与对账暂停；后台会自动重连，连上后再通知。",
+                    crate::alert::redact(&message)
+                ));
+                *trade.live_pending.lock().unwrap_or_else(|p| p.into_inner()) = Some(LivePending {
+                    since: Utc::now(),
+                    attempts: 1,
+                    error: message,
+                });
+                trade.spawn_live_reconnect(plan, client.clone(), Arc::clone(alerts));
+            }
+        }
+        Ok(trade)
     }
 
-    /// 后台监控。纸面默认关闭；实盘在 `trade` 模式下默认按扫描间隔跑。
-    /// 后台为实盘持仓刷新资金费流水：持仓页打开时就是现成的。
-    pub fn spawn_funding_refresher(&self) {
-        let Some(live) = self.live.clone() else {
-            return;
-        };
+    /// 配置的实盘模式（不管连没连上）。
+    pub(crate) fn live_mode(&self) -> LiveMode {
+        self.live_wanted.unwrap_or(LiveMode::Off)
+    }
+
+    /// 实盘交易台（已连上时）。
+    pub(crate) fn live_opt(&self) -> Option<&Arc<LiveDesk>> {
+        self.live_slot.get()
+    }
+
+    /// 实盘开着但还没连上：原因。
+    pub(crate) fn live_pending(&self) -> Option<LivePending> {
+        if self.live_slot.get().is_some() {
+            return None;
+        }
+        self.live_pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// 后台重连实盘：直到连上或开始停机。连上后填入交易台并启动它的后台任务。
+    fn spawn_live_reconnect(&self, plan: LivePlan, client: reqwest::Client, alerts: Arc<Alerter>) {
+        let slot = Arc::clone(&self.live_slot);
+        let pending = Arc::clone(&self.live_pending);
         tokio::spawn(async move {
             loop {
-                match live.ledger.replay().await {
-                    Ok((replayed, _)) => {
-                        for position in replayed.exposed() {
-                            live.position_funding(position, true).await;
+                tokio::time::sleep(LIVE_RETRY).await;
+                if crate::shutdown::is_draining() {
+                    return;
+                }
+                match connect_live(&plan, &client, Arc::clone(&alerts)).await {
+                    Ok(desk) => {
+                        let desk = Arc::new(desk);
+                        if slot.set(Arc::clone(&desk)).is_err() {
+                            return;
                         }
+                        let down = pending
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take();
+                        let waited = down
+                            .as_ref()
+                            .map_or(0, |d| (Utc::now() - d.since).num_minutes());
+                        info!(
+                            waited_min = waited,
+                            "实盘账户已连上：实盘下单、规则与对账恢复"
+                        );
+                        alerts.notify_always(format!(
+                            "✅ 实盘账户已连上（中断约 {waited} 分钟）：实盘下单、持仓规则与对账已恢复。"
+                        ));
+                        spawn_live_tasks(&desk);
+                        return;
                     }
-                    Err(error) => warn!("刷新资金费流水时读不了实盘台账：{error}"),
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        let attempts = {
+                            let mut guard = pending.lock().unwrap_or_else(|p| p.into_inner());
+                            let entry = guard.get_or_insert_with(|| LivePending {
+                                since: Utc::now(),
+                                attempts: 0,
+                                error: String::new(),
+                            });
+                            entry.attempts += 1;
+                            entry.error = message.clone();
+                            entry.attempts
+                        };
+                        warn!(attempts, "实盘账户仍然连不上：{message}");
+                        // 每 30 分钟提醒一次还没恢复（同一 key 的告警自带 30 分钟冷却）。
+                        alerts.notify(
+                            "live-reconnect",
+                            format!(
+                                "⚠️ 实盘账户仍然连不上（已试 {attempts} 次）：{}。实盘下单、规则与对账仍暂停。",
+                                crate::alert::redact(&message)
+                            ),
+                        );
+                    }
                 }
-                // 顺带补算外部平仓的实际盈亏（没有待核算的仓位时什么都不做）。它会往台账里写，
-                // 所以要占交易台的锁：不和下单、规则轮同时追加，停机排空也会等它写完。忙就跳过，下个周期再来。
-                if let Ok(_guard) = live.lock.try_lock() {
-                    live.backfill_external_pnl().await;
-                    live.recheck_closed_funding().await;
-                }
-                // 比缓存有效期略短：页面读到的永远是后台刚刷新过的。
-                tokio::time::sleep(FUNDING_CACHE_TTL - Duration::from_secs(10)).await;
             }
         });
+    }
+
+    /// 后台为实盘持仓刷新资金费流水（见 [`spawn_live_tasks`]）。实盘还没连上时由重连任务在连上后启动。
+    pub fn spawn_funding_refresher(&self) {
+        // 实盘的后台任务统一在 [`spawn_live_tasks`] 里启动。
     }
 
     pub fn spawn_watchers(&self) {
@@ -1046,29 +1150,8 @@ impl Trade {
                 }
             }));
         }
-        if let Some(live) = &self.live
-            && live.mode == LiveMode::Trade
-            && live.watch_sec > 0
-        {
-            let live = Arc::clone(live);
-            let interval = Duration::from_secs(live.watch_sec);
-            info!(interval_sec = live.watch_sec, "实盘持仓规则由看板后台执行");
-            let alerts = Arc::clone(&live.alerts);
-            tokio::spawn(rounds_forever(
-                interval,
-                "实盘",
-                Some(alerts),
-                move || {
-                    let live = Arc::clone(&live);
-                    async move {
-                        let _guard = live.lock.lock().await;
-                        // 等锁的时候收到了停机信号：这一轮不开始（已经在跑的那轮不受影响）。
-                        if !crate::shutdown::is_draining() {
-                            live.round("auto").await;
-                        }
-                    }
-                },
-            ));
+        if let Some(live) = self.live_opt() {
+            spawn_live_tasks(live);
         }
     }
 
@@ -1076,7 +1159,7 @@ impl Trade {
     /// 直到返回值被丢弃。实盘放在前面：它是真实资金。
     pub async fn quiesce(&self, deadline: tokio::time::Instant) -> crate::shutdown::Quiesced<'_> {
         let mut desks = Vec::with_capacity(2);
-        if let Some(live) = &self.live {
+        if let Some(live) = self.live_opt() {
             desks.push(("实盘", &live.lock));
         }
         desks.push(("纸面", &self.paper.lock));
@@ -1114,7 +1197,7 @@ impl Trade {
     /// 最近一次实盘对账不干净（或没做成）时的说明：实盘预览开仓前要先对账，
     /// 不干净就一律拒绝，这一关后台预检看不到，要单独告诉操作者。
     pub(crate) async fn live_reconcile_warning(&self) -> Option<String> {
-        let live = self.live.as_ref()?;
+        let live = self.live_opt()?;
         let mark = live.last_reconcile.read().await.clone()?;
         let ago = (Utc::now() - mark.at).num_seconds().max(0);
         let ago = if ago < 60 {
@@ -1137,7 +1220,7 @@ impl Trade {
     /// 只看不做的看板不该为了数仓位去创建台账文件。
     pub(crate) async fn open_positions(&self, live: bool) -> Result<usize, String> {
         if live {
-            let Some(live) = &self.live else {
+            let Some(live) = self.live_opt() else {
                 return Ok(0);
             };
             let (replayed, _) = live
@@ -1155,7 +1238,20 @@ impl Trade {
 
     /// 实盘规则轮的健康状态（给 `/healthz`）：只有布尔值和时间，不含账户信息。实盘没开为 `None`。
     pub(crate) async fn live_health(&self) -> Option<LiveHealth> {
-        let live = self.live.as_ref()?;
+        let mode = self.live_wanted?;
+        let Some(live) = self.live_opt() else {
+            // 开着实盘却连不上：规则轮根本没在跑，对监控来说就是停了（/healthz 返回 503）。
+            return Some(LiveHealth {
+                mode,
+                watch_sec: 0,
+                last_round_age_s: None,
+                reconciliation_clean: None,
+                dirty_rounds: 0,
+                stalled: true,
+                opens_paused: false,
+                disconnected: true,
+            });
+        };
         let last = live.last_round.read().await;
         let age_s = last
             .as_ref()
@@ -1174,12 +1270,13 @@ impl Trade {
             dirty_rounds: live.dirty_rounds.load(std::sync::atomic::Ordering::Relaxed),
             stalled,
             opens_paused: live.opens_paused.load(std::sync::atomic::Ordering::Relaxed),
+            disconnected: false,
         })
     }
 
     /// 暂停 / 恢复开新仓。实盘没开时返回 `false`。
     pub(crate) fn set_opens_paused(&self, paused: bool) -> bool {
-        match &self.live {
+        match self.live_opt() {
             Some(live) => {
                 live.set_paused(paused, "手动暂停（Telegram /pause）");
                 true
@@ -1189,7 +1286,7 @@ impl Trade {
     }
 
     pub(crate) fn opens_paused(&self) -> bool {
-        self.live
+        self.live_opt()
             .as_ref()
             .is_some_and(|live| live.opens_paused.load(std::sync::atomic::Ordering::SeqCst))
     }
@@ -1197,7 +1294,7 @@ impl Trade {
     /// 实盘台账里各状态的仓位数（给 `/metrics`）：包含已结束的，所以 `unwound`（开仓没做完、
     /// 被回滚）的累计数也在里面。实盘没开或台账读不了时为空。
     pub(crate) async fn ledger_status_counts(&self) -> Vec<(String, usize)> {
-        let Some(live) = &self.live else {
+        let Some(live) = self.live_opt() else {
             return Vec::new();
         };
         let Ok((replayed, _)) = live.ledger.replay().await else {
@@ -1214,7 +1311,7 @@ impl Trade {
 
     /// 各实盘场所现在的可用保证金（只读）。查不到的带原因。
     pub(crate) async fn free_collaterals(&self) -> Vec<(Venue, Result<Option<Decimal>, String>)> {
-        let Some(live) = &self.live else {
+        let Some(live) = self.live_opt() else {
             return Vec::new();
         };
         let mut out = Vec::new();
@@ -1235,7 +1332,7 @@ impl Trade {
 
     /// 当日（UTC）已实现盈亏（来自台账，不联网）。
     pub(crate) async fn daily(&self) -> Result<desk::DailyPnl, String> {
-        match &self.live {
+        match self.live_opt() {
             Some(live) => live_daily(live).await,
             None => Err("看板没有开启实盘".into()),
         }
@@ -1246,7 +1343,7 @@ impl Trade {
         &self,
         report: &ScanReport,
     ) -> Result<crate::strategy::Positions, String> {
-        let live = self.live.as_ref().ok_or("看板没有开启实盘")?;
+        let live = self.live_opt().ok_or("看板没有开启实盘")?;
         let (replayed, broken) = live
             .ledger
             .replay()
@@ -1273,28 +1370,36 @@ impl Trade {
 
     /// 实盘开着但只读：能预览、不能下单。
     pub(crate) fn live_readonly(&self) -> bool {
-        self.live
+        self.live_opt()
             .as_ref()
             .is_some_and(|live| live.mode != LiveMode::Trade)
     }
 
     /// 实盘连着的场所。实盘没开时为 `None`。
     pub(crate) fn live_venues(&self) -> Option<&[Venue]> {
-        self.live.as_ref().map(|live| live.venues.as_slice())
+        self.live_opt().map(|live| live.venues.as_slice())
     }
 
     pub(crate) fn supports_add_margin(&self, venue: Venue) -> bool {
-        self.live
+        self.live_opt()
             .as_ref()
             .and_then(|live| live.brokers.get(&venue))
             .is_some_and(|broker| broker.supports_add_margin())
     }
 
     fn live(&self) -> Result<&Arc<LiveDesk>, Denied> {
-        self.live.as_ref().ok_or(Denied(
-            StatusCode::BAD_REQUEST,
-            "看板没有开启实盘（ARB_WEB_LIVE=off）",
-        ))
+        match (self.live_opt(), self.live_wanted) {
+            (Some(live), _) => Ok(live),
+            (None, None) => Err(Denied(
+                StatusCode::BAD_REQUEST,
+                "看板没有开启实盘（ARB_WEB_LIVE=off）",
+            )),
+            // 开着实盘但交易所暂时连不上：503，页面与脚本知道是暂时的。
+            (None, Some(_)) => Err(Denied(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "实盘账户暂时连不上（交易所维护或限频），后台每分钟自动重连；在此之前实盘下单、规则与对账暂停",
+            )),
+        }
     }
 }
 
@@ -1307,41 +1412,132 @@ impl IntoResponse for Denied {
     }
 }
 
-async fn connect_live(
-    settings: &Settings,
-    client: &reqwest::Client,
+/// 实盘交易台的后台任务：持仓规则轮（`trade` 模式）与资金费流水刷新 / 外部平仓核算 / 资金费核对。
+/// 启动时连上就在启动时调用；启动时没连上，由重连任务连上后调用。每个交易台只调用一次。
+fn spawn_live_tasks(live: &Arc<LiveDesk>) {
+    {
+        let live = Arc::clone(live);
+        tokio::spawn(async move {
+            loop {
+                match live.ledger.replay().await {
+                    Ok((replayed, _)) => {
+                        for position in replayed.exposed() {
+                            live.position_funding(position, true).await;
+                        }
+                    }
+                    Err(error) => warn!("刷新资金费流水时读不了实盘台账：{error}"),
+                }
+                // 顺带补算外部平仓的实际盈亏（没有待核算的仓位时什么都不做）。它会往台账里写，
+                // 所以要占交易台的锁：不和下单、规则轮同时追加，停机排空也会等它写完。忙就跳过，下个周期再来。
+                if let Ok(_guard) = live.lock.try_lock() {
+                    live.backfill_external_pnl().await;
+                    live.recheck_closed_funding().await;
+                }
+                // 比缓存有效期略短：页面读到的永远是后台刚刷新过的。
+                tokio::time::sleep(FUNDING_CACHE_TTL - Duration::from_secs(10)).await;
+            }
+        });
+    }
+    if live.mode == LiveMode::Trade && live.watch_sec > 0 {
+        let live = Arc::clone(live);
+        let interval = Duration::from_secs(live.watch_sec);
+        info!(interval_sec = live.watch_sec, "实盘持仓规则由看板后台执行");
+        let alerts = Arc::clone(&live.alerts);
+        tokio::spawn(rounds_forever(
+            interval,
+            "实盘",
+            Some(alerts),
+            move || {
+                let live = Arc::clone(&live);
+                async move {
+                    let _guard = live.lock.lock().await;
+                    // 等锁的时候收到了停机信号：这一轮不开始（已经在跑的那轮不受影响）。
+                    if !crate::shutdown::is_draining() {
+                        live.round("auto").await;
+                    }
+                }
+            },
+        ));
+    }
+}
+
+/// 实盘配置（从环境变量解析一次）。解析失败是配置错误，启动即报；连接失败才重试。
+#[derive(Clone)]
+struct LivePlan {
     mode: LiveMode,
+    venues: Vec<Venue>,
+    auto: bool,
+    market_slippage: Option<Decimal>,
+    options: ConnectOptions,
+    settings: Settings,
+    ledger_path: String,
+    watch_sec: u64,
+}
+
+impl LivePlan {
+    fn from_env(settings: &Settings, mode: LiveMode) -> Result<Self> {
+        let selection = live_connect::live_venues(None)?;
+        let venues = selection.venues;
+        let market_slippage = match std::env::var("ARB_WEB_MARKET_SLIPPAGE") {
+            Ok(raw) if !raw.trim().is_empty() => Some(
+                parse_decimal(raw.trim())
+                    .with_context(|| format!("ARB_WEB_MARKET_SLIPPAGE 必须是小数，收到 {raw:?}"))?,
+            ),
+            _ => None,
+        };
+        let options = ConnectOptions {
+            journal_dir: PathBuf::from(
+                std::env::var("ARB_LIVE_JOURNAL_DIR").unwrap_or_else(|_| ".".into()),
+            ),
+            trading_enabled: mode == LiveMode::Trade,
+            market_slippage,
+        };
+        options
+            .validate()
+            .context("ARB_WEB_LIVE=trade 必须同时给 ARB_WEB_MARKET_SLIPPAGE")?;
+        let mut live_settings = settings.clone();
+        live_settings.venues = venues.clone();
+        live_settings.validate()?;
+        let watch_sec = env_u64("ARB_WEB_LIVE_WATCH_SEC", settings.scan_interval_sec)?;
+        Ok(Self {
+            mode,
+            venues,
+            auto: selection.auto,
+            market_slippage,
+            options,
+            settings: live_settings,
+            ledger_path: std::env::var("ARB_LIVE_LEDGER")
+                .unwrap_or_else(|_| "arb-live-ledger.jsonl".into()),
+            watch_sec,
+        })
+    }
+}
+
+/// 实盘启动没连上时多久重试一次。不用退避到很长：交易所维护结束后应尽快恢复规则轮；
+/// 每次重试只是每家一两次只读请求。
+const LIVE_RETRY: Duration = Duration::from_secs(60);
+
+/// 连接全部实盘场所并组装交易台。**全有或全无**：任何一家失败就整体失败（已连上的券商随之丢弃、
+/// 释放意图日志锁），由调用方决定是退出还是稍后重试。
+async fn connect_live(
+    plan: &LivePlan,
+    client: &reqwest::Client,
     alerts: Arc<Alerter>,
 ) -> Result<LiveDesk> {
-    let selection = live_connect::live_venues(None)?;
-    let venues = selection.venues;
-    let market_slippage = match std::env::var("ARB_WEB_MARKET_SLIPPAGE") {
-        Ok(raw) if !raw.trim().is_empty() => Some(
-            parse_decimal(raw.trim())
-                .with_context(|| format!("ARB_WEB_MARKET_SLIPPAGE 必须是小数，收到 {raw:?}"))?,
-        ),
-        _ => None,
-    };
-    let options = ConnectOptions {
-        journal_dir: PathBuf::from(
-            std::env::var("ARB_LIVE_JOURNAL_DIR").unwrap_or_else(|_| ".".into()),
-        ),
-        trading_enabled: mode == LiveMode::Trade,
+    let LivePlan {
+        mode,
+        venues,
+        auto,
         market_slippage,
-    };
-    options
-        .validate()
-        .context("ARB_WEB_LIVE=trade 必须同时给 ARB_WEB_MARKET_SLIPPAGE")?;
-
-    let mut live_settings = settings.clone();
-    live_settings.venues = venues.clone();
-    live_settings.validate()?;
+        options,
+        settings: live_settings,
+        ledger_path,
+        watch_sec,
+    } = plan.clone();
     let apis = build_all(&live_settings, client);
     let brokers = live_connect::connect(client, &venues, &options)
         .await
         .context("连接实盘账户失败")?;
-    let ledger_path =
-        std::env::var("ARB_LIVE_LEDGER").unwrap_or_else(|_| "arb-live-ledger.jsonl".into());
     let ledger = Arc::new(Ledger::open(&ledger_path).await?);
     // 启动时先把台账里没有终态的订单对到券商的记录上：上次进程若死在「意图已落盘、终态未落盘」
     // 之间，那张单永远停在 Pending，对账会把它报成永远消不掉的不一致，所有开仓与规则被拒。
@@ -1375,11 +1571,10 @@ async fn connect_live(
             "⏸ 启动时开新仓仍处于暂停状态：{reason}。发 /resume 恢复。"
         ));
     }
-    let watch_sec = env_u64("ARB_WEB_LIVE_WATCH_SEC", settings.scan_interval_sec)?;
     info!(
         mode = ?mode,
         venues = %venues.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(","),
-        auto = selection.auto,
+        auto = auto,
         ledger = %ledger_path,
         "实盘交易台已连接"
     );
@@ -1391,7 +1586,7 @@ async fn connect_live(
         by_venue: crate::api_map(&apis),
         apis,
         venues,
-        auto_venues: selection.auto,
+        auto_venues: auto,
         settings: live_settings,
         brokers,
         ledger,
@@ -1997,7 +2192,7 @@ pub async fn api_trade_config(State(state): State<Arc<AppState>>) -> Json<serde_
             "ledger": trade.paper.ledger_path,
             "watch_sec": trade.paper.watch_sec,
         },
-        "live": trade.live.as_ref().map(|live| json!({
+        "live": trade.live_opt().map(|live| json!({
             "mode": live.mode,
             "venues": live.venues,
             "market_slippage": live.market_slippage.map(|value| value.to_string()),
@@ -2009,6 +2204,13 @@ pub async fn api_trade_config(State(state): State<Arc<AppState>>) -> Json<serde_
                 .iter()
                 .filter(|venue| live.brokers.get(venue).is_some_and(|broker| broker.supports_add_margin()))
                 .collect::<Vec<_>>(),
+        })),
+        // 实盘开着但暂时没连上：给页面显示横幅。错误文本抹掉长十六进制串（地址、密钥）。
+        "live_pending": trade.live_pending().map(|pending| json!({
+            "mode": trade.live_mode(),
+            "since": pending.since,
+            "attempts": pending.attempts,
+            "error": crate::alert::redact(&pending.error),
         })),
     }))
 }
@@ -2042,7 +2244,7 @@ pub async fn api_trade_open(
 
 /// 台账算出来的当日（UTC）已实现盈亏；算不出来时给出原因。
 async fn live_daily_default(state: &AppState) -> Result<Decimal, String> {
-    let Some(live) = &state.trade.live else {
+    let Some(live) = state.trade.live_opt() else {
         return Err("看板没有开启实盘".into());
     };
     let daily = live_daily(live).await?;
@@ -2593,14 +2795,10 @@ pub async fn api_trade_accounts(
         Ok(selection) => json!({ "venues": selection.venues, "auto": selection.auto }),
         Err(error) => json!({ "error": format!("{error:#}") }),
     };
-    let live_mode = state
-        .trade
-        .live
-        .as_ref()
-        .map_or(LiveMode::Off, |live| live.mode);
+    let live_mode = state.trade.live_mode();
     Json(json!({
         "live_mode": live_mode.as_str(),
-        "live": state.trade.live.as_ref().map(|live| json!({
+        "live": state.trade.live_opt().map(|live| json!({
             "venues": live.venues,
             "auto": live.auto_venues,
         })),
@@ -2651,7 +2849,7 @@ pub async fn api_trade_round(
 
 /// 实盘台账路径（持仓页只读展示用）。
 pub fn live_ledger_path(state: &AppState) -> Option<String> {
-    state.trade.live.as_ref().map(|live| live.ledger_path())
+    state.trade.live_opt().map(|live| live.ledger_path())
 }
 
 #[cfg(test)]
@@ -2682,6 +2880,55 @@ mod tests {
         }
         hold.book_net_usdt = None;
         assert!(take_profit_hold_alert("live-1", &symbol, &hold).contains("盘口核对不了"));
+    }
+
+    #[tokio::test]
+    async fn a_live_desk_that_could_not_connect_yet_reports_why_instead_of_blocking_startup() {
+        let trade = Trade {
+            token: Some("t".repeat(MIN_TOKEN_LEN)),
+            paper: Arc::new(PaperDesk {
+                ledger_path: "unused.jsonl".into(),
+                ledger: OnceCell::new(),
+                by_venue: HashMap::new(),
+                fee_per_side: Decimal::ZERO,
+                lock: Mutex::new(()),
+                last_round: RwLock::new(None),
+                watch_sec: 0,
+                retries: desk::ExitRetries::default(),
+            }),
+            live_slot: Arc::new(std::sync::OnceLock::new()),
+            live_wanted: Some(LiveMode::Trade),
+            live_pending: Arc::new(std::sync::Mutex::new(Some(LivePending {
+                since: Utc::now(),
+                attempts: 3,
+                error: "连接 lighter-rh 账户失败：HTTP 404；地址 0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into(),
+            }))),
+        };
+        // 实盘请求：503（暂时的），不是 400「没开实盘」。
+        let Err(denied) = trade.live() else {
+            panic!("没连上不该给出交易台")
+        };
+        assert_eq!(denied.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(denied.1.contains("暂时连不上"), "{}", denied.1);
+        assert_eq!(trade.live_mode(), LiveMode::Trade);
+        assert!(trade.live_venues().is_none() && !trade.opens_paused());
+        // 健康检查：规则轮没在跑 = 停了（/healthz 503），并标明是连不上。
+        let health = trade.live_health().await.expect("实盘开着就要有健康状态");
+        assert!(health.disconnected && health.stalled);
+        let pending = trade.live_pending().expect("要说明为什么");
+        assert_eq!(pending.attempts, 3);
+        // 连上之后：不再 pending，live() 给出交易台；只能填一次。
+        let (desk, ..) =
+            live_rules_fixture(Decimal::from(100), arb_exec::broker::MarginOutcome::Applied).await;
+        let desk = Arc::new(desk);
+        assert!(trade.live_slot.set(Arc::clone(&desk)).is_ok());
+        assert!(
+            trade.live_slot.set(desk).is_err(),
+            "交易台只能填一次，不会被第二次重连覆盖"
+        );
+        assert!(trade.live_pending().is_none());
+        assert!(trade.live().is_ok());
+        assert!(!trade.live_health().await.unwrap().disconnected);
     }
 
     #[test]
