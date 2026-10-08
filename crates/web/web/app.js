@@ -31,6 +31,7 @@ let state = {
   page: 'opps',
   rh: null,
   rhTimer: null,
+  rhAuto: { data: null, form: rhAutoForm({}), dirty: false, busy: false, message: null },
   livePendingTimer: null,
   config: null,
   data: null,
@@ -2885,6 +2886,171 @@ async function loadRhSpread() {
   if (!result.ok) throw new Error(result.body?.error || `HTTP ${result.status}`);
   state.rh = result.body;
   renderRhSpread();
+  loadRhAuto().catch(() => {});
+}
+
+// ───────────────────────────── RH 价差自动交易 ─────────────────────────────
+//
+// 设置存在服务端（auto.json）。表单只在没有未保存改动时跟着服务端刷新，免得打字时被冲掉。
+
+const RH_AUTO_FIELDS = [
+  ['size_usdt', '单腿名义 (USDT)', 'number', '10', '每笔两腿各这么多名义'],
+  ['leverage', '杠杆（整数）', 'number', '1', '两腿相同，逐仓'],
+  ['min_net_pct', '触发门槛 (%)', 'number', '0.01', '「回到正常净收益」≥ 它才下单（已扣手续费与平仓穿价）'],
+  ['hold_sec', '信号保持 (秒)', 'number', '1', '连续达标这么久才下单，过滤一闪而过的挂单'],
+  ['take_profit_usdt', '止盈 (USDT)', 'number', '0.01', '含资金费的净盈利达到它就平仓（按盘口核对）；留空不设'],
+  ['liq_protection_pct', '爆仓保护 (%)', 'number', '1', '强平距离低于它两腿等比例减仓；留空不设'],
+  ['max_positions', '同时最多 (笔)', 'number', '1', '自动开的仓位同时最多几笔'],
+  ['daily_max_opens', '每日最多 (笔)', 'number', '1', '每个 UTC 日最多自动开几笔'],
+];
+
+function rhAutoForm(settings) {
+  return {
+    enabled: Boolean(settings.enabled),
+    mode: settings.mode || 'paper',
+    size_usdt: String(settings.size_usdt ?? '500'),
+    leverage: String(settings.leverage ?? '3'),
+    min_net_pct: String(settings.min_net_pct ?? '0.05'),
+    hold_sec: String(settings.hold_sec ?? '10'),
+    back_to_normal: settings.back_to_normal !== false,
+    take_profit_usdt: settings.take_profit_usdt == null ? '' : String(settings.take_profit_usdt),
+    liq_protection_pct: settings.liq_protection_pct == null ? '' : String(settings.liq_protection_pct),
+    max_positions: String(settings.max_positions ?? '1'),
+    daily_max_opens: String(settings.daily_max_opens ?? '3'),
+    symbols: (settings.symbols || []).join(','),
+  };
+}
+
+// 表单 → 请求体。空的可选项发 null（关闭），数字按字符串发（服务端按十进制解析）。
+function rhAutoBody(form, enabled) {
+  const optional = (value) => (String(value).trim() === '' ? null : String(value).trim());
+  return {
+    enabled,
+    mode: form.mode,
+    size_usdt: String(form.size_usdt).trim(),
+    leverage: String(form.leverage).trim(),
+    min_net_pct: String(form.min_net_pct).trim(),
+    hold_sec: Number(form.hold_sec),
+    back_to_normal: Boolean(form.back_to_normal),
+    take_profit_usdt: optional(form.take_profit_usdt),
+    liq_protection_pct: optional(form.liq_protection_pct),
+    max_positions: Number(form.max_positions),
+    daily_max_opens: Number(form.daily_max_opens),
+    symbols: String(form.symbols).split(/[,，\s]+/).map((s) => s.trim().toUpperCase()).filter(Boolean),
+  };
+}
+
+async function loadRhAuto() {
+  const a = state.rhAuto;
+  if (!state.tradeConfig?.auth_configured || !token()) {
+    a.data = null;
+    renderRhAuto();
+    return;
+  }
+  const { ok, body } = await api('/api/rh-spread/auto', { auth: true });
+  a.data = ok ? body : { error: body.error };
+  if (ok && !a.dirty) a.form = rhAutoForm(body.settings);
+  renderRhAuto();
+}
+
+async function saveRhAuto(enabled) {
+  const a = state.rhAuto;
+  const body = rhAutoBody(a.form, enabled);
+  if (enabled && body.mode === 'live' && !(a.data?.settings?.enabled && a.data?.settings?.mode === 'live')) {
+    const typed = window.prompt(`开启【实盘】自动交易：信号出现时机器人会用真实资金自动下单（每笔两腿各 ${body.size_usdt} USDT）。\n确认请输入 LIVE`);
+    if ((typed || '').trim() !== 'LIVE') return;
+    body.confirm = 'LIVE';
+  }
+  a.busy = true;
+  a.message = null;
+  renderRhAuto();
+  const { ok, body: result } = await api('/api/rh-spread/auto', { method: 'POST', body, auth: true });
+  a.busy = false;
+  if (ok) {
+    a.dirty = false;
+    a.message = { tone: 'info', text: enabled ? '已保存并开启。' : '已保存（自动交易关闭）。' };
+  } else {
+    a.message = { tone: 'error', text: result.error || '保存失败' };
+  }
+  await loadRhAuto().catch(() => {});
+  renderRhAuto();
+}
+
+const RH_AUTO_EVENT = { opened: '开仓', unwound: '回滚', rejected: '被拒', paused: '暂停', disabled: '关闭', settings: '设置' };
+
+function rhAutoHtml(a, cfg) {
+  if (!cfg?.auth_configured) return '<h3>自动交易</h3><p class="muted small">看板没有配置 ARB_WEB_TOKEN，自动交易不可用。</p>';
+  if (!token()) return '<h3>自动交易</h3><p class="muted small">点右上角「令牌」填写后才能查看和设置自动交易。</p>';
+  const data = a.data;
+  if (!data) return '<h3>自动交易</h3><p class="muted small">读取中…</p>';
+  if (data.error) return `<h3>自动交易</h3><div class="notice error">${esc(data.error)}</div>`;
+  const f = a.form;
+  const on = Boolean(data.settings.enabled);
+  const liveMode = data.settings.mode === 'live';
+  const badge = on
+    ? `<span class="tag ${liveMode ? 'coral' : 'pc-pass'}">${liveMode ? '实盘自动交易中' : '纸面自动交易中'}</span>`
+    : '<span class="tag">已关闭</span>';
+  const field = ([key, label, type, step, hint]) => `<label class="field" title="${esc(hint)}"><span>${esc(label)}</span><input type="${type}" step="${step}" data-rh-auto="${key}" value="${esc(f[key])}"${key === 'take_profit_usdt' || key === 'liq_protection_pct' ? ' placeholder="不设"' : ''} /></label>`;
+  const maxSize = data.max_position_usdt;
+  const warnings = [];
+  if (f.mode === 'live' && !data.live_can_trade) warnings.push('实盘没连上或是只读模式：不能开启实盘自动交易。');
+  if (f.mode === 'paper' && !data.paper_watch_sec) warnings.push('纸面规则没有在看板后台运行（ARB_WEB_PAPER_WATCH_SEC=0）：纸面自动仓位不会被自动平仓，只能在持仓页手动「执行一轮规则」。');
+  if (!f.back_to_normal && String(f.take_profit_usdt).trim() === '') warnings.push('至少开启一条退出规则（回到正常基差平仓 / 止盈），否则不能保存。');
+  if (num(f.size_usdt) !== null && num(data.monitor_size_usdt) !== null && num(f.size_usdt) > num(data.monitor_size_usdt)) {
+    warnings.push(`表格里的净收益按 ${num(data.monitor_size_usdt)} USDT 估算；你的单笔更大，吃得更深，实际价差会更差（下单前按你的金额重算，不够会被拒）。`);
+  }
+  const opened = data.open_positions || [];
+  const events = (data.events || []).slice(0, 12);
+  return `
+    <div class="row-head">
+      <h3>自动交易</h3> ${badge}
+      <span class="grow"></span>
+      <span class="small muted">${esc(data.status || '')}</span>
+    </div>
+    ${data.disabled_reason && !on ? `<div class="notice error">上次自动关闭的原因：${esc(data.disabled_reason)}</div>` : ''}
+    <p class="small muted">信号的「回到正常净收益」达到门槛、连续保持够久后，按下面的参数自动下一笔价差单。每一笔都走和手动下单同一套检查：对账干净、按你的金额现拉盘口重算、单笔上限${maxSize ? `（${esc(String(maxSize))} USDT）` : ''}、持仓数上限、当日亏损、Telegram /pause 与熔断。同一合约已有仓位不再开；每次尝试后该合约冷却 10 分钟；执行中断（结果未知）或连续 ${data.max_failures} 次回滚会自动关闭。</p>
+    <div class="rh-auto-grid">
+      <label class="field"><span>账户</span><select data-rh-auto="mode">
+        <option value="paper"${f.mode === 'paper' ? ' selected' : ''}>纸面（不碰真实资金）</option>
+        <option value="live"${f.mode === 'live' ? ' selected' : ''}>实盘（真实资金）</option>
+      </select></label>
+      ${RH_AUTO_FIELDS.map(field).join('')}
+      <label class="field" title="逗号分隔，如 NVDA,SPY；留空 = 全部合约"><span>只做这些合约</span><input type="text" data-rh-auto="symbols" value="${esc(f.symbols)}" placeholder="全部" /></label>
+    </div>
+    <label class="small rh-auto-check"><input type="checkbox" data-rh-auto="back_to_normal"${f.back_to_normal ? ' checked' : ''} /> 回到同时段正常基差就平仓（按方向换算成「基差收敛平仓」目标，按盘口核对净收益为正才平）</label>
+    ${warnings.map((w) => `<div class="alert warn small">${esc(w)}</div>`).join('')}
+    ${a.message ? `<div class="alert ${a.message.tone === 'error' ? 'error' : 'info'} small">${esc(a.message.text)}</div>` : ''}
+    <div class="plan-actions">
+      ${on
+        ? `<button type="button" class="btn ghost" data-rh-auto-save${a.busy ? ' disabled' : ''}>保存参数（保持开启）</button><button type="button" class="btn primary" data-rh-auto-off${a.busy ? ' disabled' : ''}>关闭自动交易</button>`
+        : `<button type="button" class="btn ghost" data-rh-auto-save${a.busy ? ' disabled' : ''}>只保存参数</button><button type="button" class="btn primary" data-rh-auto-on${a.busy ? ' disabled' : ''}>${f.mode === 'live' ? '开启实盘自动交易' : '开启纸面自动交易'}</button>`}
+      ${a.dirty ? '<span class="small muted">有未保存的改动</span>' : ''}
+    </div>
+    <div class="small muted">今天（UTC）已自动开 ${Number(data.opened_today) || 0} 笔；自动仓位持有中 ${opened.length} 笔${opened.length ? `：${opened.map((o) => esc(`${o.id} ${o.symbol}`)).join('、')}` : ''}${(data.cooldown || []).length ? `；冷却中：${data.cooldown.map((c) => esc(`${c.symbol} ${c.sec}s`)).join('、')}` : ''}</div>
+    ${events.length ? `<details class="rh-auto-events"><summary>最近动作（${events.length}）</summary><ul>${events.map((e) => `<li><span class="muted">${when(e.at)}</span> <b>${esc(RH_AUTO_EVENT[e.kind] || e.kind)}</b> ${esc(e.text)}</li>`).join('')}</ul></details>` : ''}`;
+}
+
+function renderRhAuto() {
+  const box = $('rh-auto');
+  if (!box) return;
+  // 正在输入时不重画：只更新状态文字。
+  if (box.contains(document.activeElement) && document.activeElement.matches('input, select')) return;
+  box.innerHTML = rhAutoHtml(state.rhAuto, state.tradeConfig);
+  for (const input of box.querySelectorAll('[data-rh-auto]')) {
+    const key = input.getAttribute('data-rh-auto');
+    const update = () => {
+      state.rhAuto.form[key] = input.type === 'checkbox' ? input.checked : input.value;
+      state.rhAuto.dirty = true;
+    };
+    input.addEventListener('input', update);
+    input.addEventListener('change', () => {
+      update();
+      renderRhAuto();
+    });
+  }
+  box.querySelector('[data-rh-auto-on]')?.addEventListener('click', () => saveRhAuto(true));
+  box.querySelector('[data-rh-auto-off]')?.addEventListener('click', () => saveRhAuto(false));
+  box.querySelector('[data-rh-auto-save]')?.addEventListener('click', () => saveRhAuto(Boolean(state.rhAuto.data?.settings?.enabled)));
 }
 
 function scheduleRh() {

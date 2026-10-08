@@ -1216,6 +1216,47 @@ impl Trade {
         }
     }
 
+    /// 台账里还有敞口的仓位：(id, 合约)。纸面台账还没建时为空。
+    pub(crate) async fn exposed_positions(
+        &self,
+        live: bool,
+    ) -> Result<Vec<(String, Symbol)>, String> {
+        let replayed = if live {
+            let Some(live) = self.live_opt() else {
+                return Err("实盘账户没连上".into());
+            };
+            live.ledger
+                .replay()
+                .await
+                .map_err(|error| error.to_string())?
+                .0
+        } else {
+            if !Path::new(&self.paper.ledger_path).exists() {
+                return Ok(Vec::new());
+            }
+            arb_exec::replay_file(&self.paper.ledger_path)
+                .await
+                .map_err(|error| error.to_string())?
+                .0
+        };
+        Ok(replayed
+            .exposed()
+            .into_iter()
+            .map(|position| (position.id.clone(), position.symbol.clone()))
+            .collect())
+    }
+
+    /// 实盘是否可下单（连上且 `trade` 模式）。
+    pub(crate) fn live_can_trade(&self) -> bool {
+        self.live_opt()
+            .is_some_and(|live| live.mode == LiveMode::Trade)
+    }
+
+    /// 纸面规则轮间隔（0 = 看板不跑纸面规则）。
+    pub(crate) fn paper_watch_sec(&self) -> u64 {
+        self.paper.watch_sec
+    }
+
     /// 台账里还有敞口的仓位数（与预览数的同一个口径）。纸面台账还没建时是 0 ——
     /// 只看不做的看板不该为了数仓位去创建台账文件。
     pub(crate) async fn open_positions(&self, live: bool) -> Result<usize, String> {
@@ -1713,7 +1754,7 @@ where
 
 // ───────────────────────────── 请求 ─────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     Paper,
@@ -2284,6 +2325,70 @@ pub async fn api_trade_daily(State(state): State<Arc<AppState>>, headers: Header
         .into_response(),
         Err(message) => fail(StatusCode::INTERNAL_SERVER_ERROR, &message),
     }
+}
+
+/// 自动交易（RH 价差）用的开仓请求：与页面下单同一个结构、同一条路径（[`run_open`]），
+/// 所以对账、闸门、当日亏损、熔断、暂停开仓、二次确认、Telegram 通知一个不少。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn auto_open_body(
+    mode: Mode,
+    symbol: &str,
+    long: Venue,
+    short: Venue,
+    size: Decimal,
+    leverage: Decimal,
+    margin_mode: arb_exec::MarginMode,
+    rules: &TaskRules,
+) -> OpenBody {
+    let opt = |value: Option<Decimal>| value.map(|v| v.normalize().to_string());
+    OpenBody {
+        margin_mode,
+        mode,
+        symbol: symbol.to_string(),
+        long: long.as_str().to_string(),
+        short: short.as_str().to_string(),
+        size: size.normalize().to_string(),
+        leverage: leverage.normalize().to_string(),
+        // 留空：实盘用台账算出来的当日已实现盈亏（算不出就拒绝，不按 0 算）。
+        daily_pnl: None,
+        view: Some("spread".into()),
+        rules: RuleFields {
+            min_funding_apr: None,
+            liq_protection: opt(rules.liq_protection_pct),
+            size_mismatch: opt(rules.size_mismatch_pct),
+            basis_exit: opt(rules.basis_exit_pct),
+            take_profit: opt(rules.take_profit_usdt),
+            auto_margin: None,
+            auto_margin_max: None,
+        },
+        // 自动交易是用户在面板上显式开启的；这里照样走二次确认那道检查（填合约名）。
+        confirm: symbol.split('/').next().map(str::to_string),
+    }
+}
+
+/// 开仓（或预览）并返回状态码与 JSON。供自动交易调用：与页面下单完全同一条路径，
+/// 在独立任务里跑（不随调用方取消），停机排空时拒绝。
+pub(crate) async fn open_for_auto(
+    state: Arc<AppState>,
+    body: OpenBody,
+    execute: bool,
+) -> (StatusCode, serde_json::Value) {
+    let response = if execute {
+        detached(crate::metrics::Op::Open, async move {
+            run_open(&state, &body, true).await
+        })
+        .await
+    } else {
+        run_open(&state, &body, false).await
+    };
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 async fn run_open(state: &AppState, body: &OpenBody, execute: bool) -> Response {

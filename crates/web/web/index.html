@@ -257,7 +257,8 @@
     <h2>Lighter RH ↔ Arcus 价差</h2>
     <p>两家同名合约的实时可成交价差（行情 WebSocket，每秒更新）。按这笔名义吃完两边深度的均价算，扣掉往返手续费和平仓穿价；
       并与该合约<b>同一时段</b>（盘中 / 盘后 / 周末 / 加密币全天）过去 7 天的「正常基差」比较 —— 股票类合约休市时常有系统性偏差，
-      现价差大不代表会收敛到 0。本页只读；<b>点击某一行</b>会跳到策略页的下单界面，带上方向和「回到正常基差」的收敛目标，仍需预览并确认才会下单。</p>
+      现价差大不代表会收敛到 0。<b>点击某一行</b>会跳到策略页的下单界面（仍需预览并确认）；
+      也可以在下面开启<b>自动交易</b>：信号达到你设的门槛并保持够久后，机器人按你设的金额和退出规则自动下单。</p>
   </section>
   <section class="controls card">
     <span class="small" id="rh-status"></span>
@@ -265,6 +266,7 @@
     <label class="small"><input type="checkbox" id="rh-signal-only" /> 只看信号</label>
   </section>
   <div class="stats" id="rh-stats"></div>
+  <section class="card block rh-auto" id="rh-auto"></section>
   <div id="rh-notice"></div>
   <div class="table-wrap card">
     <table class="rh-table">

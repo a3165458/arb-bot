@@ -24,7 +24,8 @@ function harness(storage = new Map()) {
       state, RULE_FIELDS, positionRuleForm, positionRulesEditor, ruleFields,
       rememberPositionRuleValues, rulePreferenceKey, ruleDraftKey, wirePositionRules,
       savePositionRules, saveStrategyParams, tradeBody, marginModeError, ruleFormError,
-      pnlSummary, bookExitText, rhRow, rhStatus, renderRhSpread, rhOrderTarget, rhOriginNote, openRhInStrategy,
+      pnlSummary, bookExitText, rhRow, rhStatus, renderRhSpread, rhOrderTarget, rhOriginNote, openRhInStrategy, rhAutoForm, rhAutoBody, rhAutoHtml, saveRhAuto,
+      mockPrompt(fn) { globalThis.window = { prompt: fn }; },
       mockShowPage(fn) { showPage = fn; },
       mockApi(fn) { api = fn; },
       mockRefresh(fn) { loadPositions = fn; },
@@ -359,4 +360,50 @@ test('clicking an RH spread row opens the spread order form with the depth-chose
   assert.match(app.rhOriginNote(s.selected.fromRh), /0\.112%/);
   // 打开下单界面不会发任何请求、不会下单：只切页面和表单。
   assert.equal(app.state.trade.preview, null);
+});
+
+test('RH auto-trading panel round-trips settings, needs a token, and makes live opt-in explicit', async () => {
+  const { app, context } = harness();
+  const settings = {
+    enabled: false, mode: 'paper', size_usdt: '500', leverage: '3', min_net_pct: '0.05', hold_sec: 10,
+    back_to_normal: true, take_profit_usdt: null, liq_protection_pct: null, max_positions: 1, daily_max_opens: 3, symbols: [],
+  };
+  const form = app.rhAutoForm(settings);
+  assert.equal(form.take_profit_usdt, '');
+  const body = plain(app.rhAutoBody({ ...form, take_profit_usdt: ' 1.5 ', symbols: 'nvda， spy' }, true));
+  assert.deepEqual(
+    [body.enabled, body.take_profit_usdt, body.liq_protection_pct, body.symbols, body.hold_sec],
+    [true, '1.5', null, ['NVDA', 'SPY'], 10],
+  );
+
+  const cfg = { auth_configured: true };
+  const a = { data: { settings, status: '监控中', max_failures: 2, events: [], open_positions: [], cooldown: [], paper_watch_sec: 0, live_can_trade: true, monitor_size_usdt: '2000' }, form, dirty: false };
+  const html = app.rhAutoHtml(a, cfg);
+  for (const part of ['已关闭', '开启纸面自动交易', '纸面规则没有在看板后台运行', '监控中']) assert.ok(html.includes(part), part);
+  const noExit = app.rhAutoHtml({ ...a, form: { ...form, back_to_normal: false } }, cfg);
+  assert.match(noExit, /至少开启一条退出规则/);
+  const bigger = app.rhAutoHtml({ ...a, form: { ...form, size_usdt: '5000' } }, cfg);
+  assert.match(bigger, /实际价差会更差/);
+  assert.match(app.rhAutoHtml(a, { auth_configured: false }), /ARB_WEB_TOKEN/);
+
+  // 开启实盘：不输入 LIVE 就不发请求；输入了才带上 confirm。
+  const sent = [];
+  app.mockApi(async (url, opts = {}) => {
+    if (opts.method === 'POST') sent.push(plain(opts.body));
+    return { ok: true, status: 200, body: { settings } };
+  });
+  context.document.getElementById = () => null;
+  app.state.rhAuto = { data: a.data, form: { ...form, mode: 'live' }, dirty: true, busy: false, message: null };
+  app.mockPrompt(() => 'live');
+  await app.saveRhAuto(true);
+  assert.equal(sent.length, 0, '没输入 LIVE 不发请求');
+  app.mockPrompt(() => 'LIVE');
+  await app.saveRhAuto(true);
+  assert.equal(sent.length, 1);
+  assert.deepEqual([sent[0].enabled, sent[0].mode, sent[0].confirm], [true, 'live', 'LIVE']);
+  // 纸面开启不需要确认。
+  app.state.rhAuto.form = { ...form, mode: 'paper' };
+  app.mockPrompt(() => { throw new Error('纸面不该弹确认'); });
+  await app.saveRhAuto(true);
+  assert.equal(sent[1].confirm, undefined);
 });

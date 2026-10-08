@@ -429,3 +429,13 @@ footer p { margin: 0 0 6px; max-width: 980px; }
 /* 实盘暂时连不上的横幅 */
 .live-pending { margin: 0 auto; max-width: 1400px; padding: 10px 16px; border: 1px solid #ef535066; border-radius: var(--radius); background: var(--danger-bg); color: var(--danger-text); font-size: 13px; }
 .live-pending.hidden { display: none; }
+
+/* RH 价差自动交易 */
+.rh-auto { margin: 12px 0; }
+.rh-auto h3 { margin: 0; }
+.rh-auto .row-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.rh-auto-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin: 10px 0; }
+.rh-auto-check { display: flex; align-items: flex-start; gap: 6px; margin: 4px 0 10px; color: var(--text-2); }
+.rh-auto .plan-actions { display: flex; gap: 8px; align-items: center; margin: 10px 0 6px; }
+.rh-auto-events ul { margin: 6px 0 0; padding-left: 18px; font-size: 12px; }
+.rh-auto-events summary { cursor: pointer; color: var(--text-3); font-size: 12px; margin-top: 6px; }

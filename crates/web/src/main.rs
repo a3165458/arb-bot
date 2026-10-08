@@ -31,6 +31,7 @@ mod cache;
 mod metrics;
 mod pause;
 mod precheck;
+mod rh_auto;
 mod rh_spread;
 mod shutdown;
 mod strategy;
@@ -57,6 +58,7 @@ struct AppState {
     precheck: Arc<precheck::Prechecker>,
     alerts: Arc<alert::Alerter>,
     rh_spread: Arc<rh_spread::Monitor>,
+    rh_auto: Arc<rh_auto::AutoTrader>,
 }
 
 #[tokio::main]
@@ -120,12 +122,14 @@ async fn main() -> anyhow::Result<()> {
     precheck.spawn(Arc::clone(&cache), settings.clone());
 
     // Lighter RH ↔ Arcus 价差监控（只读）：行情走 WebSocket，不占 REST 限频额度。
+    let rh_auto = rh_auto::AutoTrader::load(&rh_spread_config.dir);
     let rh_spread = rh_spread::Monitor::new(rh_spread_config, Arc::clone(&alerts));
     rh_spread.spawn(client.clone());
 
     let bind = format!("{host}:{}", settings.http_port);
     let state = Arc::new(AppState {
         rh_spread,
+        rh_auto,
         settings,
         cache,
         apis,
@@ -147,6 +151,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/plan", get(api_plan))
         .route("/api/positions", get(api_positions))
         .route("/api/rh-spread", get(api_rh_spread))
+        .route(
+            "/api/rh-spread/auto",
+            get(rh_auto::api_get).post(rh_auto::api_set),
+        )
         .route("/api/trade/config", get(trade::api_trade_config))
         .route("/api/trade/daily", get(trade::api_trade_daily))
         .route("/api/trade/preview", post(trade::api_trade_preview))
@@ -170,6 +178,18 @@ async fn main() -> anyhow::Result<()> {
             "frame-ancestors 'none'",
         ))
         .layer(security_header(header::CACHE_CONTROL, "no-store"));
+
+    // RH 价差自动交易：默认关闭，面板上开启后才会下单。
+    state.rh_auto.spawn(Arc::clone(&state));
+    {
+        let auto = state.rh_auto.settings().await;
+        if auto.enabled {
+            warn!(
+                "RH 价差自动交易已开启（沿用上次的设置）：{}",
+                rh_auto::describe(&auto)
+            );
+        }
+    }
 
     // 命令机器人（菜单与只读查询）：配了 Telegram 密钥才启动，只有管理员的私聊能用。
     telegram::spawn(&state, &client);
