@@ -12,20 +12,37 @@ async fn live_probe() {
         alert_net_pct: Decimal::new(5, 2),
         equities_only: false,
         dir: dir.clone(),
+        pairs: Pair::parse_list(pairs::DEFAULT_PAIRS).unwrap(),
+        entropy_rebate: Decimal::TWO,
     };
     let monitor = Monitor::new(config, crate::alert::Alerter::with_sink(None));
     let client = arb_venues::build_client(20).unwrap();
-    monitor.spawn(client);
+    // 先跑一轮扫描给 Hyperliquid 的组核对身份。
+    let settings = arb_core::Settings::from_env().unwrap();
+    let apis = arb_venues::build_all(&settings, &client);
+    let cache = Arc::new(crate::cache::ScanCache::default());
+    cache.put(arb_scanner::scan(&apis, &settings).await).await;
+    monitor.spawn(client, cache);
     tokio::time::sleep(Duration::from_secs(90)).await;
     let view = monitor.view().await;
     println!(
-        "connected={:?} fee={:?} error={:?} lines={}",
+        "connected={:?} error={:?} lines={}",
         view.connected,
-        view.fee_round_trip_pct,
         view.error,
         view.lines.len()
     );
-    for line in view.lines.iter().take(40) {
+    for pair in &view.pairs {
+        println!(
+            "pair {} markets {} fee {:?}~{:?} history {} note {:?}",
+            pair.id,
+            pair.markets,
+            pair.fee_min_pct,
+            pair.fee_max_pct,
+            pair.history_minutes,
+            pair.note
+        );
+    }
+    for line in view.lines.iter().take(80) {
         let leg = |l: &Option<Leg>| {
             l.as_ref()
                 .map(|l| {
@@ -37,13 +54,14 @@ async fn live_probe() {
                 .unwrap_or("-".into())
         };
         println!(
-            "{:8} {:6} basis {:>9} age {:?} | A {} | L {} | note {:?}",
+            "{:28} {:10} {:6} basis {:>9} age {:?} | long_a {} | long_b {} | note {:?}",
+            line.pair,
             line.base,
             line.session.label(),
             line.basis_pct.map(|b| b.to_string()).unwrap_or("-".into()),
             line.age_sec,
-            leg(&line.long_arcus),
-            leg(&line.long_lighter),
+            leg(&line.long_a),
+            leg(&line.long_b),
             line.note
         );
     }
@@ -79,23 +97,31 @@ fn config() -> Config {
         alert_net_pct: dec!(0.05),
         equities_only: false,
         dir: std::env::temp_dir(),
+        pairs: vec![Pair::RH],
+        entropy_rebate: Decimal::ZERO,
     }
 }
 
-fn market(category: &str) -> Market {
-    Market {
+/// Arcus（a，吃单 0.0225%）↔ Lighter RH（b，0）的 SPY。
+fn market(category: &str) -> PairMarket {
+    market_with(category, Some(dec!(0.000225)))
+}
+
+fn market_with(category: &str, arcus_fee: Option<Decimal>) -> PairMarket {
+    let venue_market = |key: &str, fee| pairs::VenueMarket {
+        key: key.into(),
+        taker_fee: fee,
+        category: None,
+        outside_rth: None,
+    };
+    PairMarket {
         base: "SPY".into(),
-        lighter_id: 26,
-        arcus_name: "SPY-USD".into(),
+        a: venue_market("SPY-USD", arcus_fee),
+        b: venue_market("26", Some(Decimal::ZERO)),
         category: category.into(),
         outside_rth: Some(true),
     }
 }
-
-const FEES: Fees = Fees {
-    arcus_taker: Decimal::from_parts(225, 0, 0, false, 6),
-    lighter_taker: Decimal::ZERO,
-};
 
 fn normal(median: f64) -> Normal {
     Normal {
@@ -167,17 +193,17 @@ fn net_to_normal_subtracts_the_part_of_the_basis_that_never_comes_back() {
     let cfg = config();
     // 没有正常水平：只给「收敛到 0」，不发信号。
     let line = evaluate(
+        Pair::RH,
         &m,
         Some(&arcus),
         Some(&lighter),
-        Some(FEES),
         None,
         30,
         Session::Off,
         &cfg,
         now,
     );
-    let leg = line.long_arcus.clone().unwrap();
+    let leg = line.long_a.clone().unwrap();
     assert_eq!(
         leg.net_to_zero_pct,
         dec!(0.1998) - dec!(0.01998) - dec!(0.045)
@@ -185,22 +211,22 @@ fn net_to_normal_subtracts_the_part_of_the_basis_that_never_comes_back() {
     assert_eq!(leg.net_to_normal_pct, None);
     assert_eq!(line.normal_missing_minutes, history::MIN_MINUTES - 30);
     let best = line.best.unwrap();
-    assert_eq!(best.direction, "long_arcus");
+    assert_eq!(best.direction, "long_a");
     assert!(!best.signal, "没有正常水平不提醒");
 
     // 正常基差就是 −0.2%（休市时 Arcus 一直便宜）：回到正常水平几乎什么都赚不到。
     let line = evaluate(
+        Pair::RH,
         &m,
         Some(&arcus),
         Some(&lighter),
-        Some(FEES),
         Some(normal(-0.2)),
         500,
         Session::Off,
         &cfg,
         now,
     );
-    let leg = line.long_arcus.clone().unwrap();
+    let leg = line.long_a.clone().unwrap();
     assert_eq!(
         leg.net_to_normal_pct,
         Some((leg.net_to_zero_pct - dec!(0.2)).round_dp(5))
@@ -209,10 +235,10 @@ fn net_to_normal_subtracts_the_part_of_the_basis_that_never_comes_back() {
 
     // 正常基差 −0.05%：现在偏到 −0.22%，回到 −0.05% 净赚 ≈ 0.085%，超过门槛 0.05%。
     let line = evaluate(
+        Pair::RH,
         &m,
         Some(&arcus),
         Some(&lighter),
-        Some(FEES),
         Some(normal(-0.05)),
         500,
         Session::Off,
@@ -230,17 +256,17 @@ fn net_to_normal_subtracts_the_part_of_the_basis_that_never_comes_back() {
         "盘后",
         "-0.050%",
         "0.85 USDT",
-        "不会自动下单",
+        "Arcus − Lighter RH",
     ] {
         assert!(text.contains(part), "{part} 不在：{text}");
     }
 
     // 反方向：Lighter 便宜时选多 Lighter；正常基差的符号反过来用。
     let line = evaluate(
+        Pair::RH,
         &m,
         Some(&lighter),
         Some(&arcus),
-        Some(FEES),
         Some(normal(0.05)),
         500,
         Session::Off,
@@ -248,7 +274,7 @@ fn net_to_normal_subtracts_the_part_of_the_basis_that_never_comes_back() {
         now,
     );
     let best = line.best.unwrap();
-    assert_eq!(best.direction, "long_lighter");
+    assert_eq!(best.direction, "long_b");
     assert!(best.signal);
     assert_eq!(best.net_usdt, Some(dec!(0.85)));
 }
@@ -265,10 +291,10 @@ fn stale_thin_or_missing_books_never_signal() {
     let m = market("INDICES");
     let cfg = config();
     let thin = evaluate(
+        Pair::RH,
         &m,
         Some(&arcus),
         Some(&lighter),
-        Some(FEES),
         Some(normal(0.0)),
         500,
         Session::Off,
@@ -283,10 +309,10 @@ fn stale_thin_or_missing_books_never_signal() {
     );
     let later = now + Duration::from_secs(16);
     let stale = evaluate(
+        Pair::RH,
         &m,
         Some(&old),
         Some(&lighter),
-        Some(FEES),
         Some(normal(0.0)),
         500,
         Session::Off,
@@ -295,10 +321,10 @@ fn stale_thin_or_missing_books_never_signal() {
     );
     assert!(stale.best.is_none() && stale.note.unwrap().contains("没更新"));
     let missing = evaluate(
+        Pair::RH,
         &m,
         None,
         Some(&lighter),
-        Some(FEES),
         None,
         0,
         Session::Off,
@@ -307,10 +333,10 @@ fn stale_thin_or_missing_books_never_signal() {
     );
     assert!(missing.best.is_none() && missing.basis_pct.is_none());
     let no_fee = evaluate(
-        &m,
+        Pair::RH,
+        &market_with("INDICES", None),
         Some(&old),
         Some(&lighter),
-        None,
         Some(normal(0.0)),
         500,
         Session::Off,
@@ -413,8 +439,26 @@ async fn history_round_trips_through_daily_files_and_skips_broken_lines() {
             el: None,
         })
         .collect();
-    history::append(&dir, &rows, now).await.unwrap();
-    let path = history::file_for(&dir, now.date_naive());
+    history::append(&dir, "rh-spread", &rows, now)
+        .await
+        .unwrap();
+    // 另一组的文件：前缀不同，互不影响、不被误删。
+    let other = Pair::parse("hyperliquid-xyz:lighter-rh")
+        .unwrap()
+        .file_prefix();
+    assert_eq!(other, "spread-hyperliquid-xyz-lighter-rh");
+    assert_eq!(
+        Pair::RH.file_prefix(),
+        "rh-spread",
+        "最早那组沿用原来的文件，历史照常读"
+    );
+    let other_old = history::file_for(
+        &dir,
+        &other,
+        (now - chrono::Duration::days(history::KEEP_DAYS + 3)).date_naive(),
+    );
+    std::fs::write(&other_old, "").unwrap();
+    let path = history::file_for(&dir, "rh-spread", now.date_naive());
     let mut text = std::fs::read_to_string(&path).unwrap();
     assert!(!text.contains("\"el\""), "缺的字段不写");
     text.push_str("{broken\n");
@@ -422,13 +466,19 @@ async fn history_round_trips_through_daily_files_and_skips_broken_lines() {
     // 超过保留期的旧文件在下次写入时删掉。
     let ancient = history::file_for(
         &dir,
+        "rh-spread",
         (now - chrono::Duration::days(history::KEEP_DAYS + 3)).date_naive(),
     );
     std::fs::write(&ancient, "").unwrap();
-    history::append(&dir, &rows[..1], now).await.unwrap();
+    history::append(&dir, "rh-spread", &rows[..1], now)
+        .await
+        .unwrap();
     assert!(!ancient.exists());
-    let (loaded, broken) = history::load(&dir, now).await;
+    assert!(other_old.exists(), "只清理本组的旧文件");
+    let (loaded, broken) = history::load(&dir, "rh-spread", now).await;
     assert_eq!((loaded.minutes("QQQ", Session::Off, now), broken), (3, 1));
+    let (empty, _) = history::load(&dir, &other, now).await;
+    assert_eq!(empty.coverage_minutes(), 0, "各组历史分开");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -497,12 +547,13 @@ fn feeds_parse_snapshots_deltas_and_errors() {
 
 #[test]
 fn lighter_nonce_gap_drops_the_book_and_asks_for_a_resubscribe() {
-    let index: HashMap<String, usize> = [("26".to_string(), 0)].into();
-    let mut books = vec![None];
+    let mut books = HashMap::new();
     let (tx, mut rx) = mpsc::channel(4);
+    let lighter = Venue::LighterRh;
+    let key = (lighter, "26".to_string());
     apply(
         &mut books,
-        &index,
+        lighter,
         feed::Event::Snapshot {
             market: "26".into(),
             bids: vec![(dec!(1), dec!(1))],
@@ -513,7 +564,7 @@ fn lighter_nonce_gap_drops_the_book_and_asks_for_a_resubscribe() {
     );
     apply(
         &mut books,
-        &index,
+        lighter,
         feed::Event::Delta {
             market: "26".into(),
             bids: vec![(dec!(1.5), dec!(1))],
@@ -523,10 +574,23 @@ fn lighter_nonce_gap_drops_the_book_and_asks_for_a_resubscribe() {
         },
         Some(&tx),
     );
-    assert_eq!(books[0].as_ref().unwrap().best_bid(), Some(dec!(1.5)));
+    assert_eq!(books[&key].best_bid(), Some(dec!(1.5)));
+    // 别家同名的市场是另一本盘口。
     apply(
         &mut books,
-        &index,
+        Venue::Arcus,
+        feed::Event::Snapshot {
+            market: "26".into(),
+            bids: vec![(dec!(9), dec!(1))],
+            asks: vec![(dec!(10), dec!(1))],
+            nonce: None,
+        },
+        None,
+    );
+    assert_eq!(books[&key].best_bid(), Some(dec!(1.5)));
+    apply(
+        &mut books,
+        lighter,
         feed::Event::Delta {
             market: "26".into(),
             bids: vec![],
@@ -536,12 +600,12 @@ fn lighter_nonce_gap_drops_the_book_and_asks_for_a_resubscribe() {
         },
         Some(&tx),
     );
-    assert!(books[0].is_none(), "丢了增量的盘口不能再用");
-    assert_eq!(rx.try_recv().unwrap(), 26);
+    assert!(!books.contains_key(&key), "丢了增量的盘口不能再用");
+    assert_eq!(rx.try_recv().unwrap(), "26");
     // 没有快照之前的增量忽略。
     apply(
         &mut books,
-        &index,
+        lighter,
         feed::Event::Delta {
             market: "26".into(),
             bids: vec![(dec!(1), dec!(1))],
@@ -551,46 +615,190 @@ fn lighter_nonce_gap_drops_the_book_and_asks_for_a_resubscribe() {
         },
         Some(&tx),
     );
-    assert!(books[0].is_none());
+    assert!(!books.contains_key(&key));
 }
 
 #[test]
-fn discovery_matches_online_perps_by_base_and_keeps_fees_honest() {
+fn catalogs_keep_fees_honest_and_pairs_need_a_verified_identity() {
     let arcus = serde_json::json!({"markets": [
         {"marketDisplayName": "SPY-USD", "baseAsset": "SPY", "status": "ONLINE", "type": "PERPETUAL", "category": "INDICES", "isOutsideRth": true},
         {"marketDisplayName": "BTC-USD", "baseAsset": "BTC", "status": "ONLINE", "type": "PERPETUAL", "category": "CRYPTO", "isOutsideRth": null},
         {"marketDisplayName": "F-USD", "baseAsset": "F", "status": "OFFLINE", "type": "PERPETUAL", "category": "EQUITIES"},
-        {"marketDisplayName": "XBT-USD", "baseAsset": "QQQ", "status": "ONLINE", "type": "PERPETUAL", "category": "INDICES"}
+        {"marketDisplayName": "XBT-USD", "baseAsset": "QQQ", "status": "ONLINE", "type": "PERPETUAL", "category": "INDICES"},
+        {"marketDisplayName": "QNT-USD", "baseAsset": "QNT", "status": "ONLINE", "type": "PERPETUAL", "category": "EQUITIES"}
     ]});
     let lighter = serde_json::json!({"order_book_details": [
         {"symbol": "SPY", "market_id": 26, "status": "active", "market_type": "perp", "taker_fee": "0.0000"},
         {"symbol": "BTC", "market_id": 1, "status": "active", "market_type": "perp", "taker_fee": "0.0000"},
         {"symbol": "F", "market_id": 3, "status": "active", "market_type": "perp", "taker_fee": "0.0000"},
-        {"symbol": "QQQ", "market_id": 4, "status": "active", "market_type": "perp", "taker_fee": "0.0000"}
+        {"symbol": "QQQ", "market_id": 4, "status": "active", "market_type": "perp"}
     ]});
-    let (markets, fees) = discover_from(&arcus, dec!(0.000225), &lighter, false).unwrap();
+    let xyz = serde_json::json!({"universe": [
+        {"name": "xyz:SPY", "deployerFeeScale": "1.0", "growthMode": "enabled"},
+        {"name": "xyz:QNT", "deployerFeeScale": "1.0", "growthMode": "enabled"},
+        {"name": "xyz:GOLD", "deployerFeeScale": "1.0"},
+        {"name": "xyz:OLD", "deployerFeeScale": "1.0", "isDelisted": true},
+        {"name": "io:ANTH", "deployerFeeScale": "1.0"}
+    ]});
+    let io = serde_json::json!({"universe": [{"name": "io:ANTH", "deployerFeeScale": "1.0", "growthMode": "enabled"}]});
+    let mut catalog = Catalog::new();
+    catalog.insert(
+        Venue::Arcus,
+        catalog::arcus(&arcus, dec!(0.000225)).unwrap(),
+    );
+    catalog.insert(Venue::LighterRh, catalog::lighter(&lighter).unwrap());
+    catalog.insert(
+        Venue::HyperliquidXyz,
+        catalog::hyperliquid(Venue::HyperliquidXyz, &xyz, Decimal::TWO).unwrap(),
+    );
+    catalog.insert(
+        Venue::HyperliquidIo,
+        catalog::hyperliquid(Venue::HyperliquidIo, &io, Decimal::TWO).unwrap(),
+    );
+    assert!(catalog::arcus(&arcus, dec!(0.5)).is_err());
+
+    // 最早那组：按 base 对齐，不需要扫描。Lighter 没报费率的 QQQ 不知道往返费，不当 0。
+    let rh = pairs::pair_markets(Pair::RH, &catalog, None, false);
     assert_eq!(
-        markets.iter().map(|m| m.base.as_str()).collect::<Vec<_>>(),
-        ["BTC", "SPY"]
+        rh.iter().map(|m| m.base.as_str()).collect::<Vec<_>>(),
+        ["BTC", "QQQ", "SPY"]
+            .iter()
+            .filter(|b| **b != "QQQ")
+            .copied()
+            .collect::<Vec<_>>(),
+        "XBT-USD 名不符的 QQQ 不配"
     );
-    assert_eq!(markets[1].outside_rth, Some(true));
-    assert_eq!(fees.round_trip_pct(), dec!(0.045));
-    let (equities, _) = discover_from(&arcus, dec!(0.000225), &lighter, true).unwrap();
-    assert_eq!(equities.len(), 1);
-    // Lighter 没报费率：不当 0，按 Arcus 费率保守估。
-    let unknown = serde_json::json!({"order_book_details": [{"symbol": "SPY", "market_id": 26, "status": "active"}]});
-    let (_, fees) = discover_from(&arcus, dec!(0.000225), &unknown, false).unwrap();
-    assert_eq!(fees.round_trip_pct(), dec!(0.090));
-    assert!(discover_from(&arcus, dec!(0.5), &lighter, false).is_err());
+    let spy = rh.iter().find(|m| m.base == "SPY").unwrap();
+    assert_eq!(spy.round_trip_pct(), Some(dec!(0.045)));
+    assert_eq!((spy.a.key.as_str(), spy.b.key.as_str()), ("SPY-USD", "26"));
+    assert_eq!(spy.outside_rth, Some(true));
+    assert_eq!(
+        pairs::pair_markets(Pair::RH, &catalog, None, true).len(),
+        1,
+        "只看股票类"
+    );
+
+    // HL-xyz 的组：没有扫描就不配；身份簇不同（QNT 股票 vs 币）不配；同簇才配。
+    let xyz_rh = Pair::parse("hyperliquid-xyz:lighter-rh").unwrap();
+    assert!(pairs::pair_markets(xyz_rh, &catalog, None, false).is_empty());
+    let arcus_xyz = Pair::parse("arcus:hyperliquid-xyz").unwrap();
+    let mut identity = pairs::Identity::new();
+    identity.insert((Venue::Arcus, "SPY".into()), 1);
+    identity.insert((Venue::HyperliquidXyz, "SPY".into()), 1);
+    identity.insert((Venue::Arcus, "QNT".into()), 2);
+    identity.insert((Venue::HyperliquidXyz, "QNT".into()), 3);
+    let found = pairs::pair_markets(arcus_xyz, &catalog, Some(&identity), false);
+    assert_eq!(
+        found.iter().map(|m| m.base.as_str()).collect::<Vec<_>>(),
+        ["SPY"]
+    );
+    // growth mode：xyz 单边 0.045% × 2 × 0.1 = 0.009%，Arcus 0.0225% → 往返 (0.009 + 0.0225) × 2 = 0.063%；类别取 Arcus 的。
+    assert_eq!(found[0].round_trip_pct(), Some(dec!(0.063)));
+    assert_eq!(found[0].category, "INDICES");
+    assert_eq!(found[0].b.key, "xyz:SPY");
+    // xyz 的 catalog：别名 GOLD→XAU、下架的跳过、别的 dex 的币名不收。
+    let x = &catalog[&Venue::HyperliquidXyz];
+    assert!(x.contains_key("XAU") && !x.contains_key("OLD") && !x.contains_key("ANTHROPIC"));
+    assert_eq!(
+        x["XAU"].taker_fee,
+        Some(dec!(0.0009)),
+        "没开 growth：×2 不打折"
+    );
+    // io：Tier 4 返佣 → 0（不是负数）。
+    assert_eq!(
+        catalog[&Venue::HyperliquidIo]["ANTHROPIC"].taker_fee,
+        Some(Decimal::ZERO)
+    );
+
+    // 组的解析：不支持的场所、同一场所、重复（反过来写也算）都报错。
+    assert!(Pair::parse("binance:arcus").is_err());
+    assert!(Pair::parse("arcus:arcus").is_err());
+    assert!(Pair::parse_list("arcus:lighter-rh,lighter-rh:arcus").is_err());
+    assert_eq!(Pair::parse_list(pairs::DEFAULT_PAIRS).unwrap()[0], Pair::RH);
+}
+
+#[test]
+fn hyperliquid_feed_parses_full_snapshots() {
+    let text = r#"{"channel":"l2Book","data":{"coin":"xyz:NVDA","time":1791514562612,"levels":[[{"px":"232.16","sz":"14.29","n":2}],[{"px":"232.17","sz":"65.506","n":3}]]}}"#;
+    assert_eq!(
+        feed::parse_hyperliquid(text).unwrap(),
+        feed::Event::Snapshot {
+            market: "xyz:NVDA".into(),
+            bids: vec![(dec!(232.16), dec!(14.29))],
+            asks: vec![(dec!(232.17), dec!(65.506))],
+            nonce: None
+        }
+    );
+    assert_eq!(
+        feed::parse_hyperliquid(r#"{"channel":"subscriptionResponse","data":{}}"#).unwrap(),
+        feed::Event::Other
+    );
+    assert!(matches!(
+        feed::parse_hyperliquid(r#"{"channel":"error","data":"Invalid subscription"}"#).unwrap(),
+        feed::Event::Error(_)
+    ));
     assert!(
-        discover_from(
-            &serde_json::json!({"markets": []}),
-            dec!(0.000225),
-            &lighter,
-            false
-        )
-        .is_err()
+        feed::parse_hyperliquid(r#"{"channel":"l2Book","data":{"coin":"x","levels":[[]]}}"#)
+            .is_err()
     );
+    assert_eq!(
+        feed::hyperliquid_subscribe("io:ANTH"),
+        r#"{"method":"subscribe","subscription":{"coin":"io:ANTH","type":"l2Book"}}"#
+    );
+}
+
+#[test]
+fn a_pair_with_two_snapshot_feeds_goes_stale_on_the_older_book() {
+    let now = Instant::now();
+    let pair = Pair::parse("arcus:hyperliquid-xyz").unwrap();
+    let mut m = market("INDICES");
+    m.b.taker_fee = Some(dec!(0.00009));
+    let fresh = book(
+        &[(dec!(99.98), dec!(100))],
+        &[(dec!(100.00), dec!(100))],
+        now,
+    );
+    let mut old = book(
+        &[(dec!(100.20), dec!(100))],
+        &[(dec!(100.22), dec!(100))],
+        now,
+    );
+    old.updated = now - Duration::from_secs(20);
+    let line = evaluate(
+        pair,
+        &m,
+        Some(&fresh),
+        Some(&old),
+        Some(normal(-0.05)),
+        500,
+        Session::Off,
+        &config(),
+        now,
+    );
+    assert!(line.best.is_none());
+    assert!(
+        line.note.unwrap().contains("hyperliquid-xyz"),
+        "说清楚是哪家过期"
+    );
+    // Lighter RH 只推变化：它的盘口旧不算过期。
+    let line = evaluate(
+        Pair::RH,
+        &market("INDICES"),
+        Some(&fresh),
+        Some(&old),
+        Some(normal(-0.05)),
+        500,
+        Session::Off,
+        &config(),
+        now,
+    );
+    assert!(line.best.is_some());
+    assert_eq!(
+        (line.a, line.b, line.pair.as_str()),
+        (Venue::Arcus, Venue::LighterRh, "arcus:lighter-rh")
+    );
+    let (long, short, _) = line.legs(line.best.as_ref().unwrap().direction).unwrap();
+    assert_eq!((long, short), (Venue::Arcus, Venue::LighterRh));
 }
 
 struct Recorder(std::sync::Mutex<Vec<String>>);
@@ -623,10 +831,10 @@ async fn alerts_need_a_held_signal_and_never_exceed_their_own_rate_limit() {
         now,
     );
     let mut line = evaluate(
+        Pair::RH,
         &market("INDICES"),
         Some(&arcus),
         Some(&lighter),
-        Some(FEES),
         Some(normal(-0.05)),
         500,
         Session::Off,

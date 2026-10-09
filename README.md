@@ -78,7 +78,7 @@ cargo build --release
 | 机会 | 全市场两两配对的资金费榜与价差榜（原有功能），附强平距离与保证金年化 |
 | 策略 | 选两家场所 → 同时上市的合约与两边费率（APR / 8h / 1h）→ 选中一对腿，右侧给出开仓计划、可复制的 `arb-paper` 命令，以及「下单」区（预览 → 纸面 / 实盘开仓） |
 | 持仓 | 纸面 / 实盘台账里的双腿仓位、两腿强平距离、规则与监控建议；平仓、重试退出、手动执行一轮规则；实盘账户的真实持仓与对账 |
-| RH 价差 | Lighter RH ↔ Arcus 同名合约的实时可成交价差、按时段统计的正常基差与提醒；点一行跳到下单界面；可选的自动交易（默认关闭） |
+| 价差监控 | Arcus、Lighter RH、Hyperliquid xyz / io 之间同名合约的实时可成交价差、按时段统计的正常基差与提醒；点一行跳到下单界面；Arcus ↔ RH 组可选自动交易（默认关闭） |
 
 ## 架构
 
@@ -776,7 +776,7 @@ Arcus（`/v1/funding`）；其它场所显示「未接入」，不拿 0 冒充�
   全仓持仓不使用这个模型，只读取交易所报告的有效强平价；缺数据就无法执行爆仓保护。
 - HIP-3 只接了 `xyz` 与 `io` 两个子交易所；其余子交易所多数重复上市同一批股票。
 
-## Lighter RH ↔ Arcus 价差监控与自动交易
+## 跨场所价差监控与自动交易
 
 看板「RH 价差」页。两家都在 Robinhood Chain、都用 USDG 保证金，有 37 个同名合约（美股、指数、商品、加密币），
 价格偶尔偏离。监控与提醒本身不下单、不连账户；下单只有两种途径：点一行跳到策略页手动预览确认，或在面板上**显式开启**自动交易。
@@ -802,6 +802,24 @@ Arcus（`/v1/funding`）；其它场所显示「未接入」，不拿 0 冒充�
 | `ARB_RH_SPREAD_ALERT_PCT` | `0.05` | 提醒门槛：回到正常水平的预估净收益（%，0.001 ~ 5） |
 | `ARB_RH_SPREAD_EQUITIES_ONLY` | 关 | `on` 只看股票、指数、商品，不看加密币 |
 | `ARB_RH_SPREAD_DIR` | `rh-spread` | 分钟历史目录（相对工作目录）；自动交易设置也存在这里（`auto.json`） |
+| `ARB_RH_SPREAD_PAIRS` | 见下 | 监控哪几组，`场所A:场所B` 逗号分隔；支持 `arcus`、`lighter-rh`、`hyperliquid`、`hyperliquid-xyz`、`hyperliquid-io` |
+| `ARB_ENTROPY_SELF_REBATE` | `0` | Entropy（`hyperliquid-io` 的部署方）自返佣比例，小数：Tier 4 = `2`（200%） |
+
+### 多组监控
+
+默认监控 5 组：`arcus:lighter-rh`、`hyperliquid-xyz:lighter-rh`、`arcus:hyperliquid-xyz`、`hyperliquid-io:lighter-rh`、`arcus:hyperliquid-io`。
+每家只连一条行情 WebSocket，几组共用（Hyperliquid 用 `l2Book` 订阅，每侧 20 档完整快照，实测约 5 秒一次，15 秒没更新就不算数）。
+
+- **基差口径**：每组 `(左 − 右) / 均值`，方向 `long_a` = 多左空右。最早那组 `arcus:lighter-rh` 与原来同号，
+  历史文件仍是 `rh-spread-YYYYMMDD.jsonl`，已攒的历史照常使用；其它组写 `spread-<左>-<右>-YYYYMMDD.jsonl`，从零开始攒。
+- **同名 ≠ 同一资产**：有一边是 Hyperliquid 的组，两边都必须落在扫描器的**同一个身份簇**里（价格分簇，被可信度筛查排除的读数不算），
+  所以要等首轮扫描完成才开始订阅；股票 QNT 与币 QNT 这类同名不同资产不会配成一对。
+- **手续费（单边，按基础档上限）**：Arcus 0.0225%、Lighter RH 0、Hyperliquid 主 dex 0.045%；
+  HIP-3（xyz / io）= 0.045% × deployer 倍数（`scale < 1 ? 1 + scale : 2 × scale`，实测 ×2），开着 growth mode 的合约再 ×0.1（逐合约读 `meta`）。
+  `hyperliquid-io` 还按 `ARB_ENTROPY_SELF_REBATE` 扣掉 Entropy 返佣：官方规则按 Entropy 那一半份额返，净费率 = 费率 × (1 − 返佣 / 2)，
+  **最低 0、不算成负的**，且只在倍数为 1 时适用（文档写明的五五分成）。见 https://docs.entropy.io/about-entropy/referrals 。
+  这套费率同样用于扫描器与下单前的价差核算（`taker_fee`）；**台账记的是交易所实际扣的手续费**，返佣到账要自己在 Entropy 领取，不进台账。
+- **自动交易目前只做 `arcus:lighter-rh`**。其它组只监控与提醒：先攒够正常基差的历史、并用第一笔真实成交核对过实际扣费，再开放。
 
 ### 自动交易（默认关闭）
 

@@ -33,6 +33,9 @@ use crate::AppState;
 use crate::rh_spread::{Line, View};
 use crate::trade::Mode;
 
+/// 自动交易做哪一组。其它组先只监控：新组要攒历史、核实真实费率之后再开放。
+pub const AUTO_PAIR: crate::rh_spread::pairs::Pair = crate::rh_spread::pairs::Pair::RH;
+
 /// 同一合约尝试一次后的冷却（成功或被闸门拒绝）。
 const SYMBOL_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// 被闸门拒绝后，下一次尝试（任何合约）至少隔这么久。
@@ -203,10 +206,10 @@ pub struct Candidate {
     pub signal_sec: u64,
 }
 
-/// 价差页基差是 (Arcus − RH)；持仓规则的基差是 (空 − 多)。多 Arcus / 空 RH 时持仓基差 = −页面基差，
+/// 价差页基差是 (a − b)；持仓规则的基差是 (空 − 多)。多 a / 空 b 时持仓基差 = −页面基差，
 /// 所以「回到正常」的目标 = −中位数；反方向就是中位数本身。超出规则允许的 ±5% 时不给目标。
 pub fn target_for(direction: &str, median: f64) -> Option<Decimal> {
-    let raw = if direction == "long_arcus" {
+    let raw = if direction == "long_a" {
         -median
     } else {
         median
@@ -242,7 +245,7 @@ pub fn pick(
     held_sec: &dyn Fn(&Candidate) -> u64,
     busy_symbols: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Candidate, String> {
-    if !view.connected.lighter || !view.connected.arcus {
+    if !view.connected.up(AUTO_PAIR.a) || !view.connected.up(AUTO_PAIR.b) {
         return Err("价差监控有一家行情没连上".into());
     }
     match view.updated_at {
@@ -280,15 +283,12 @@ pub fn pick(
 /// 一行能不能做、怎么做。纯函数。
 pub fn candidate_of(line: &Line, settings: &Settings) -> Option<Candidate> {
     let best = line.best.as_ref()?;
-    if line.note.is_some() {
+    // 自动交易目前只做 Arcus ↔ Lighter RH；其它组只监控、提醒。
+    if line.note.is_some() || line.pair != AUTO_PAIR.id() {
         return None;
     }
     let normal = line.normal.as_ref()?;
-    let (leg, long, short) = match best.direction {
-        "long_arcus" => (line.long_arcus.as_ref()?, Venue::Arcus, Venue::LighterRh),
-        "long_lighter" => (line.long_lighter.as_ref()?, Venue::LighterRh, Venue::Arcus),
-        _ => return None,
-    };
+    let (long, short, leg) = line.legs(best.direction)?;
     let net = leg.net_to_normal_pct?;
     // 下单路径要求可成交价差为正、收敛到 0 也划算（价差单的硬性条件）：不满足的信号去了也会被拒。
     if net < settings.min_net_pct
@@ -969,12 +969,16 @@ mod tests {
     }
 
     fn line(base: &str, direction: &'static str, leg: Leg, median: f64) -> Line {
-        let (long_arcus, long_lighter) = if direction == "long_arcus" {
+        let (long_a, long_b) = if direction == "long_a" {
             (Some(leg), None)
         } else {
             (None, Some(leg))
         };
         Line {
+            pair: AUTO_PAIR.id(),
+            a: Venue::Arcus,
+            b: Venue::LighterRh,
+            fee_round_trip_pct: Some(dec("0.045")),
             base: base.into(),
             category: "EQUITIES".into(),
             session: Session::Rth,
@@ -989,8 +993,8 @@ mod tests {
             }),
             normal_missing_minutes: 0,
             z: Some(-10.0),
-            long_arcus,
-            long_lighter,
+            long_a,
+            long_b,
             best: Some(Best {
                 direction,
                 signal: false,
@@ -1007,13 +1011,11 @@ mod tests {
             enabled: true,
             size_usdt: Decimal::from(2000),
             alert_net_pct: dec("0.05"),
-            fee_round_trip_pct: Some(dec("0.045")),
             min_minutes: 120,
             window_days: 7,
-            history_minutes: 900,
+            pairs: Vec::new(),
             connected: Connected {
-                lighter: true,
-                arcus: true,
+                venues: [(Venue::Arcus, true), (Venue::LighterRh, true)].into(),
                 reconnects: 0,
             },
             updated_at: Some(Utc::now()),
@@ -1033,11 +1035,11 @@ mod tests {
     #[test]
     fn a_qualifying_line_becomes_an_order_with_the_back_to_normal_target_in_position_terms() {
         // 页面基差 (Arcus − RH) 正常 −0.11%；多 Arcus / 空 RH 的持仓基差 (空 − 多) = −页面基差 → 目标 +0.11%。
-        let nvda = line("NVDA", "long_arcus", leg("0.30", "0.20", "0.09"), -0.11);
+        let nvda = line("NVDA", "long_a", leg("0.30", "0.20", "0.09"), -0.11);
         let c = candidate_of(&nvda, &settings()).expect("够门槛");
         assert_eq!((c.long, c.short), (Venue::Arcus, Venue::LighterRh));
         assert_eq!(c.target_pct, Some(dec("0.11")));
-        let reverse = line("NVDA", "long_lighter", leg("0.30", "0.20", "0.09"), -0.11);
+        let reverse = line("NVDA", "long_b", leg("0.30", "0.20", "0.09"), -0.11);
         let c = candidate_of(&reverse, &settings()).unwrap();
         assert_eq!((c.long, c.short), (Venue::LighterRh, Venue::Arcus));
         assert_eq!(c.target_pct, Some(dec("-0.11")));
@@ -1053,42 +1055,31 @@ mod tests {
     #[test]
     fn lines_the_order_path_would_reject_are_never_picked() {
         let s = settings();
+        // 其它组只监控：哪怕信号再好也不自动下单。
+        let mut other = line("NVDA", "long_a", leg("0.3", "0.2", "0.09"), -0.11);
+        other.pair = "hyperliquid-xyz:lighter-rh".into();
+        other.a = Venue::HyperliquidXyz;
+        assert!(candidate_of(&other, &s).is_none());
         // 回到正常净收益不够门槛。
-        assert!(
-            candidate_of(
-                &line("A", "long_arcus", leg("0.3", "0.2", "0.04"), -0.1),
-                &s
-            )
-            .is_none()
-        );
+        assert!(candidate_of(&line("A", "long_a", leg("0.3", "0.2", "0.04"), -0.1), &s).is_none());
         // 可成交价差不为正（价差单的硬性条件）。
         assert!(
-            candidate_of(
-                &line("A", "long_arcus", leg("-0.01", "0.2", "0.09"), -0.1),
-                &s
-            )
-            .is_none()
+            candidate_of(&line("A", "long_a", leg("-0.01", "0.2", "0.09"), -0.1), &s).is_none()
         );
         // 收敛到 0 也不划算（下单路径按它拒绝）。
         assert!(
-            candidate_of(
-                &line("A", "long_arcus", leg("0.1", "-0.01", "0.09"), -0.1),
-                &s
-            )
-            .is_none()
+            candidate_of(&line("A", "long_a", leg("0.1", "-0.01", "0.09"), -0.1), &s).is_none()
         );
         // 盘口过期等。
-        let mut stale = line("A", "long_arcus", leg("0.3", "0.2", "0.09"), -0.1);
+        let mut stale = line("A", "long_a", leg("0.3", "0.2", "0.09"), -0.1);
         stale.note = Some("Arcus 盘口 20 秒没更新".into());
         assert!(candidate_of(&stale, &s).is_none());
         // 没有正常样本。
-        let mut fresh = line("A", "long_arcus", leg("0.3", "0.2", "0.09"), -0.1);
+        let mut fresh = line("A", "long_a", leg("0.3", "0.2", "0.09"), -0.1);
         fresh.normal = None;
         assert!(candidate_of(&fresh, &s).is_none());
         // 目标超出规则允许的 ±5%：不截断成另一个意思的数，直接不做。
-        assert!(
-            candidate_of(&line("A", "long_arcus", leg("0.3", "0.2", "0.09"), 7.0), &s).is_none()
-        );
+        assert!(candidate_of(&line("A", "long_a", leg("0.3", "0.2", "0.09"), 7.0), &s).is_none());
     }
 
     #[test]
@@ -1098,8 +1089,8 @@ mod tests {
             ..settings()
         };
         let v = view(vec![
-            line("NVDA", "long_arcus", leg("0.3", "0.2", "0.09"), -0.11),
-            line("SPY", "long_arcus", leg("0.3", "0.2", "0.08"), -0.11),
+            line("NVDA", "long_a", leg("0.3", "0.2", "0.09"), -0.11),
+            line("SPY", "long_a", leg("0.3", "0.2", "0.08"), -0.11),
         ]);
         let now = Utc::now();
         let none = |_: &str| None;
@@ -1118,7 +1109,7 @@ mod tests {
         assert_eq!(pick(&v, &only, now, &held, &none).unwrap().base, "SPY");
         // 行情断了、快照旧了：不下单。
         let mut down = v.clone();
-        down.connected.arcus = false;
+        down.connected.venues.insert(Venue::Arcus, false);
         assert!(pick(&down, &s, now, &held, &none).is_err());
         let mut old = v.clone();
         old.updated_at = Some(now - chrono::Duration::seconds(30));
@@ -1132,7 +1123,7 @@ mod tests {
         let t0 = Instant::now();
         let good = view(vec![line(
             "NVDA",
-            "long_arcus",
+            "long_a",
             leg("0.3", "0.2", "0.09"),
             -0.11,
         )]);
@@ -1141,7 +1132,7 @@ mod tests {
         assert_eq!(since[&("NVDA".to_string(), Venue::Arcus)], t0);
         let gone = view(vec![line(
             "NVDA",
-            "long_arcus",
+            "long_a",
             leg("0.3", "0.2", "0.01"),
             -0.11,
         )]);

@@ -1,21 +1,24 @@
-//! Lighter RH ↔ Arcus 同名合约价差监控（只读，不下单）。
+//! 跨场所同名合约价差监控（只读，不下单；自动交易见 `rh_auto`）。
 //!
-//! 两家都在 Robinhood Chain 上、都用 USDG 保证金，37 个同名合约（美股、指数、商品、加密币）。
+//! 最早只做 Lighter RH ↔ Arcus（都在 Robinhood Chain 上、都用 USDG 保证金）；现在按**组**监控，
+//! 支持 Arcus、Lighter RH、Hyperliquid 主 dex 与 HIP-3 xyz / io 任意两家（`ARB_RH_SPREAD_PAIRS`）。
 //! 价格偶尔会偏离：一边比另一边贵出手续费加穿价以上。这里：
 //!
-//! 1. 用两家的行情 WebSocket 维护本地盘口（REST 轮询会打穿 Lighter RH 的 IP 限频，
-//!    并挤占实盘下单用的额度）；
-//! 2. 每秒按「这笔名义吃完深度的均价」算两个方向的可成交价差，扣掉 Arcus 两次吃单费
-//!    （Lighter RH 吃单费为 0）和立即平仓的穿价；
-//! 3. 每分钟落盘一行中间价基差，按合约、按时段（盘中 / 盘后 / 周末 / 加密币全天）统计「正常水平」。
-//!    股票类合约在休市时常常有**系统性**偏差：现价差大不等于会收敛到 0，要看相对正常水平偏了多少；
-//! 4. 偏离正常水平、且「回到正常水平」的预估净收益超过门槛时推送 Telegram（同一合约同一方向 30 分钟一条）。
+//! 1. 用各家的行情 WebSocket 维护本地盘口（REST 轮询会打穿 Lighter RH 的 IP 限频，
+//!    并挤占实盘下单用的额度）；每家只连一条，几组共用；
+//! 2. 每秒按「这笔名义吃完深度的均价」算两个方向的可成交价差，扣掉两家各开平一次的吃单费
+//!    和立即平仓的穿价；
+//! 3. 每分钟落盘一行中间价基差（每组一个文件前缀），按合约、按时段（盘中 / 盘后 / 周末 / 加密币全天）
+//!    统计「正常水平」。股票类合约在休市时常常有**系统性**偏差：现价差大不等于会收敛到 0；
+//! 4. 偏离正常水平、且「回到正常水平」的预估净收益超过门槛时推送 Telegram（同一组同一合约同一方向 30 分钟一条）。
 //!
-//! **只读**：不连任何账户、不下单。
+//! 基差一律是 **(a − b) / 均值**，方向叫 `long_a` / `long_b`（最早那组 a = Arcus、b = Lighter RH，与旧历史同号）。
 
 mod book;
+mod catalog;
 mod feed;
 mod history;
+pub mod pairs;
 mod session;
 
 #[cfg(test)]
@@ -37,8 +40,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::alert::Alerter;
+use arb_core::Venue;
 pub use book::{DirectionQuote, LocalBook, mid_basis_pct, quote};
 pub use history::{Normal, Row};
+use pairs::{Catalog, Pair, PairMarket};
 pub use session::{Session, classify};
 
 /// 监控配置（环境变量）。
@@ -52,6 +57,10 @@ pub struct Config {
     /// 只看股票类（股票、指数、商品），不看加密币。
     pub equities_only: bool,
     pub dir: PathBuf,
+    /// 监控哪几组（`ARB_RH_SPREAD_PAIRS`）。
+    pub pairs: Vec<Pair>,
+    /// Entropy（`hyperliquid-io`）自返佣（`ARB_ENTROPY_SELF_REBATE`，2 = 200%）。
+    pub entropy_rebate: Decimal,
 }
 
 impl Config {
@@ -99,61 +108,44 @@ impl Config {
                 Some("1" | "on" | "true")
             ),
             dir: var("ARB_RH_SPREAD_DIR").map_or_else(|| PathBuf::from("rh-spread"), PathBuf::from),
+            pairs: Pair::parse_list(
+                var("ARB_RH_SPREAD_PAIRS")
+                    .as_deref()
+                    .unwrap_or(pairs::DEFAULT_PAIRS),
+            )
+            .map_err(|error| anyhow::anyhow!("ARB_RH_SPREAD_PAIRS：{error}"))?,
+            entropy_rebate: arb_venues::hyperliquid::entropy_self_rebate_from_env()
+                .map_err(|error| anyhow::anyhow!("{error}"))?,
         })
     }
 }
 
-/// 一个同名合约在两家的身份。
-#[derive(Debug, Clone, Serialize)]
-pub struct Market {
-    pub base: String,
-    pub lighter_id: i64,
-    pub arcus_name: String,
-    /// Arcus `category`：`EQUITIES` / `INDICES` / `COMMODITIES` / `CRYPTO`。
-    pub category: String,
-    #[serde(skip)]
-    pub outside_rth: Option<bool>,
-}
-
-impl Market {
-    pub fn crypto(&self) -> bool {
-        self.category == "CRYPTO"
-    }
-}
-
-/// Arcus 吃单费率（单边）。两家都按这一笔开、按这一笔平：Arcus 开平各一次。
-#[derive(Debug, Clone, Copy)]
-pub struct Fees {
-    pub arcus_taker: Decimal,
-    pub lighter_taker: Decimal,
-}
-
-impl Fees {
-    /// 往返两腿手续费（%）：两家各开平一次。
-    pub fn round_trip_pct(&self) -> Decimal {
-        (self.arcus_taker + self.lighter_taker) * Decimal::TWO * Decimal::ONE_HUNDRED
-    }
-}
-
-/// 页面上一行：一个合约此刻的状况。
+/// 页面上一行：一组里一个合约此刻的状况。
 #[derive(Debug, Clone, Serialize)]
 pub struct Line {
+    /// 组标识（`arcus:lighter-rh`）。
+    pub pair: String,
+    /// 基差的被减数 / 减数：(a − b)。
+    pub a: Venue,
+    pub b: Venue,
     pub base: String,
     pub category: String,
     pub session: Session,
-    /// 中间价基差（%）：(Arcus − Lighter RH) / 均值。
+    /// 往返两腿手续费（%）。
+    pub fee_round_trip_pct: Option<Decimal>,
+    /// 中间价基差（%）：(a − b) / 均值。
     pub basis_pct: Option<Decimal>,
     pub normal: Option<Normal>,
     /// 正常水平还差多少分钟样本（够了为 0）。
     pub normal_missing_minutes: usize,
     /// 偏离正常水平几个 MAD。
     pub z: Option<f64>,
-    /// 两个方向的报价与净收益。
-    pub long_arcus: Option<Leg>,
-    pub long_lighter: Option<Leg>,
+    /// 两个方向的报价与净收益：多 a 空 b / 多 b 空 a。
+    pub long_a: Option<Leg>,
+    pub long_b: Option<Leg>,
     /// 更好的那个方向。
     pub best: Option<Best>,
-    /// Arcus 盘口多久没更新（秒）。
+    /// 两家盘口里较旧的那本多久没更新（秒）。
     pub age_sec: Option<u64>,
     pub note: Option<String>,
 }
@@ -170,7 +162,7 @@ pub struct Leg {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Best {
-    /// `long_arcus` / `long_lighter`。
+    /// `long_a` / `long_b`。
     pub direction: &'static str,
     /// 达到提醒条件（回到正常水平净收益 ≥ 门槛、样本够、盘口新鲜）。
     pub signal: bool,
@@ -186,24 +178,48 @@ pub struct View {
     pub enabled: bool,
     pub size_usdt: Decimal,
     pub alert_net_pct: Decimal,
-    pub fee_round_trip_pct: Option<Decimal>,
     pub min_minutes: usize,
     pub window_days: i64,
-    pub history_minutes: usize,
+    /// 各组的概况（顺序 = 配置顺序）。
+    pub pairs: Vec<PairView>,
+    /// 各家行情连接。
     pub connected: Connected,
     pub updated_at: Option<DateTime<Utc>>,
     pub lines: Vec<Line>,
     pub error: Option<String>,
 }
 
+/// 一组的概况。
+#[derive(Debug, Clone, Serialize)]
+pub struct PairView {
+    pub id: String,
+    pub a: Venue,
+    pub b: Venue,
+    /// 同名合约数（Hyperliquid 的组要等首轮扫描核过身份才有）。
+    pub markets: usize,
+    pub history_minutes: usize,
+    /// 这组的往返手续费范围（%）：合约之间可能不同（growth mode）。
+    pub fee_min_pct: Option<Decimal>,
+    pub fee_max_pct: Option<Decimal>,
+    /// 还没发现市场的原因（等扫描、某家市场列表取不到）。
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Connected {
-    pub lighter: bool,
-    pub arcus: bool,
+    /// 场所 → 行情 WebSocket 是否连着。
+    pub venues: std::collections::BTreeMap<Venue, bool>,
     pub reconnects: u64,
 }
 
-/// 两家盘口超过这么久没更新就不算数（WebSocket 静默断流时不会报错）。
+impl Connected {
+    pub fn up(&self, venue: Venue) -> bool {
+        self.venues.get(&venue).copied().unwrap_or(false)
+    }
+}
+
+/// 快照式盘口（Arcus、Hyperliquid：盘口没变也推）超过这么久没更新就不算数（WebSocket 静默断流时不会报错）。
+/// Hyperliquid 实测每 ~5 秒推一次，留出三倍余量。
 const STALE: Duration = Duration::from_secs(15);
 /// 信号要连续保持这么久才推送：一秒钟的闪烁（一档挂单被吃掉又补上）不值得叫人。
 pub const SIGNAL_HOLD: Duration = Duration::from_secs(10);
@@ -211,56 +227,73 @@ pub const SIGNAL_HOLD: Duration = Duration::from_secs(10);
 /// 一波行情同时亮十几个合约时不能把规则平仓、裸敞口这类告警挤掉。
 pub const ALERTS_PER_MINUTE: usize = 2;
 
-/// 估算一个合约此刻的状况。纯计算，单测覆盖。
+/// 这家的盘口是不是「没变也推」的快照：是的话它的年龄就是数据新鲜度。
+/// Lighter 只推变化：安静的市场几秒没增量是常态，新鲜度靠连接活着保证（断线即清空盘口）。
+pub fn snapshot_feed(venue: Venue) -> bool {
+    venue != Venue::LighterRh
+}
+
+/// 估算一组里一个合约此刻的状况。纯计算，单测覆盖。
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate(
-    market: &Market,
-    arcus: Option<&LocalBook>,
-    lighter: Option<&LocalBook>,
-    fees: Option<Fees>,
+    pair: Pair,
+    market: &PairMarket,
+    a: Option<&LocalBook>,
+    b: Option<&LocalBook>,
     normal: Option<Normal>,
     normal_minutes: usize,
     session: Session,
     config: &Config,
     now: Instant,
 ) -> Line {
+    let fee = market.round_trip_pct();
     let mut line = Line {
+        pair: pair.id(),
+        a: pair.a,
+        b: pair.b,
         base: market.base.clone(),
         category: market.category.clone(),
         session,
+        fee_round_trip_pct: fee,
         basis_pct: None,
         normal_missing_minutes: history::MIN_MINUTES.saturating_sub(normal_minutes),
         normal: normal.clone(),
         z: None,
-        long_arcus: None,
-        long_lighter: None,
+        long_a: None,
+        long_b: None,
         best: None,
         age_sec: None,
         note: None,
     };
-    let (Some(arcus), Some(lighter)) = (arcus, lighter) else {
+    let (Some(book_a), Some(book_b)) = (a, b) else {
         line.note = Some("等待两家盘口".into());
         return line;
     };
-    // Arcus 每 ~1.3 秒推一份完整快照（盘口没变也推），它的年龄就是数据新鲜度。
-    // Lighter 只推变化：安静的市场几秒没增量是常态，新鲜度靠连接活着保证（断线即清空盘口），
-    // 所以这里只按 Arcus 判断是否过期。
-    let age = now.saturating_duration_since(arcus.updated);
-    line.age_sec = Some(age.as_secs());
-    if age > STALE {
-        line.note = Some(format!("Arcus 盘口 {} 秒没更新，不计算", age.as_secs()));
-        return line;
+    let mut oldest: Option<(Venue, Duration)> = None;
+    for (venue, book) in [(pair.a, book_a), (pair.b, book_b)] {
+        if snapshot_feed(venue) {
+            let age = now.saturating_duration_since(book.updated);
+            if oldest.is_none_or(|(_, o)| age > o) {
+                oldest = Some((venue, age));
+            }
+        }
     }
-    let Some(basis) = mid_basis_pct(arcus, lighter) else {
+    if let Some((venue, age)) = oldest {
+        line.age_sec = Some(age.as_secs());
+        if age > STALE {
+            line.note = Some(format!("{venue} 盘口 {} 秒没更新，不计算", age.as_secs()));
+            return line;
+        }
+    }
+    let Some(basis) = mid_basis_pct(book_a, book_b) else {
         line.note = Some("至少一家盘口为空或交叉".into());
         return line;
     };
     line.basis_pct = Some(basis);
-    let Some(fees) = fees else {
-        line.note = Some("还没取到 Arcus 吃单费率".into());
+    let Some(fee) = fee else {
+        line.note = Some("至少一家的吃单费率不知道，不估净收益".into());
         return line;
     };
-    let fee = fees.round_trip_pct();
     if let Some(n) = &normal
         && let Some(b) = basis.to_f64()
     {
@@ -271,7 +304,7 @@ pub fn evaluate(
         .as_ref()
         .and_then(|n| Decimal::from_f64_retain(n.median))
         .map(|d| d.round_dp(5));
-    // 方向：多 Arcus 空 Lighter 赚的是「Arcus 相对 Lighter 变贵」（基差上升）；反方向赚基差下降。
+    // 方向：多 a 空 b 赚的是「a 相对 b 变贵」（基差上升）；反方向赚基差下降。
     // 回到正常水平的净收益 = 可成交价差 − 平仓穿价 − 手续费 −/＋ 正常水平（正常基差本身是收不回来的那部分）。
     let leg = |quote: DirectionQuote, sign: Decimal| {
         let net_to_zero_pct = (quote.entry_pct - quote.exit_cross_pct - fee).round_dp(5);
@@ -282,10 +315,10 @@ pub fn evaluate(
             quote,
         }
     };
-    // 多 Arcus 空 RH：入场价差 = RH 卖 − Arcus 买，正常基差 m = Arcus − RH；回到 m 时还剩 −m 收不回 → +m。
-    line.long_arcus = quote(arcus, lighter, config.size_usdt).map(|q| leg(q, Decimal::ONE));
-    line.long_lighter = quote(lighter, arcus, config.size_usdt).map(|q| leg(q, -Decimal::ONE));
-    if line.long_arcus.is_none() && line.long_lighter.is_none() {
+    // 多 a 空 b：入场价差 = b 卖 − a 买，正常基差 m = a − b；回到 m 时还剩 −m 收不回 → +m。
+    line.long_a = quote(book_a, book_b, config.size_usdt).map(|q| leg(q, Decimal::ONE));
+    line.long_b = quote(book_b, book_a, config.size_usdt).map(|q| leg(q, -Decimal::ONE));
+    if line.long_a.is_none() && line.long_b.is_none() {
         line.note = Some(format!("深度不够 {} USDT", config.size_usdt.normalize()));
         return line;
     }
@@ -293,10 +326,10 @@ pub fn evaluate(
         leg.as_ref()
             .map(|l| l.net_to_normal_pct.unwrap_or(l.net_to_zero_pct))
     };
-    let (direction, chosen) = match (score(&line.long_arcus), score(&line.long_lighter)) {
-        (Some(a), Some(l)) if l > a => ("long_lighter", &line.long_lighter),
-        (Some(_), _) => ("long_arcus", &line.long_arcus),
-        _ => ("long_lighter", &line.long_lighter),
+    let (direction, chosen) = match (score(&line.long_a), score(&line.long_b)) {
+        (Some(x), Some(y)) if y > x => ("long_b", &line.long_b),
+        (Some(_), _) => ("long_a", &line.long_a),
+        _ => ("long_b", &line.long_b),
     };
     let chosen = chosen.as_ref().expect("至少一个方向有报价");
     let signal = chosen
@@ -313,13 +346,24 @@ pub fn evaluate(
     line
 }
 
-/// 一分钟内的采样（算中位数用）。
+impl Line {
+    /// 一个方向的两条腿：(多, 空)。
+    pub fn legs(&self, direction: &str) -> Option<(Venue, Venue, &Leg)> {
+        match direction {
+            "long_a" => Some((self.a, self.b, self.long_a.as_ref()?)),
+            "long_b" => Some((self.b, self.a, self.long_b.as_ref()?)),
+            _ => None,
+        }
+    }
+}
+
+/// 一组一分钟内的采样（算中位数用）。
 #[derive(Default)]
 struct Minute {
     start: i64,
     basis: HashMap<String, Vec<f64>>,
-    entry_arcus: HashMap<String, f64>,
-    entry_lighter: HashMap<String, f64>,
+    entry_a: HashMap<String, f64>,
+    entry_b: HashMap<String, f64>,
     sessions: HashMap<String, Session>,
 }
 
@@ -338,8 +382,8 @@ impl Minute {
                     k: self.sessions.get(base).copied().unwrap_or(Session::All),
                     b: (history::percentile(&sorted, 0.5) * 1e5).round() / 1e5,
                     n: u32::try_from(values.len()).unwrap_or(u32::MAX),
-                    ea: self.entry_arcus.get(base).copied(),
-                    el: self.entry_lighter.get(base).copied(),
+                    ea: self.entry_a.get(base).copied(),
+                    el: self.entry_b.get(base).copied(),
                 }
             })
             .collect();
@@ -350,10 +394,20 @@ impl Minute {
 
 /// 从行情 WebSocket 读到的东西，送到计算任务。
 enum Feed {
-    Arcus(feed::Event),
-    Lighter(feed::Event),
+    Book(Venue, feed::Event),
     /// 某家连接状态变了。
-    Up(&'static str, bool),
+    Up(Venue, bool),
+}
+
+/// 一组的运行状态。
+struct PairState {
+    pair: Pair,
+    markets: Vec<PairMarket>,
+    history: history::History,
+    minute: Minute,
+    /// 正常水平只在每分钟落一行之后才会变：按（合约，时段）缓存，换分钟时清空。
+    normals: HashMap<(String, Session), (Option<Normal>, usize)>,
+    note: Option<String>,
 }
 
 pub struct Monitor {
@@ -364,16 +418,31 @@ pub struct Monitor {
     sent: std::sync::Mutex<std::collections::VecDeque<Instant>>,
 }
 
+/// 订阅变化：每家场所要订阅的市场名（全量）。
+type Subscriptions = HashMap<Venue, Vec<String>>;
+
 impl Monitor {
     pub fn new(config: Config, alerts: Arc<Alerter>) -> Arc<Self> {
         let view = View {
             enabled: config.enabled,
             size_usdt: config.size_usdt,
             alert_net_pct: config.alert_net_pct,
-            fee_round_trip_pct: None,
             min_minutes: history::MIN_MINUTES,
             window_days: history::WINDOW_DAYS,
-            history_minutes: 0,
+            pairs: config
+                .pairs
+                .iter()
+                .map(|pair| PairView {
+                    id: pair.id(),
+                    a: pair.a,
+                    b: pair.b,
+                    markets: 0,
+                    history_minutes: 0,
+                    fee_min_pct: None,
+                    fee_max_pct: None,
+                    note: Some("启动中".into()),
+                })
+                .collect(),
             connected: Connected::default(),
             updated_at: None,
             lines: Vec::new(),
@@ -391,114 +460,231 @@ impl Monitor {
         self.view.read().await.clone()
     }
 
-    pub fn spawn(self: &Arc<Self>, client: reqwest::Client) {
+    /// `cache`：扫描缓存，Hyperliquid 的组要用它核对同名合约是不是同一资产。
+    pub fn spawn(self: &Arc<Self>, client: reqwest::Client, cache: Arc<crate::cache::ScanCache>) {
         if !self.config.enabled {
-            info!("Lighter RH ↔ Arcus 价差监控已关闭");
+            info!("价差监控已关闭");
             return;
         }
         let monitor = Arc::clone(self);
-        tokio::spawn(async move { monitor.run(client).await });
+        tokio::spawn(async move { monitor.run(client, cache).await });
     }
 
     async fn set_error(&self, error: Option<String>) {
         self.view.write().await.error = error;
     }
 
-    /// 发现两家的同名市场。失败就隔一会儿重试，不让监控把整个看板拖死。
-    async fn discover(&self, client: &reqwest::Client) -> anyhow::Result<(Vec<Market>, Fees)> {
-        let arcus: Value = arb_venues::get_json(
-            client.get("https://api.arcus.xyz/v1/markets"),
-            arb_core::Venue::Arcus,
-        )
-        .await?;
-        let arcus_taker = arb_venues::arcus::fetch_base_taker_fee(client).await?;
-        let lighter: Value = arb_venues::get_json(
-            client.get("https://api.rh.lighter.xyz/api/v1/orderBookDetails"),
-            arb_core::Venue::LighterRh,
-        )
-        .await?;
-        discover_from(&arcus, arcus_taker, &lighter, self.config.equities_only)
+    /// 用到的场所。
+    fn venues(&self) -> Vec<Venue> {
+        let mut venues: Vec<Venue> = self
+            .config
+            .pairs
+            .iter()
+            .flat_map(|pair| [pair.a, pair.b])
+            .collect();
+        venues.sort();
+        venues.dedup();
+        venues
     }
 
-    async fn run(self: Arc<Self>, client: reqwest::Client) {
-        let (mut markets, mut fees) = loop {
-            match self.discover(&client).await {
-                Ok(found) => break found,
+    /// 取一家场所的市场列表。
+    async fn catalog_of(
+        &self,
+        client: &reqwest::Client,
+        venue: Venue,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, pairs::VenueMarket>> {
+        match venue {
+            Venue::Arcus => {
+                let markets: Value = arb_venues::get_json(
+                    client.get("https://api.arcus.xyz/v1/markets"),
+                    Venue::Arcus,
+                )
+                .await?;
+                let taker = arb_venues::arcus::fetch_base_taker_fee(client).await?;
+                catalog::arcus(&markets, taker)
+            }
+            Venue::LighterRh => {
+                let details: Value = arb_venues::get_json(
+                    client.get("https://api.rh.lighter.xyz/api/v1/orderBookDetails"),
+                    Venue::LighterRh,
+                )
+                .await?;
+                catalog::lighter(&details)
+            }
+            Venue::Hyperliquid | Venue::HyperliquidXyz | Venue::HyperliquidIo => {
+                let body = match arb_venues::hyperliquid::dex_name(venue) {
+                    Some(dex) => serde_json::json!({"type": "meta", "dex": dex}),
+                    None => serde_json::json!({"type": "meta"}),
+                };
+                let meta: Value = arb_venues::get_json(
+                    client.post("https://api.hyperliquid.xyz/info").json(&body),
+                    venue,
+                )
+                .await?;
+                catalog::hyperliquid(venue, &meta, self.config.entropy_rebate)
+            }
+            other => anyhow::bail!("价差监控不支持 {other}"),
+        }
+    }
+
+    /// 刷新各家市场列表（失败的保留上一次的）。
+    async fn refresh_catalog(
+        &self,
+        client: &reqwest::Client,
+        catalog: &mut Catalog,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        for venue in self.venues() {
+            match self.catalog_of(client, venue).await {
+                Ok(markets) => {
+                    catalog.insert(venue, markets);
+                }
                 Err(error) => {
-                    warn!("价差监控：取两家市场列表失败，60 秒后重试：{error:#}");
-                    self.set_error(Some(format!("取两家市场列表失败：{error:#}")))
-                        .await;
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    warn!(%venue, "价差监控：取市场列表失败：{error:#}");
+                    errors.push(format!("{venue}：{error:#}"));
                 }
             }
-        };
-        info!(markets = markets.len(), "Lighter RH ↔ Arcus 价差监控启动");
-        let (mut history, broken) = history::load(&self.config.dir, Utc::now()).await;
-        if broken > 0 {
-            warn!(broken, "价差历史里有坏行，已跳过");
         }
-        {
-            let mut view = self.view.write().await;
-            view.error = None;
-            view.fee_round_trip_pct = Some(fees.round_trip_pct());
-            view.history_minutes = history.coverage_minutes();
+        errors
+    }
+
+    /// 按市场列表与身份簇重算各组的合约；返回每家要订阅的市场名。
+    fn rebuild(
+        &self,
+        states: &mut [PairState],
+        catalog: &Catalog,
+        identity: Option<&pairs::Identity>,
+    ) -> Subscriptions {
+        let mut subs: HashMap<Venue, std::collections::BTreeSet<String>> = HashMap::new();
+        for state in states.iter_mut() {
+            let pair = state.pair;
+            state.markets = pairs::pair_markets(pair, catalog, identity, self.config.equities_only);
+            state.note = if !catalog.contains_key(&pair.a) || !catalog.contains_key(&pair.b) {
+                Some("有一家的市场列表还没取到".into())
+            } else if pair.needs_identity_check() && identity.is_none() {
+                Some("等首轮扫描核对同名合约是不是同一资产".into())
+            } else if state.markets.is_empty() {
+                Some("两家没有核实过的同名合约".into())
+            } else {
+                None
+            };
+            for market in &state.markets {
+                subs.entry(pair.a).or_default().insert(market.a.key.clone());
+                subs.entry(pair.b).or_default().insert(market.b.key.clone());
+            }
+        }
+        subs.into_iter()
+            .map(|(venue, keys)| (venue, keys.into_iter().collect()))
+            .collect()
+    }
+
+    async fn run(self: Arc<Self>, client: reqwest::Client, cache: Arc<crate::cache::ScanCache>) {
+        let mut catalog = Catalog::new();
+        loop {
+            let errors = self.refresh_catalog(&client, &mut catalog).await;
+            if !catalog.is_empty() {
+                self.set_error((!errors.is_empty()).then(|| errors.join("；")))
+                    .await;
+                break;
+            }
+            self.set_error(Some(format!(
+                "取市场列表失败，60 秒后重试：{}",
+                errors.join("；")
+            )))
+            .await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+        let now = Utc::now();
+        let mut states = Vec::new();
+        for &pair in &self.config.pairs {
+            let (mut history, broken) =
+                history::load(&self.config.dir, &pair.file_prefix(), now).await;
+            if broken > 0 {
+                warn!(pair = %pair.id(), broken, "价差历史里有坏行，已跳过");
+            }
+            history.prune(now);
+            states.push(PairState {
+                pair,
+                markets: Vec::new(),
+                history,
+                minute: Minute {
+                    start: now.timestamp() / 60 * 60,
+                    ..Minute::default()
+                },
+                normals: HashMap::new(),
+                note: None,
+            });
+        }
+        let identity = cache
+            .get()
+            .await
+            .map(|snap| pairs::identity_of(&snap.report));
+        let mut subs = self.rebuild(&mut states, &catalog, identity.as_ref());
+        let mut identity_ready = identity.is_some();
+        info!(
+            pairs = %self.config.pairs.iter().map(|p| p.id()).collect::<Vec<_>>().join(","),
+            markets = states.iter().map(|s| s.markets.len()).sum::<usize>(),
+            "价差监控启动"
+        );
+
+        let (tx, mut rx) = mpsc::channel::<Feed>(8192);
+        // 每家一个连接任务；订阅列表变化时通过 watch 通知它重连。Lighter 另有一个「重订阅某个市场」的通道。
+        let mut senders: HashMap<Venue, tokio::sync::watch::Sender<Vec<String>>> = HashMap::new();
+        let (resub_tx, resub_rx) = mpsc::channel::<String>(64);
+        let mut resub_rx = Some(resub_rx);
+        for venue in self.venues() {
+            let (sub_tx, sub_rx) =
+                tokio::sync::watch::channel(subs.get(&venue).cloned().unwrap_or_default());
+            senders.insert(venue, sub_tx);
+            let resub = if venue == Venue::LighterRh {
+                resub_rx.take()
+            } else {
+                None
+            };
+            tokio::spawn(venue_loop(venue, sub_rx, resub, tx.clone()));
         }
 
-        let (tx, mut rx) = mpsc::channel::<Feed>(4096);
-        let lighter_ids: Vec<i64> = markets.iter().map(|m| m.lighter_id).collect();
-        let arcus_names: Vec<String> = markets.iter().map(|m| m.arcus_name.clone()).collect();
-        let (resub_tx, resub_rx) = mpsc::channel::<i64>(64);
-        tokio::spawn(lighter_loop(lighter_ids, tx.clone(), resub_rx));
-        tokio::spawn(arcus_loop(arcus_names, tx.clone()));
-
-        let by_lighter: HashMap<String, usize> = markets
-            .iter()
-            .enumerate()
-            .map(|(i, m)| (m.lighter_id.to_string(), i))
-            .collect();
-        let by_arcus: HashMap<String, usize> = markets
-            .iter()
-            .enumerate()
-            .map(|(i, m)| (m.arcus_name.clone(), i))
-            .collect();
-        let mut arcus_books: Vec<Option<LocalBook>> = vec![None; markets.len()];
-        let mut lighter_books: Vec<Option<LocalBook>> = vec![None; markets.len()];
+        // 盘口：(场所, 市场名) → 本地盘口。几组共用同一家的盘口。
+        let mut books: HashMap<(Venue, String), LocalBook> = HashMap::new();
         let mut connected = Connected::default();
+        for venue in self.venues() {
+            connected.venues.insert(venue, false);
+        }
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut refresh = tokio::time::interval(Duration::from_secs(300));
         refresh.tick().await;
-        let mut minute = Minute {
-            start: Utc::now().timestamp() / 60 * 60,
-            ..Minute::default()
-        };
-        // 正常水平只在每分钟落一行之后才会变：按（合约，时段）缓存，换分钟时清空。
-        let mut normals: HashMap<(String, Session), (Option<Normal>, usize)> = HashMap::new();
-        // 信号从什么时候开始连续成立（合约, 方向）。
-        let mut signal_since: HashMap<(String, &'static str), Instant> = HashMap::new();
+        // 信号从什么时候开始连续成立（组, 合约, 方向）。
+        let mut signal_since: HashMap<(String, String, &'static str), Instant> = HashMap::new();
 
         loop {
             tokio::select! {
                 Some(message) = rx.recv() => match message {
-                    Feed::Up(which, up) => {
-                        if which == "lighter" { connected.lighter = up } else { connected.arcus = up }
+                    Feed::Up(venue, up) => {
+                        connected.venues.insert(venue, up);
                         if !up {
                             connected.reconnects += 1;
                             // 断线后旧盘口不能再用：等重连后的快照。
-                            let books = if which == "lighter" { &mut lighter_books } else { &mut arcus_books };
-                            books.iter_mut().for_each(|b| *b = None);
+                            books.retain(|(v, _), _| *v != venue);
                         }
                     }
-                    Feed::Arcus(event) => apply(&mut arcus_books, &by_arcus, event, None),
-                    Feed::Lighter(event) => apply(&mut lighter_books, &by_lighter, event, Some(&resub_tx)),
+                    Feed::Book(venue, event) => {
+                        let resub = (venue == Venue::LighterRh).then_some(&resub_tx);
+                        apply(&mut books, venue, event, resub);
+                    }
                 },
                 _ = refresh.tick() => {
-                    // 交易时段（isOutsideRth）与费率会变：5 分钟刷新一次（Arcus markets 权重 20，IP 预算 1500/分钟）。
-                    if let Ok((fresh, fresh_fees)) = self.discover(&client).await {
-                        fees = fresh_fees;
-                        for market in &mut markets {
-                            if let Some(found) = fresh.iter().find(|f| f.base == market.base) {
-                                market.outside_rth = found.outside_rth;
+                    // 交易时段（isOutsideRth）、费率、上下架会变：5 分钟刷新一次。
+                    let _ = self.refresh_catalog(&client, &mut catalog).await;
+                    let identity = cache.get().await.map(|snap| pairs::identity_of(&snap.report));
+                    identity_ready |= identity.is_some();
+                    let fresh = self.rebuild(&mut states, &catalog, identity.as_ref());
+                    if fresh != subs {
+                        subs = fresh;
+                        for (venue, sender) in &senders {
+                            let list = subs.get(venue).cloned().unwrap_or_default();
+                            if *sender.borrow() != list {
+                                let _ = sender.send(list);
                             }
                         }
                     }
@@ -506,79 +692,115 @@ impl Monitor {
                 _ = tick.tick() => {
                     if crate::shutdown::is_draining() {
                         // 停机：把这一分钟写掉再退出循环。
-                        let _ = history::append(&self.config.dir, &minute.rows(), Utc::now()).await;
+                        for state in &states {
+                            let _ = history::append(&self.config.dir, &state.pair.file_prefix(), &state.minute.rows(), Utc::now()).await;
+                        }
                         return;
+                    }
+                    // 首轮扫描刚出来：Hyperliquid 的组现在能核对身份了，不等 5 分钟。
+                    if !identity_ready
+                        && let Some(snap) = cache.get().await
+                    {
+                        identity_ready = true;
+                        let identity = pairs::identity_of(&snap.report);
+                        subs = self.rebuild(&mut states, &catalog, Some(&identity));
+                        for (venue, sender) in &senders {
+                            let _ = sender.send(subs.get(venue).cloned().unwrap_or_default());
+                        }
                     }
                     let now_utc = Utc::now();
                     let now = Instant::now();
                     let start = now_utc.timestamp() / 60 * 60;
-                    if start != minute.start {
-                        let rows = minute.rows();
-                        rows.iter().for_each(|row| history.push(row));
-                        history.prune(now_utc);
-                        if let Err(error) = history::append(&self.config.dir, &rows, now_utc).await {
-                            warn!("价差历史写不进去：{error}");
-                        }
-                        minute = Minute { start, ..Minute::default() };
-                        normals.clear();
-                    }
-                    let mut lines = Vec::with_capacity(markets.len());
-                    for (i, market) in markets.iter().enumerate() {
-                        let session = classify(now_utc, market.crypto(), market.outside_rth);
-                        let (normal, normal_minutes) = normals
-                            .entry((market.base.clone(), session))
-                            .or_insert_with(|| {
-                                (history.normal(&market.base, session, now_utc), history.minutes(&market.base, session, now_utc))
-                            })
-                            .clone();
-                        let mut line = evaluate(
-                            market,
-                            arcus_books[i].as_ref(),
-                            lighter_books[i].as_ref(),
-                            Some(fees),
-                            normal,
-                            normal_minutes,
-                            session,
-                            &self.config,
-                            now,
-                        );
-                        if let Some(best) = line.best.as_mut() {
-                            let key = (market.base.clone(), best.direction);
-                            if best.signal {
-                                let since = *signal_since.entry(key).or_insert(now);
-                                best.signal_sec = now.saturating_duration_since(since).as_secs();
-                            } else {
-                                signal_since.remove(&key);
+                    let mut lines = Vec::new();
+                    for state in &mut states {
+                        let pair = state.pair;
+                        if start != state.minute.start {
+                            let rows = state.minute.rows();
+                            rows.iter().for_each(|row| state.history.push(row));
+                            state.history.prune(now_utc);
+                            if let Err(error) = history::append(&self.config.dir, &pair.file_prefix(), &rows, now_utc).await {
+                                warn!(pair = %pair.id(), "价差历史写不进去：{error}");
                             }
+                            state.minute = Minute { start, ..Minute::default() };
+                            state.normals.clear();
                         }
-                        // 方向换了或没信号：另一个方向的计时作废。
-                        signal_since.retain(|(base, direction), _| {
-                            base != &market.base
-                                || line.best.as_ref().is_some_and(|b| b.signal && b.direction == *direction)
-                        });
-                        if let Some(basis) = line.basis_pct.and_then(|b| b.to_f64()) {
-                            minute.basis.entry(market.base.clone()).or_default().push(basis);
-                            minute.sessions.insert(market.base.clone(), session);
-                            let keep_max = |map: &mut HashMap<String, f64>, value: Option<f64>| {
-                                if let Some(value) = value {
-                                    let slot = map.entry(market.base.clone()).or_insert(value);
-                                    *slot = slot.max(value);
+                        for market in &state.markets {
+                            let session = classify(now_utc, market.crypto(), market.outside_rth);
+                            let history = &state.history;
+                            let (normal, normal_minutes) = state
+                                .normals
+                                .entry((market.base.clone(), session))
+                                .or_insert_with(|| {
+                                    (history.normal(&market.base, session, now_utc), history.minutes(&market.base, session, now_utc))
+                                })
+                                .clone();
+                            let mut line = evaluate(
+                                pair,
+                                market,
+                                books.get(&(pair.a, market.a.key.clone())),
+                                books.get(&(pair.b, market.b.key.clone())),
+                                normal,
+                                normal_minutes,
+                                session,
+                                &self.config,
+                                now,
+                            );
+                            let id = pair.id();
+                            if let Some(best) = line.best.as_mut() {
+                                let key = (id.clone(), market.base.clone(), best.direction);
+                                if best.signal {
+                                    let since = *signal_since.entry(key).or_insert(now);
+                                    best.signal_sec = now.saturating_duration_since(since).as_secs();
+                                } else {
+                                    signal_since.remove(&key);
                                 }
-                            };
-                            keep_max(&mut minute.entry_arcus, line.long_arcus.as_ref().and_then(|l| l.quote.entry_pct.to_f64()));
-                            keep_max(&mut minute.entry_lighter, line.long_lighter.as_ref().and_then(|l| l.quote.entry_pct.to_f64()));
+                            }
+                            // 方向换了或没信号：另一个方向的计时作废。
+                            signal_since.retain(|(p, base, direction), _| {
+                                p != &id
+                                    || base != &market.base
+                                    || line.best.as_ref().is_some_and(|b| b.signal && b.direction == *direction)
+                            });
+                            if let Some(basis) = line.basis_pct.and_then(|b| b.to_f64()) {
+                                let minute = &mut state.minute;
+                                minute.basis.entry(market.base.clone()).or_default().push(basis);
+                                minute.sessions.insert(market.base.clone(), session);
+                                let keep_max = |map: &mut HashMap<String, f64>, value: Option<f64>| {
+                                    if let Some(value) = value {
+                                        let slot = map.entry(market.base.clone()).or_insert(value);
+                                        *slot = slot.max(value);
+                                    }
+                                };
+                                keep_max(&mut minute.entry_a, line.long_a.as_ref().and_then(|l| l.quote.entry_pct.to_f64()));
+                                keep_max(&mut minute.entry_b, line.long_b.as_ref().and_then(|l| l.quote.entry_pct.to_f64()));
+                            }
+                            self.maybe_alert(&line);
+                            lines.push(line);
                         }
-                        self.maybe_alert(&line);
-                        lines.push(line);
                     }
                     lines.sort_by(|a, b| {
                         let key = |l: &Line| l.best.as_ref().and_then(|b| b.net_usdt).unwrap_or(Decimal::MIN);
-                        key(b).cmp(&key(a)).then_with(|| a.base.cmp(&b.base))
+                        key(b).cmp(&key(a)).then_with(|| a.pair.cmp(&b.pair)).then_with(|| a.base.cmp(&b.base))
                     });
+                    let pair_views: Vec<PairView> = states
+                        .iter()
+                        .map(|state| {
+                            let fees: Vec<Decimal> = state.markets.iter().filter_map(PairMarket::round_trip_pct).collect();
+                            PairView {
+                                id: state.pair.id(),
+                                a: state.pair.a,
+                                b: state.pair.b,
+                                markets: state.markets.len(),
+                                history_minutes: state.history.coverage_minutes(),
+                                fee_min_pct: fees.iter().min().copied(),
+                                fee_max_pct: fees.iter().max().copied(),
+                                note: state.note.clone(),
+                            }
+                        })
+                        .collect();
                     let mut view = self.view.write().await;
                     view.connected = connected.clone();
-                    view.fee_round_trip_pct = Some(fees.round_trip_pct());
-                    view.history_minutes = history.coverage_minutes();
+                    view.pairs = pair_views;
                     view.updated_at = Some(now_utc);
                     view.lines = lines;
                 }
@@ -611,48 +833,63 @@ impl Monitor {
         if sent.len() >= ALERTS_PER_MINUTE {
             return;
         }
-        if self
-            .alerts
-            .notify(&format!("rh-spread:{}:{}", line.base, best.direction), text)
-        {
+        // 最早那组沿用原来的告警 key（冷却不因升级重置）。
+        let key = if line.pair == Pair::RH.id() {
+            let legacy = if best.direction == "long_a" {
+                "long_arcus"
+            } else {
+                "long_lighter"
+            };
+            format!("rh-spread:{}:{legacy}", line.base)
+        } else {
+            format!("spread:{}:{}:{}", line.pair, line.base, best.direction)
+        };
+        if self.alerts.notify(&key, text) {
             sent.push_back(now);
-            info!(symbol = %line.base, direction = best.direction, net_usdt = ?best.net_usdt, "价差监控：推送提醒");
+            info!(pair = %line.pair, symbol = %line.base, direction = best.direction, net_usdt = ?best.net_usdt, "价差监控：推送提醒");
         }
+    }
+}
+
+/// 场所的显示名（提醒、页面用）。
+pub fn venue_label(venue: Venue) -> &'static str {
+    match venue {
+        Venue::Arcus => "Arcus",
+        Venue::LighterRh => "Lighter RH",
+        Venue::Hyperliquid => "Hyperliquid",
+        Venue::HyperliquidXyz => "HL-xyz",
+        Venue::HyperliquidIo => "HL-io",
+        other => other.as_str(),
     }
 }
 
 /// 提醒文本。
 pub fn alert_text(line: &Line, best: &Best, config: &Config) -> Option<String> {
-    let leg = if best.direction == "long_arcus" {
-        line.long_arcus.as_ref()?
-    } else {
-        line.long_lighter.as_ref()?
-    };
+    let (long, short, leg) = line.legs(best.direction)?;
     let normal = line.normal.as_ref()?;
-    let (long, short) = if best.direction == "long_arcus" {
-        ("Arcus", "Lighter RH")
-    } else {
-        ("Lighter RH", "Arcus")
-    };
     Some(format!(
-        "📈 价差偏离：{} {}，多 {long} / 空 {short}\n可成交价差 {}%（{} USDT），{}正常基差 {:.3}%，当前 {}%\n回到正常水平预估净赚 {}%（≈{} USDT，已扣手续费与平仓穿价）\n只读提醒，不会自动下单；同一合约同一方向 30 分钟内不重复。",
+        "📈 价差偏离：{} {}，多 {} / 空 {}\n可成交价差 {}%（{} USDT），{}正常基差 {:.3}%，当前 {}%（{} − {}）\n回到正常水平预估净赚 {}%（≈{} USDT，已扣手续费与平仓穿价）\n提醒；是否自动下单见面板的自动交易设置。同一合约同一方向 30 分钟内不重复。",
         line.base,
         line.session.label(),
+        venue_label(long),
+        venue_label(short),
         leg.quote.entry_pct.round_dp(3),
         config.size_usdt.normalize(),
         line.session.label(),
         normal.median,
         line.basis_pct?.round_dp(3),
+        venue_label(line.a),
+        venue_label(line.b),
         leg.net_to_normal_pct?.round_dp(3),
         best.net_usdt?.normalize(),
     ))
 }
 
 fn apply(
-    books: &mut [Option<LocalBook>],
-    index: &HashMap<String, usize>,
+    books: &mut HashMap<(Venue, String), LocalBook>,
+    venue: Venue,
     event: feed::Event,
-    resub: Option<&mpsc::Sender<i64>>,
+    resub: Option<&mpsc::Sender<String>>,
 ) {
     let now = Instant::now();
     match event {
@@ -662,14 +899,13 @@ fn apply(
             asks,
             nonce,
         } => {
-            let Some(&i) = index.get(&market) else { return };
             let mut book = LocalBook::new(now);
             bids.into_iter()
                 .for_each(|(p, q)| LocalBook::apply(&mut book.bids, p, q));
             asks.into_iter()
                 .for_each(|(p, q)| LocalBook::apply(&mut book.asks, p, q));
             book.nonce = nonce;
-            books[i] = Some(book);
+            books.insert((venue, market), book);
         }
         feed::Event::Delta {
             market,
@@ -678,18 +914,18 @@ fn apply(
             begin_nonce,
             nonce,
         } => {
-            let Some(&i) = index.get(&market) else { return };
-            let Some(book) = books[i].as_mut() else {
+            let key = (venue, market);
+            let Some(book) = books.get_mut(&key) else {
                 return;
             };
             if let (Some(last), Some(begin)) = (book.nonce, begin_nonce)
                 && last != begin
             {
                 // 丢了增量：这本盘口不能再信，作废并重订阅拿新快照。
-                debug!(market, last, begin, "Lighter 盘口增量不连续，重订阅");
-                books[i] = None;
-                if let (Some(resub), Ok(id)) = (resub, market.parse::<i64>()) {
-                    let _ = resub.try_send(id);
+                debug!(market = %key.1, last, begin, "Lighter 盘口增量不连续，重订阅");
+                books.remove(&key);
+                if let Some(resub) = resub {
+                    let _ = resub.try_send(key.1);
                 }
                 return;
             }
@@ -700,92 +936,9 @@ fn apply(
             book.nonce = nonce.or(book.nonce);
             book.updated = now;
         }
-        feed::Event::Error(message) => warn!("价差监控：行情服务端报错：{message}"),
+        feed::Event::Error(message) => warn!(%venue, "价差监控：行情服务端报错：{message}"),
         feed::Event::Other => {}
     }
-}
-
-/// 从两家的市场列表里找同名、在线的永续。纯函数，单测覆盖。
-///
-/// `arcus_taker`：Arcus 基础档吃单费率（小数，档位只会更低，所以是上限）。Lighter RH 的
-/// `taker_fee` 与扫描器同口径直接当小数用（实测为 `"0.0000"`）。
-pub fn discover_from(
-    arcus: &Value,
-    arcus_taker: Decimal,
-    lighter: &Value,
-    equities_only: bool,
-) -> anyhow::Result<(Vec<Market>, Fees)> {
-    let arcus_rows = arcus
-        .get("markets")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("Arcus markets 格式不对"))?;
-    let lighter_rows = lighter
-        .get("order_book_details")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("Lighter RH orderBookDetails 格式不对"))?;
-    let lighter_ids: HashMap<&str, (i64, Option<Decimal>)> = lighter_rows
-        .iter()
-        .filter(|r| r.get("status").and_then(Value::as_str) == Some("active"))
-        .filter(|r| {
-            r.get("market_type")
-                .and_then(Value::as_str)
-                .is_none_or(|t| t == "perp")
-        })
-        .filter_map(|r| {
-            let fee = r
-                .get("taker_fee")
-                .and_then(Value::as_str)
-                .and_then(arb_core::parse_decimal);
-            Some((
-                r.get("symbol")?.as_str()?,
-                (r.get("market_id")?.as_i64()?, fee),
-            ))
-        })
-        .collect();
-    // 任何一个同名市场没报 Lighter 费率：不拿 0 冒充，按 Arcus 费率保守估计。
-    let mut lighter_fee = Some(Decimal::ZERO);
-    let mut markets: Vec<Market> = arcus_rows
-        .iter()
-        .filter(|m| m.get("status").and_then(Value::as_str) == Some("ONLINE"))
-        .filter(|m| m.get("type").and_then(Value::as_str) == Some("PERPETUAL"))
-        .filter_map(|m| {
-            let base = m.get("baseAsset")?.as_str()?;
-            let name = m.get("marketDisplayName")?.as_str()?;
-            if name != format!("{base}-USD") {
-                return None;
-            }
-            let &(lighter_id, fee) = lighter_ids.get(base)?;
-            let category = m
-                .get("category")
-                .and_then(Value::as_str)
-                .unwrap_or("CRYPTO")
-                .to_string();
-            if equities_only && category == "CRYPTO" {
-                return None;
-            }
-            lighter_fee = lighter_fee.zip(fee).map(|(a, b)| a.max(b));
-            Some(Market {
-                base: base.to_string(),
-                lighter_id,
-                arcus_name: name.to_string(),
-                outside_rth: m.get("isOutsideRth").and_then(Value::as_bool),
-                category,
-            })
-        })
-        .collect();
-    markets.sort_by(|a, b| a.base.cmp(&b.base));
-    anyhow::ensure!(!markets.is_empty(), "两家没有同名在线永续");
-    anyhow::ensure!(
-        (Decimal::ZERO..Decimal::new(1, 2)).contains(&arcus_taker),
-        "Arcus 吃单费率 {arcus_taker} 超出合理范围"
-    );
-    Ok((
-        markets,
-        Fees {
-            arcus_taker,
-            lighter_taker: lighter_fee.unwrap_or(arcus_taker),
-        },
-    ))
 }
 
 // ───────────────────────────── WebSocket 连接 ─────────────────────────────
@@ -808,24 +961,86 @@ fn backoff(failures: u32) -> Duration {
     Duration::from_secs(1u64 << failures.min(6)).min(Duration::from_secs(60))
 }
 
-async fn lighter_loop(ids: Vec<i64>, tx: mpsc::Sender<Feed>, mut resub: mpsc::Receiver<i64>) {
+/// 一家场所的协议细节。
+struct Protocol {
+    url: &'static str,
+    subscribe: fn(&str) -> Option<String>,
+    unsubscribe: fn(&str) -> Option<String>,
+    parse: fn(&str) -> Result<feed::Event, String>,
+    /// 应用层心跳文本；`None` = 用 WebSocket 协议层 ping。
+    ping: Option<&'static str>,
+}
+
+fn protocol(venue: Venue) -> Option<Protocol> {
+    match venue {
+        Venue::LighterRh => Some(Protocol {
+            url: feed::LIGHTER_WS,
+            subscribe: |key| key.parse().ok().map(feed::lighter_subscribe),
+            unsubscribe: |key| key.parse().ok().map(feed::lighter_unsubscribe),
+            parse: feed::parse_lighter,
+            // 2 分钟内必须发一帧。
+            ping: Some(r#"{"type":"ping"}"#),
+        }),
+        Venue::Arcus => Some(Protocol {
+            url: feed::ARCUS_WS,
+            subscribe: |key| Some(feed::arcus_subscribe(key)),
+            unsubscribe: |_| None,
+            parse: feed::parse_arcus,
+            // Arcus 连接 24 小时自动断，断了就重连。
+            ping: None,
+        }),
+        Venue::Hyperliquid | Venue::HyperliquidXyz | Venue::HyperliquidIo => Some(Protocol {
+            url: feed::HYPERLIQUID_WS,
+            subscribe: |key| Some(feed::hyperliquid_subscribe(key)),
+            unsubscribe: |_| None,
+            parse: feed::parse_hyperliquid,
+            // 60 秒没有消息服务端会断开；订阅了就一直有推送，另发应用层 ping 兜底。
+            ping: Some(r#"{"method":"ping"}"#),
+        }),
+        _ => None,
+    }
+}
+
+/// 一家场所的行情连接：断线指数退避重连；订阅列表变了就重连（全量重订阅最简单，也不会漏）。
+async fn venue_loop(
+    venue: Venue,
+    mut subs: tokio::sync::watch::Receiver<Vec<String>>,
+    mut resub: Option<mpsc::Receiver<String>>,
+    tx: mpsc::Sender<Feed>,
+) {
+    let Some(protocol) = protocol(venue) else {
+        return;
+    };
     let mut failures = 0u32;
     loop {
         if crate::shutdown::is_draining() {
             return;
         }
+        let keys = subs.borrow_and_update().clone();
+        if keys.is_empty() {
+            // 这家暂时没有要订阅的（等首轮扫描核对身份）：等订阅列表变化。
+            if subs.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
         let started = Instant::now();
-        match lighter_session(&ids, &tx, &mut resub).await {
-            Ok(()) => return,
+        match session(venue, &protocol, &keys, &mut subs, resub.as_mut(), &tx).await {
+            Ok(Some(())) => {
+                // 订阅列表变了：马上用新列表重连。
+                let _ = tx.send(Feed::Up(venue, false)).await;
+                failures = 0;
+            }
+            Ok(None) => return,
             Err(error) => {
-                let _ = tx.send(Feed::Up("lighter", false)).await;
+                let _ = tx.send(Feed::Up(venue, false)).await;
                 if started.elapsed() > Duration::from_secs(60) {
                     failures = 0;
                 }
                 let wait = backoff(failures);
                 failures += 1;
                 warn!(
-                    "价差监控：Lighter RH 行情断开，{} 秒后重连：{error:#}",
+                    "价差监控：{venue} 行情断开，{} 秒后重连：{error:#}",
                     wait.as_secs()
                 );
                 tokio::time::sleep(wait).await;
@@ -834,28 +1049,34 @@ async fn lighter_loop(ids: Vec<i64>, tx: mpsc::Sender<Feed>, mut resub: mpsc::Re
     }
 }
 
-async fn lighter_session(
-    ids: &[i64],
+/// 一次连接。`Ok(Some(()))` = 订阅列表变了要重连；`Ok(None)` = 停机或下游没了。
+async fn session(
+    venue: Venue,
+    protocol: &Protocol,
+    keys: &[String],
+    subs: &mut tokio::sync::watch::Receiver<Vec<String>>,
+    mut resub: Option<&mut mpsc::Receiver<String>>,
     tx: &mpsc::Sender<Feed>,
-    resub: &mut mpsc::Receiver<i64>,
-) -> anyhow::Result<()> {
-    let mut ws = connect(feed::LIGHTER_WS).await?;
-    // 每分钟最多 200 条客户端消息：37 个订阅一次发完没问题，重订阅另有节流。
-    for id in ids {
-        ws.send(Message::text(feed::lighter_subscribe(*id))).await?;
+) -> anyhow::Result<Option<()>> {
+    let mut ws = connect(protocol.url).await?;
+    // Lighter 每分钟最多 200 条客户端消息、Hyperliquid 每条连接最多 1000 个订阅：几十个一次发完没问题。
+    for key in keys {
+        if let Some(text) = (protocol.subscribe)(key) {
+            ws.send(Message::text(text)).await?;
+        }
     }
-    let _ = tx.send(Feed::Up("lighter", true)).await;
+    let _ = tx.send(Feed::Up(venue, true)).await;
     let mut ping = tokio::time::interval(Duration::from_secs(30));
     ping.tick().await;
-    let mut last_resub: HashMap<i64, Instant> = HashMap::new();
+    let mut last_resub: HashMap<String, Instant> = HashMap::new();
     loop {
         tokio::select! {
             message = tokio::time::timeout(STALE * 2, ws.next()) => {
                 let message = message.map_err(|_| anyhow::anyhow!("{} 秒没收到任何消息", (STALE * 2).as_secs()))?;
                 match message {
-                    Some(Ok(Message::Text(text))) => match feed::parse_lighter(&text) {
-                        Ok(event) => { if tx.send(Feed::Lighter(event)).await.is_err() { return Ok(()); } }
-                        Err(error) => debug!("Lighter 消息解析失败：{error}"),
+                    Some(Ok(Message::Text(text))) => match (protocol.parse)(&text) {
+                        Ok(event) => { if tx.send(Feed::Book(venue, event)).await.is_err() { return Ok(None); } }
+                        Err(error) => debug!(%venue, "行情消息解析失败：{error}"),
                     },
                     Some(Ok(Message::Ping(payload))) => ws.send(Message::Pong(payload)).await?,
                     Some(Ok(Message::Close(frame))) => anyhow::bail!("服务端关闭连接：{frame:?}"),
@@ -864,76 +1085,30 @@ async fn lighter_session(
                     None => anyhow::bail!("连接结束"),
                 }
             }
-            Some(id) = resub.recv() => {
+            changed = subs.changed() => {
+                if changed.is_err() { return Ok(None); }
+                let _ = ws.close(None).await;
+                return Ok(Some(()));
+            }
+            Some(key) = async {
+                match resub.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 // 同一个市场 10 秒内最多重订阅一次。
-                if last_resub.get(&id).is_none_or(|at| at.elapsed() > Duration::from_secs(10)) {
-                    last_resub.insert(id, Instant::now());
-                    ws.send(Message::text(feed::lighter_unsubscribe(id))).await?;
-                    ws.send(Message::text(feed::lighter_subscribe(id))).await?;
+                if last_resub.get(&key).is_none_or(|at| at.elapsed() > Duration::from_secs(10)) {
+                    last_resub.insert(key.clone(), Instant::now());
+                    if let Some(text) = (protocol.unsubscribe)(&key) { ws.send(Message::text(text)).await?; }
+                    if let Some(text) = (protocol.subscribe)(&key) { ws.send(Message::text(text)).await?; }
                 }
             }
             _ = ping.tick() => {
-                if crate::shutdown::is_draining() { let _ = ws.close(None).await; return Ok(()); }
-                ws.send(Message::text(r#"{"type":"ping"}"#)).await?;
-            }
-        }
-    }
-}
-
-async fn arcus_loop(names: Vec<String>, tx: mpsc::Sender<Feed>) {
-    let mut failures = 0u32;
-    loop {
-        if crate::shutdown::is_draining() {
-            return;
-        }
-        let started = Instant::now();
-        match arcus_session(&names, &tx).await {
-            Ok(()) => return,
-            Err(error) => {
-                let _ = tx.send(Feed::Up("arcus", false)).await;
-                if started.elapsed() > Duration::from_secs(60) {
-                    failures = 0;
+                if crate::shutdown::is_draining() { let _ = ws.close(None).await; return Ok(None); }
+                match protocol.ping {
+                    Some(text) => ws.send(Message::text(text)).await?,
+                    None => ws.send(Message::Ping(Vec::new().into())).await?,
                 }
-                let wait = backoff(failures);
-                failures += 1;
-                warn!(
-                    "价差监控：Arcus 行情断开，{} 秒后重连：{error:#}",
-                    wait.as_secs()
-                );
-                tokio::time::sleep(wait).await;
-            }
-        }
-    }
-}
-
-async fn arcus_session(names: &[String], tx: &mpsc::Sender<Feed>) -> anyhow::Result<()> {
-    let mut ws = connect(feed::ARCUS_WS).await?;
-    for name in names {
-        ws.send(Message::text(feed::arcus_subscribe(name))).await?;
-    }
-    let _ = tx.send(Feed::Up("arcus", true)).await;
-    let mut ping = tokio::time::interval(Duration::from_secs(30));
-    ping.tick().await;
-    loop {
-        tokio::select! {
-            message = tokio::time::timeout(STALE * 2, ws.next()) => {
-                let message = message.map_err(|_| anyhow::anyhow!("{} 秒没收到任何消息", (STALE * 2).as_secs()))?;
-                match message {
-                    Some(Ok(Message::Text(text))) => match feed::parse_arcus(&text) {
-                        Ok(event) => { if tx.send(Feed::Arcus(event)).await.is_err() { return Ok(()); } }
-                        Err(error) => debug!("Arcus 消息解析失败：{error}"),
-                    },
-                    Some(Ok(Message::Ping(payload))) => ws.send(Message::Pong(payload)).await?,
-                    Some(Ok(Message::Close(frame))) => anyhow::bail!("服务端关闭连接：{frame:?}"),
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => return Err(error.into()),
-                    None => anyhow::bail!("连接结束"),
-                }
-            }
-            _ = ping.tick() => {
-                if crate::shutdown::is_draining() { let _ = ws.close(None).await; return Ok(()); }
-                // WebSocket 协议层 ping：Arcus 连接 24 小时自动断，断了就重连。
-                ws.send(Message::Ping(Vec::new().into())).await?;
             }
         }
     }

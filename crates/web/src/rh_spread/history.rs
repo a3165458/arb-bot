@@ -25,11 +25,11 @@ pub struct Row {
     /// 合约 base（如 `SPY`）。
     pub s: String,
     pub k: Session,
-    /// 中间价基差（%）：(Arcus − Lighter RH) / 均值，这一分钟的中位数。
+    /// 中间价基差（%）：(a − b) / 均值，这一分钟的中位数（最早那组 a = Arcus、b = Lighter RH）。
     pub b: f64,
     /// 这一分钟的采样数。
     pub n: u32,
-    /// 一档可成交价差（%）的分钟最大值：多 Arcus 空 RH / 多 RH 空 Arcus。缺盘口时为 `None`。
+    /// 可成交价差（%）的分钟最大值：多 a 空 b / 多 b 空 a。缺盘口时为 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ea: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,17 +130,18 @@ pub fn percentile(sorted: &[f64], q: f64) -> f64 {
     sorted[low] * (1.0 - weight) + sorted[high] * weight
 }
 
-pub fn file_for(dir: &Path, day: NaiveDate) -> PathBuf {
-    dir.join(format!("rh-spread-{}.jsonl", day.format("%Y%m%d")))
+/// `prefix` 见 [`super::pairs::Pair::file_prefix`]（最早那组是 `rh-spread`）。
+pub fn file_for(dir: &Path, prefix: &str, day: NaiveDate) -> PathBuf {
+    dir.join(format!("{prefix}-{}.jsonl", day.format("%Y%m%d")))
 }
 
 /// 读回最近 [`WINDOW_DAYS`] 天。坏行跳过并计数（不让一行坏数据拦住启动）。
-pub async fn load(dir: &Path, now: DateTime<Utc>) -> (History, usize) {
+pub async fn load(dir: &Path, prefix: &str, now: DateTime<Utc>) -> (History, usize) {
     let mut history = History::default();
     let mut broken = 0;
     for back in (0..=WINDOW_DAYS).rev() {
         let day = (now - Duration::days(back)).date_naive();
-        let path = file_for(dir, day);
+        let path = file_for(dir, prefix, day);
         let text = match tokio::fs::read_to_string(&path).await {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -161,7 +162,12 @@ pub async fn load(dir: &Path, now: DateTime<Utc>) -> (History, usize) {
 }
 
 /// 追加一批行到当天文件，并删掉超过 [`KEEP_DAYS`] 的旧文件。
-pub async fn append(dir: &Path, rows: &[Row], now: DateTime<Utc>) -> std::io::Result<()> {
+pub async fn append(
+    dir: &Path,
+    prefix: &str,
+    rows: &[Row],
+    now: DateTime<Utc>,
+) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     if rows.is_empty() {
         return Ok(());
@@ -175,16 +181,22 @@ pub async fn append(dir: &Path, rows: &[Row], now: DateTime<Utc>) -> std::io::Re
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(file_for(dir, now.date_naive()))
+        .open(file_for(dir, prefix, now.date_naive()))
         .await?;
     file.write_all(text.as_bytes()).await?;
     file.flush().await?;
-    let oldest = file_for(dir, (now - Duration::days(KEEP_DAYS)).date_naive());
+    let oldest = file_for(dir, prefix, (now - Duration::days(KEEP_DAYS)).date_naive());
+    let head = format!("{prefix}-");
     if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with("rh-spread-") && name.ends_with(".jsonl") && path < oldest {
+            // 只删本组的文件：别的组前缀不同；`{prefix}-` 后面紧跟 8 位日期，不会误删更长前缀的组。
+            let dated = name
+                .strip_prefix(&head)
+                .and_then(|rest| rest.strip_suffix(".jsonl"))
+                .is_some_and(|day| day.len() == 8 && day.bytes().all(|c| c.is_ascii_digit()));
+            if dated && path < oldest {
                 let _ = tokio::fs::remove_file(&path).await;
             }
         }

@@ -114,9 +114,9 @@ pub fn quote(long: &LocalBook, short: &LocalBook, size_usdt: Decimal) -> Option<
     })
 }
 
-/// 两家中间价的有符号基差（%）：(Arcus − Lighter RH) / 均值。
-pub fn mid_basis_pct(arcus: &LocalBook, lighter: &LocalBook) -> Option<Decimal> {
-    let (a, l) = (arcus.mid()?, lighter.mid()?);
-    let reference = (a + l) / Decimal::TWO;
-    (reference > Decimal::ZERO).then(|| ((a - l) / reference * Decimal::ONE_HUNDRED).round_dp(5))
+/// 两家中间价的有符号基差（%）：(a − b) / 均值。最早那组 a = Arcus、b = Lighter RH。
+pub fn mid_basis_pct(a: &LocalBook, b: &LocalBook) -> Option<Decimal> {
+    let (a, b) = (a.mid()?, b.mid()?);
+    let reference = (a + b) / Decimal::TWO;
+    (reference > Decimal::ZERO).then(|| ((a - b) / reference * Decimal::ONE_HUNDRED).round_dp(5))
 }

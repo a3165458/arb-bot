@@ -7,6 +7,9 @@
 //! - Arcus `wss://api.arcus.xyz/v1/ws`，频道 `l2Orderbook`（`id` = `SPY-USD`、`nLevels`）：
 //!   每 ~200ms 推一份**完整快照**，直接替换，不需要连续性检查。
 //!
+//! - Hyperliquid `wss://api.hyperliquid.xyz/ws`，`{"method":"subscribe","subscription":{"type":"l2Book","coin":"xyz:TSLA"}}`：
+//!   每侧 20 档**完整快照**，2026-10-09 实测每 ~5 秒推一次（盘口没变也推）。一条连接最多 1000 个订阅。
+//!
 //! 实测（2026-10-07）37 个合约两家合计约 240 KB/s。
 
 use rust_decimal::Decimal;
@@ -15,6 +18,7 @@ use serde_json::Value;
 
 pub const LIGHTER_WS: &str = "wss://api.rh.lighter.xyz/stream";
 pub const ARCUS_WS: &str = "wss://api.arcus.xyz/v1/ws";
+pub const HYPERLIQUID_WS: &str = "wss://api.hyperliquid.xyz/ws";
 /// Arcus 每侧订阅多少档。2000 USDT 级别的名义，20 档在 37 个合约上都吃得满（最薄的 AMD 10 档约 2300 USDT）。
 pub const ARCUS_LEVELS: u32 = 25;
 
@@ -170,5 +174,55 @@ pub fn lighter_unsubscribe(market_id: i64) -> String {
 
 pub fn arcus_subscribe(market: &str) -> String {
     serde_json::json!({"type": "subscribe", "channel": "l2Orderbook", "id": market, "nLevels": ARCUS_LEVELS})
+        .to_string()
+}
+
+/// 解析 Hyperliquid 的一条消息。`market` 是原始币名（`xyz:TSLA`）。`l2Book` 每条都是完整快照。
+pub fn parse_hyperliquid(text: &str) -> Result<Event, String> {
+    let value: Value = serde_json::from_str(text).map_err(|error| format!("不是 JSON：{error}"))?;
+    match value.get("channel").and_then(Value::as_str) {
+        Some("error") => {
+            let message = value.get("data").map(Value::to_string).unwrap_or_default();
+            return Ok(Event::Error(message.chars().take(160).collect()));
+        }
+        Some("l2Book") => {}
+        _ => return Ok(Event::Other),
+    }
+    let data = value.get("data").ok_or("缺 data")?;
+    let market = data
+        .get("coin")
+        .and_then(Value::as_str)
+        .ok_or("缺 coin")?
+        .to_string();
+    let levels = data
+        .get("levels")
+        .and_then(Value::as_array)
+        .filter(|sides| sides.len() == 2)
+        .ok_or("levels 必须是两侧")?;
+    let side = |v: &Value| -> Result<Vec<(Decimal, Decimal)>, String> {
+        v.as_array()
+            .ok_or("档位不是数组")?
+            .iter()
+            .map(|l| {
+                let (Some(px), Some(sz)) = (
+                    l.get("px").and_then(Value::as_str),
+                    l.get("sz").and_then(Value::as_str),
+                ) else {
+                    return Err("档位缺 px / sz".to_string());
+                };
+                level(px, sz).ok_or_else(|| format!("档位不是数字：{px} / {sz}"))
+            })
+            .collect()
+    };
+    Ok(Event::Snapshot {
+        market,
+        bids: side(&levels[0])?,
+        asks: side(&levels[1])?,
+        nonce: None,
+    })
+}
+
+pub fn hyperliquid_subscribe(coin: &str) -> String {
+    serde_json::json!({"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}})
         .to_string()
 }

@@ -27,7 +27,7 @@
     <button class="nav-item active" type="button" data-page="opps">机会</button>
     <button class="nav-item" type="button" data-page="strategy">策略</button>
     <button class="nav-item" type="button" data-page="positions">持仓</button>
-    <button class="nav-item" type="button" data-page="rhspread">RH 价差</button>
+    <button class="nav-item" type="button" data-page="rhspread">价差监控</button>
   </nav>
   <div class="header-right">
     <div class="chips" id="chips"></div>
@@ -254,8 +254,8 @@
 <main class="page hidden" id="page-rhspread">
   <section class="section-head">
     <span class="eyebrow sky">monitor</span>
-    <h2>Lighter RH ↔ Arcus 价差</h2>
-    <p>两家同名合约的实时可成交价差（行情 WebSocket，每秒更新）。按这笔名义吃完两边深度的均价算，扣掉往返手续费和平仓穿价；
+    <h2>跨场所价差监控</h2>
+    <p>Arcus、Lighter RH、Hyperliquid xyz / io 之间同名合约的实时可成交价差（行情 WebSocket，每秒更新；Hyperliquid 的组要扫描器核实过是同一资产才配对）。按这笔名义吃完两边深度的均价算，扣掉往返手续费和平仓穿价；
       并与该合约<b>同一时段</b>（盘中 / 盘后 / 周末 / 加密币全天）过去 7 天的「正常基差」比较 —— 股票类合约休市时常有系统性偏差，
       现价差大不代表会收敛到 0。<b>点击某一行</b>会跳到策略页的下单界面（仍需预览并确认）；
       也可以在下面开启<b>自动交易</b>：信号达到你设的门槛并保持够久后，机器人按你设的金额和退出规则自动下单。</p>
@@ -263,6 +263,7 @@
   <section class="controls card">
     <span class="small" id="rh-status"></span>
     <span class="grow"></span>
+    <label class="small">组 <select id="rh-pair"></select></label>
     <label class="small"><input type="checkbox" id="rh-signal-only" /> 只看信号</label>
   </section>
   <div class="stats" id="rh-stats"></div>
@@ -274,7 +275,7 @@
         <tr>
           <th>合约</th>
           <th>时段</th>
-          <th class="num" title="(Arcus 中间价 − Lighter RH 中间价) / 均值">当前基差</th>
+          <th class="num" title="(左边那家中间价 − 右边那家中间价) / 均值">当前基差</th>
           <th class="num" title="过去 7 天同一时段的分钟中位数（括号里是 p10 ~ p90）">正常基差</th>
           <th class="num" title="当前基差偏离正常水平几个 MAD（中位数绝对偏差）">偏离</th>
           <th>方向</th>

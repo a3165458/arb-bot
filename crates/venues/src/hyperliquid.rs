@@ -8,8 +8,18 @@
 //! 批量行情不含结算时间；实测 predictedFundings 的 nextFundingTime 落在过去，
 //! 因此按下一 UTC 整点推算并标记 estimated，不冒充服务端时间。
 //! 持仓量以合约基础单位返回，乘 markPx 得到报价资产名义量，不直接当成 USDT。
-//! 公开行情没有账户实际费率；费率随交易量、质押与推荐优惠变化，故保留 None。
+//! 吃单费率按**最低交易量档**（基础档）算：账户的交易量档位、质押与推荐优惠只会让它更低，
+//! 所以这是任何账户都不会超过的上限（见 [`taker_fee_for`]）：
+//! - 主 dex：基础档 0.045%；
+//! - HIP-3：再乘 deployer 倍数（官方规则 `scale < 1 ? 1 + scale : 2 × scale`，xyz / io 实测 `1.0` → ×2）；
+//!   开着 growth mode 的合约手续费（与返佣）打一折（×0.1）。逐合约读 `deployerFeeScale` / `growthMode`，
+//!   缺倍数就不知道 —— 保留 None，不猜；
+//! - `hyperliquid-io`（Entropy 部署）的自返佣：`ARB_ENTROPY_SELF_REBATE`（Tier 4 = `2`，即 200%）
+//!   按 Entropy 那一半的份额返还，净费率 = 费率 × (1 − 返佣 / 2)，**最低 0，不算成负的**。
+//!   只在倍数为 1（官方文档写明的五五分成）时适用。
+//!
 //! https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees
+//! https://docs.entropy.io/equity-perp-mechanics/fees 、 https://docs.entropy.io/about-entropy/referrals
 //!
 //! 主 dex 合约通常 USDT 计价、USDC 保证金，属于无汇率换算的 quanto 合约；
 //! 与 USDT 保证金合约仍有抵押品风险差异。HYPE/PURR 官方明确为 USDC 计价，排除。
@@ -126,6 +136,90 @@ use crate::connector::VenueApi;
 use crate::http::get_json;
 
 const INFO_URL: &str = "https://api.hyperliquid.xyz/info";
+
+/// 永续吃单费率的基础档（最低交易量档）。交易量档位、质押与推荐优惠只会更低。
+/// `userFees.feeSchedule.cross`（2026-10-09 实测 `"0.00045"`）。
+pub const BASE_TAKER_FEE: Decimal = Decimal::from_parts(45, 0, 0, false, 5);
+
+/// Entropy（`hyperliquid-io` 的部署方）自返佣比例的上限：Tier 4 = 200%。
+pub const MAX_ENTROPY_SELF_REBATE: Decimal = Decimal::from_parts(2, 0, 0, false, 0);
+
+/// 读 `ARB_ENTROPY_SELF_REBATE`（小数，`2` = 200%）。没设为 0；不合法返回错误。
+pub fn entropy_self_rebate_from_env() -> ArbResult<Decimal> {
+    let Ok(raw) = std::env::var("ARB_ENTROPY_SELF_REBATE") else {
+        return Ok(Decimal::ZERO);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("off") {
+        return Ok(Decimal::ZERO);
+    }
+    let value = parse_decimal(raw).ok_or_else(|| {
+        ArbError::config(format!(
+            "ARB_ENTROPY_SELF_REBATE 必须是小数（2 = 200%），收到 {raw:?}"
+        ))
+    })?;
+    if !(Decimal::ZERO..=MAX_ENTROPY_SELF_REBATE).contains(&value) {
+        return Err(ArbError::config(format!(
+            "ARB_ENTROPY_SELF_REBATE 必须在 0 到 {MAX_ENTROPY_SELF_REBATE} 之间，收到 {value}"
+        )));
+    }
+    Ok(value)
+}
+
+/// 一个合约的吃单费率（单边，小数）。`None` = HIP-3 合约缺 deployer 倍数，不知道。
+///
+/// `rebate` 只对 `hyperliquid-io` 生效，且只在倍数为 1 时（Entropy 拿一半）。结果不小于 0。
+pub fn taker_fee_for(
+    venue: Venue,
+    deployer_fee_scale: Option<&str>,
+    growth_mode: Option<&str>,
+    rebate: Decimal,
+) -> Option<Decimal> {
+    if venue == Venue::Hyperliquid {
+        return Some(BASE_TAKER_FEE);
+    }
+    let scale = parse_decimal(deployer_fee_scale?)?;
+    if scale < Decimal::ZERO {
+        return None;
+    }
+    let multiplier = if scale < Decimal::ONE {
+        Decimal::ONE + scale
+    } else {
+        Decimal::TWO * scale
+    };
+    let mut fee = BASE_TAKER_FEE * multiplier;
+    if growth_mode == Some("enabled") {
+        fee *= Decimal::new(1, 1);
+    }
+    if venue == Venue::HyperliquidIo && scale == Decimal::ONE && rebate > Decimal::ZERO {
+        let rebate = rebate.min(MAX_ENTROPY_SELF_REBATE);
+        fee *= Decimal::ONE - rebate / Decimal::TWO;
+    }
+    Some(fee.max(Decimal::ZERO))
+}
+
+/// 原始币名（`xyz:GOLD`）→ 对外的 base（`XAU`），按该场所的前缀与已核实别名。不是本场所的币名为 `None`。
+pub fn base_for(venue: Venue, raw: &str) -> Option<String> {
+    let dex = match venue {
+        Venue::Hyperliquid => MAIN_DEX,
+        Venue::HyperliquidXyz => XYZ_DEX,
+        Venue::HyperliquidIo => IO_DEX,
+        _ => return None,
+    };
+    if dex.is_usdc_quoted(raw) {
+        return None;
+    }
+    dex.base_of(raw)
+}
+
+/// 场所对应的 `/info` 请求里的 `dex`（主 dex 为 `None`）。
+pub fn dex_name(venue: Venue) -> Option<&'static str> {
+    match venue {
+        Venue::HyperliquidXyz => XYZ_DEX.name,
+        Venue::HyperliquidIo => IO_DEX.name,
+        _ => None,
+    }
+}
 
 /// 一个 perp dex：场所身份、请求里的 `dex` 参数、以及已核实的别名。
 #[derive(Debug, Clone, Copy)]
@@ -258,6 +352,8 @@ const FUNDING_INTERVAL_H: u32 = 1;
 pub struct HyperliquidApi {
     client: Client,
     dex: Dex,
+    /// Entropy 自返佣（只对 io 生效），见 [`taker_fee_for`]。
+    rebate: Decimal,
 }
 
 impl HyperliquidApi {
@@ -266,6 +362,7 @@ impl HyperliquidApi {
         Self {
             client,
             dex: MAIN_DEX,
+            rebate: Decimal::ZERO,
         }
     }
 
@@ -274,14 +371,21 @@ impl HyperliquidApi {
         Self {
             client,
             dex: XYZ_DEX,
+            rebate: Decimal::ZERO,
         }
     }
 
     /// HIP-3 `io` dex（`hyperliquid-io`）。
     pub fn io(client: Client) -> Self {
+        // 启动时 `arb-web` 已校验过这个变量；这里读不懂就按没有返佣（偏保守）。
+        let rebate = entropy_self_rebate_from_env().unwrap_or_else(|error| {
+            warn!(%error, "Entropy 自返佣读不懂，按 0 计");
+            Decimal::ZERO
+        });
         Self {
             client,
             dex: IO_DEX,
+            rebate,
         }
     }
 
@@ -329,6 +433,12 @@ struct UniverseAsset {
     /// 最低档的最高杠杆（整数）。
     #[serde(default)]
     max_leverage: Option<u32>,
+    /// HIP-3 deployer 手续费倍数（字符串，如 `"1.0"`）。主 dex 没有。
+    #[serde(default)]
+    deployer_fee_scale: Option<String>,
+    /// `"enabled"` = growth mode：手续费与返佣打一折。
+    #[serde(default)]
+    growth_mode: Option<String>,
 }
 
 /// 缺少费率只丢该行；缺少辅助指标保留 None，不用零填充。
@@ -373,7 +483,7 @@ impl VenueApi for HyperliquidApi {
         let (response, capped) =
             tokio::join!(self.info::<MetaAndAssetCtxs>(&body), self.fetch_oi_capped(),);
         let capped = capped.unwrap_or_default();
-        let parsed = parse_response(self.dex, &response?, &capped, Utc::now())?;
+        let parsed = parse_response_with(self.dex, &response?, &capped, Utc::now(), self.rebate)?;
 
         // 两种「少了一条」要分开报：已下架是预期内的，字段不可用则说明数据源变了。
         if parsed.filtered > 0 {
@@ -596,11 +706,23 @@ struct Parsed {
 /// 保持场所顺序；拒绝长度不一致的数组，防止静默截断残缺的快照。
 ///
 /// `capped` 是 `perpsAtOpenInterestCap` 返回的原始币名（含子交易所前缀）。
+#[cfg(test)]
 fn parse_response(
     dex: Dex,
     response: &MetaAndAssetCtxs,
     capped: &[String],
     now: DateTime<Utc>,
+) -> ArbResult<Parsed> {
+    parse_response_with(dex, response, capped, now, Decimal::ZERO)
+}
+
+/// `rebate`：Entropy 自返佣（只对 io 生效），见 [`taker_fee_for`]。
+fn parse_response_with(
+    dex: Dex,
+    response: &MetaAndAssetCtxs,
+    capped: &[String],
+    now: DateTime<Utc>,
+    rebate: Decimal,
 ) -> ArbResult<Parsed> {
     if response.0.universe.len() != response.1.len() {
         return Err(ArbError::venue(
@@ -626,7 +748,7 @@ fn parse_response(
         // null 不能提前移除，否则后面的币种会错配行情。
         match ctx
             .as_ref()
-            .and_then(|ctx| parse_row(dex, asset, ctx, oi_capped, now))
+            .and_then(|ctx| parse_row(dex, asset, ctx, oi_capped, now, rebate))
         {
             Some(rate) => parsed.rates.push(rate),
             None => parsed.unusable += 1,
@@ -653,6 +775,7 @@ fn parse_row(
     ctx: &AssetCtx,
     oi_capped: bool,
     now: DateTime<Utc>,
+    rebate: Decimal,
 ) -> Option<MarketSnapshot> {
     let base = dex.base_of(&asset.name)?;
     let period_rate = parse_decimal(ctx.funding.as_deref()?)?;
@@ -669,7 +792,13 @@ fn parse_row(
         next_funding_at,
         // 批量行情没有下一结算时刻，按已核实的小时规则推算。
         next_funding_estimated: true,
-        taker_fee: None,
+        // 基础档费率（上限）；HIP-3 缺倍数时不知道。
+        taker_fee: taker_fee_for(
+            dex.venue,
+            asset.deployer_fee_scale.as_deref(),
+            asset.growth_mode.as_deref(),
+            rebate,
+        ),
         mark_price,
         index_price: opt_decimal(&ctx.oracle_px),
         // 批量接口没有一档价量，不能用中间价、冲击价或标记价伪造可成交盘口。
@@ -807,13 +936,67 @@ mod tests {
     }
 
     #[test]
-    fn taker_fee_is_unknown_not_zero() {
+    fn taker_fees_are_the_base_tier_upper_bound_with_hip3_scale_growth_and_capped_rebate() {
         let parsed = parse(&[BTC_CTX, ETH_CTX, MATIC_CTX, KPEPE_CTX]);
         assert_eq!(
             row(&parsed, "BTC").taker_fee,
-            None,
-            "公共接口没有手续费字段：不知道就是 None，不是 0"
+            Some(dec("0.00045")),
+            "主 dex 基础档"
         );
+        // HIP-3：倍数 1.0 → ×2；growth mode → ×0.1。xyz:TSLA 开着 growth，xyz:GOLD 没开。
+        let response = load_dex(&[XYZ_TSLA, XYZ_GOLD]);
+        let parsed = parse_response(XYZ_DEX, &response, &[], at(MID_HOUR)).unwrap();
+        assert_eq!(row(&parsed, "TSLA").taker_fee, Some(dec("0.00009")));
+        assert_eq!(row(&parsed, "XAU").taker_fee, Some(dec("0.0009")));
+        // 缺倍数：不知道，不猜。
+        assert_eq!(
+            taker_fee_for(Venue::HyperliquidXyz, None, None, Decimal::ZERO),
+            None
+        );
+        // 倍数 < 1：1 + scale。
+        assert_eq!(
+            taker_fee_for(Venue::HyperliquidXyz, Some("0.5"), None, Decimal::ZERO),
+            Some(dec("0.000675"))
+        );
+        // Entropy 返佣只对 io、只按一半份额：200% → 0，100% → 一半；不会变成负的；xyz 不适用。
+        let response = load_dex(&[IO_ANTH]);
+        let parsed = parse_response_with(IO_DEX, &response, &[], at(MID_HOUR), dec("2")).unwrap();
+        assert_eq!(
+            row(&parsed, "ANTHROPIC").taker_fee,
+            Some(Decimal::ZERO),
+            "Tier 4 返佣"
+        );
+        let io =
+            |r: &str| taker_fee_for(Venue::HyperliquidIo, Some("1.0"), Some("enabled"), dec(r));
+        assert_eq!(io("0"), Some(dec("0.00009")));
+        assert_eq!(io("1"), Some(dec("0.000045")));
+        assert_eq!(io("2"), Some(Decimal::ZERO));
+        assert_eq!(io("5"), Some(Decimal::ZERO), "超过上限按上限，不出负数");
+        assert_eq!(
+            taker_fee_for(
+                Venue::HyperliquidXyz,
+                Some("1.0"),
+                Some("enabled"),
+                dec("2")
+            ),
+            Some(dec("0.00009")),
+            "返佣只属于 Entropy 部署的 io"
+        );
+        assert_eq!(
+            taker_fee_for(Venue::HyperliquidIo, Some("2.0"), None, dec("2")),
+            Some(dec("0.0018")),
+            "倍数不是 1 时分成比例未知，不套返佣"
+        );
+        assert_eq!(
+            base_for(Venue::HyperliquidXyz, "xyz:GOLD").as_deref(),
+            Some("XAU")
+        );
+        assert_eq!(
+            base_for(Venue::HyperliquidIo, "io:ANTH").as_deref(),
+            Some("ANTHROPIC")
+        );
+        assert_eq!(base_for(Venue::HyperliquidXyz, "io:ANTH"), None);
+        assert_eq!(base_for(Venue::Hyperliquid, "HYPE"), None, "USDC 计价");
     }
 
     #[test]

@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
     // Lighter RH ↔ Arcus 价差监控（只读）：行情走 WebSocket，不占 REST 限频额度。
     let rh_auto = rh_auto::AutoTrader::load(&rh_spread_config.dir);
     let rh_spread = rh_spread::Monitor::new(rh_spread_config, Arc::clone(&alerts));
-    rh_spread.spawn(client.clone());
+    rh_spread.spawn(client.clone(), Arc::clone(&cache));
 
     let bind = format!("{host}:{}", settings.http_port);
     let state = Arc::new(AppState {
