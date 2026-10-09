@@ -1,4 +1,5 @@
-//! RH 价差自动交易：Lighter RH ↔ Arcus 价差监控出信号后，按用户在面板上设定的参数自动开价差单。
+//! 价差自动交易：价差监控（全部组：用户配了 API 的场所两两组合）出信号后，按用户在面板上设定的参数自动开价差单。
+//! 两条腿都必须是实盘已连接的场所（纸面模式不限）；规则与最早只做 Arcus ↔ Lighter RH 时完全相同。
 //!
 //! **不另起一条下单路径**：每一笔都走页面下单同一个函数（[`crate::trade::open_for_auto`] →
 //! `run_open`），所以对账、按现拉盘口重算深度与净收益、单笔上限、持仓数上限、当日亏损闸门、
@@ -32,9 +33,6 @@ use tracing::{error, info, warn};
 use crate::AppState;
 use crate::rh_spread::{Line, View};
 use crate::trade::Mode;
-
-/// 自动交易做哪一组。其它组先只监控：新组要攒历史、核实真实费率之后再开放。
-pub const AUTO_PAIR: crate::rh_spread::pairs::Pair = crate::rh_spread::pairs::Pair::RH;
 
 /// 同一合约尝试一次后的冷却（成功或被闸门拒绝）。
 const SYMBOL_COOLDOWN: Duration = Duration::from_secs(10 * 60);
@@ -206,6 +204,15 @@ pub struct Candidate {
     pub signal_sec: u64,
 }
 
+/// 计时的键：同一个合约可能出现在几组里（同一个多腿、不同的空腿），要分开计。
+pub type HoldKey = (String, Venue, Venue);
+
+impl Candidate {
+    pub fn hold_key(&self) -> HoldKey {
+        (self.base.clone(), self.long, self.short)
+    }
+}
+
 /// 价差页基差是 (a − b)；持仓规则的基差是 (空 − 多)。多 a / 空 b 时持仓基差 = −页面基差，
 /// 所以「回到正常」的目标 = −中位数；反方向就是中位数本身。超出规则允许的 ±5% 时不给目标。
 pub fn target_for(direction: &str, median: f64) -> Option<Decimal> {
@@ -223,13 +230,13 @@ pub fn target_for(direction: &str, median: f64) -> Option<Decimal> {
 pub fn track_holds(
     view: &View,
     settings: &Settings,
-    since: &mut HashMap<(String, Venue), Instant>,
+    since: &mut HashMap<HoldKey, Instant>,
     now: Instant,
 ) {
-    let current: Vec<(String, Venue)> = view
+    let current: Vec<HoldKey> = view
         .lines
         .iter()
-        .filter_map(|line| candidate_of(line, settings).map(|c| (c.base, c.long)))
+        .filter_map(|line| candidate_of(line, settings).map(|c| c.hold_key()))
         .collect();
     since.retain(|key, _| current.contains(key));
     for key in current {
@@ -238,16 +245,15 @@ pub fn track_holds(
 }
 
 /// 从价差监控的快照里挑一笔。`Err` 是这一刻为什么不下单（给页面看）。
+/// `tradable`：这家场所能不能下单（实盘：已连接；纸面：都能）。两条腿都要能下单的组才做。
 pub fn pick(
     view: &View,
     settings: &Settings,
     now: DateTime<Utc>,
+    tradable: &dyn Fn(Venue) -> bool,
     held_sec: &dyn Fn(&Candidate) -> u64,
     busy_symbols: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Candidate, String> {
-    if !view.connected.up(AUTO_PAIR.a) || !view.connected.up(AUTO_PAIR.b) {
-        return Err("价差监控有一家行情没连上".into());
-    }
     match view.updated_at {
         Some(at) if (now - at).num_seconds() <= VIEW_STALE_SEC => {}
         _ => return Err("价差监控的快照不新鲜".into()),
@@ -258,6 +264,13 @@ pub fn pick(
         let Some(mut candidate) = candidate_of(line, settings) else {
             continue;
         };
+        // 行情断了的那家，盘口会被清空、这一行不会有报价；这里再挡一次「行情连着但账户没连」的。
+        if !tradable(candidate.long) || !tradable(candidate.short) {
+            continue;
+        }
+        if !view.connected.up(candidate.long) || !view.connected.up(candidate.short) {
+            continue;
+        }
         candidate.signal_sec = held_sec(&candidate);
         if !settings.symbols.is_empty() && !settings.symbols.contains(&candidate.base) {
             continue;
@@ -283,8 +296,7 @@ pub fn pick(
 /// 一行能不能做、怎么做。纯函数。
 pub fn candidate_of(line: &Line, settings: &Settings) -> Option<Candidate> {
     let best = line.best.as_ref()?;
-    // 自动交易目前只做 Arcus ↔ Lighter RH；其它组只监控、提醒。
-    if line.note.is_some() || line.pair != AUTO_PAIR.id() {
+    if line.note.is_some() {
         return None;
     }
     let normal = line.normal.as_ref()?;
@@ -372,7 +384,7 @@ struct Inner {
     retry_at: Option<Instant>,
     last_open: Option<Instant>,
     /// 达到门槛的（合约, 多腿）从什么时候开始连续成立。
-    since: HashMap<(String, Venue), Instant>,
+    since: HashMap<HoldKey, Instant>,
     /// 这一刻为什么没下单。
     status: String,
     attempting: Option<String>,
@@ -654,7 +666,7 @@ impl AutoTrader {
             let since = inner.since.clone();
             let held = |c: &Candidate| {
                 since
-                    .get(&(c.base.clone(), c.long))
+                    .get(&c.hold_key())
                     .map_or(0, |at| instant.saturating_duration_since(*at).as_secs())
             };
             let cooldown = inner.cooldown.clone();
@@ -675,7 +687,13 @@ impl AutoTrader {
                         )
                     })
             };
-            match pick(&view, &settings, now, &held, &busy) {
+            let live_venues: Option<Vec<Venue>> = state.trade.live_venues().map(<[Venue]>::to_vec);
+            let tradable = |venue: Venue| match &live_venues {
+                _ if !live => true,
+                Some(venues) => venues.contains(&venue),
+                None => false,
+            };
+            match pick(&view, &settings, now, &tradable, &held, &busy) {
                 Ok(candidate) => {
                     inner.attempting = Some(candidate.base.clone());
                     inner.status = format!("正在为 {} 下单…", candidate.base);
@@ -731,7 +749,7 @@ impl AutoTrader {
                 .map(|t| format!("，收敛目标 {t}%"))
                 .unwrap_or_default()
         );
-        warn!(symbol = %candidate.base, "RH 价差自动交易：尝试开仓 {what}");
+        warn!(symbol = %candidate.base, "价差自动交易：尝试开仓 {what}");
         let (status, response) = crate::trade::open_for_auto(Arc::clone(state), body, true).await;
         let outcome = classify(status, &response);
         let reason = response["error"].as_str().unwrap_or_default().to_string();
@@ -758,16 +776,16 @@ impl AutoTrader {
                 inner.status = format!("已开仓 {id}");
                 self.save(&inner.persisted);
                 drop(inner);
-                info!(position = %id, "RH 价差自动交易：开仓成功");
+                info!(position = %id, "价差自动交易：开仓成功");
                 if settings.mode == Mode::Paper {
                     state
                         .alerts
                         .notify_always(format!("🤖 自动交易（纸面）开仓 {id}：{what}"));
                 } else {
                     // 实盘开仓的详细通知由下单路径发出；这里补一句是自动开的。
-                    state.alerts.notify_always(format!(
-                        "🤖 上面这笔实盘开仓 {id} 是 RH 价差自动交易开的。"
-                    ));
+                    state
+                        .alerts
+                        .notify_always(format!("🤖 上面这笔实盘开仓 {id} 是价差自动交易开的。"));
                 }
             }
             Outcome::Unwound(id) => {
@@ -789,7 +807,7 @@ impl AutoTrader {
                     let reason = format!("开仓连续 {failures} 次以回滚收场");
                     self.disable(reason.clone()).await;
                     state.alerts.notify_always(format!(
-                        "⛔ RH 价差自动交易已关闭：{reason}。查明原因后在面板上重新开启。"
+                        "⛔ 价差自动交易已关闭：{reason}。查明原因后在面板上重新开启。"
                     ));
                 }
             }
@@ -819,10 +837,10 @@ impl AutoTrader {
             Outcome::Interrupted => {
                 drop(inner);
                 let text = format!("执行中断、结果未知：{reason}（{what}）");
-                error!(symbol = %candidate.base, "RH 价差自动交易：{text}");
+                error!(symbol = %candidate.base, "价差自动交易：{text}");
                 self.disable(text.clone()).await;
                 state.alerts.notify_always(format!(
-                    "⛔ RH 价差自动交易已关闭：{text}。以台账与对账为准，去持仓页核对后再决定是否重新开启。"
+                    "⛔ 价差自动交易已关闭：{text}。以台账与对账为准，去持仓页核对后再决定是否重新开启。"
                 ));
             }
             Outcome::Misconfigured => {
@@ -831,7 +849,7 @@ impl AutoTrader {
                 self.disable(text.clone()).await;
                 state
                     .alerts
-                    .notify_always(format!("⛔ RH 价差自动交易已关闭：{text}"));
+                    .notify_always(format!("⛔ 价差自动交易已关闭：{text}"));
             }
         }
     }
@@ -935,11 +953,10 @@ pub async fn api_set(
         .and_then(Decimal::from_f64_retain);
     match state.rh_auto.update(settings, max, confirm).await {
         Ok(saved) => {
-            warn!("RH 价差自动交易设置已更新：{}", describe(&saved));
-            state.alerts.notify_always(format!(
-                "🤖 RH 价差自动交易设置已更新：{}",
-                describe(&saved)
-            ));
+            warn!("价差自动交易设置已更新：{}", describe(&saved));
+            state
+                .alerts
+                .notify_always(format!("🤖 价差自动交易设置已更新：{}", describe(&saved)));
             Json(json!({ "settings": saved })).into_response()
         }
         Err(message) => {
@@ -975,7 +992,7 @@ mod tests {
             (None, Some(leg))
         };
         Line {
-            pair: AUTO_PAIR.id(),
+            pair: crate::rh_spread::pairs::Pair::RH.id(),
             a: Venue::Arcus,
             b: Venue::LighterRh,
             fee_round_trip_pct: Some(dec("0.045")),
@@ -1055,11 +1072,17 @@ mod tests {
     #[test]
     fn lines_the_order_path_would_reject_are_never_picked() {
         let s = settings();
-        // 其它组只监控：哪怕信号再好也不自动下单。
+        // 其它组同样适用（规则相同）：多 HL-xyz / 空 RH。
         let mut other = line("NVDA", "long_a", leg("0.3", "0.2", "0.09"), -0.11);
         other.pair = "hyperliquid-xyz:lighter-rh".into();
         other.a = Venue::HyperliquidXyz;
-        assert!(candidate_of(&other, &s).is_none());
+        let c = candidate_of(&other, &s).expect("别的组也做");
+        assert_eq!((c.long, c.short), (Venue::HyperliquidXyz, Venue::LighterRh));
+        // 开仓价差为负（如 io ↔ RH 的 ANTHROPIC 长期差 2%）：哪个组都不做。
+        let mut io = line("ANTHROPIC", "long_b", leg("-2.17", "-2.19", "0.087"), -2.27);
+        io.pair = "hyperliquid-io:lighter-rh".into();
+        io.a = Venue::HyperliquidIo;
+        assert!(candidate_of(&io, &s).is_none());
         // 回到正常净收益不够门槛。
         assert!(candidate_of(&line("A", "long_a", leg("0.3", "0.2", "0.04"), -0.1), &s).is_none());
         // 可成交价差不为正（价差单的硬性条件）。
@@ -1094,26 +1117,33 @@ mod tests {
         ]);
         let now = Utc::now();
         let none = |_: &str| None;
-        let err = pick(&v, &s, now, &|_| 3, &none).unwrap_err();
+        let all = |_: Venue| true;
+        let err = pick(&v, &s, now, &all, &|_| 3, &none).unwrap_err();
         assert!(err.contains("3/10"), "{err}");
         let held = |c: &Candidate| if c.base == "NVDA" { 12 } else { 30 };
-        assert_eq!(pick(&v, &s, now, &held, &none).unwrap().base, "NVDA");
+        assert_eq!(pick(&v, &s, now, &all, &held, &none).unwrap().base, "NVDA");
         // 已有 NVDA 仓位：跳到下一条。
         let busy = |b: &str| (b == "NVDA").then(|| "已有这个合约的仓位".to_string());
-        assert_eq!(pick(&v, &s, now, &held, &busy).unwrap().base, "SPY");
+        assert_eq!(pick(&v, &s, now, &all, &held, &busy).unwrap().base, "SPY");
         // 名单只做 SPY。
         let only = Settings {
             symbols: vec!["SPY".into()],
             ..s.clone()
         };
-        assert_eq!(pick(&v, &only, now, &held, &none).unwrap().base, "SPY");
+        assert_eq!(
+            pick(&v, &only, now, &all, &held, &none).unwrap().base,
+            "SPY"
+        );
         // 行情断了、快照旧了：不下单。
         let mut down = v.clone();
         down.connected.venues.insert(Venue::Arcus, false);
-        assert!(pick(&down, &s, now, &held, &none).is_err());
+        assert!(pick(&down, &s, now, &all, &held, &none).is_err());
         let mut old = v.clone();
         old.updated_at = Some(now - chrono::Duration::seconds(30));
-        assert!(pick(&old, &s, now, &held, &none).is_err());
+        assert!(pick(&old, &s, now, &all, &held, &none).is_err());
+        // 实盘只连了 Arcus（RH 没连上 / 没配 API）：两腿不全，不做。
+        let arcus_only = |v: Venue| v == Venue::Arcus;
+        assert!(pick(&v, &s, now, &arcus_only, &held, &none).is_err());
     }
 
     #[test]
@@ -1129,7 +1159,8 @@ mod tests {
         )]);
         track_holds(&good, &s, &mut since, t0);
         track_holds(&good, &s, &mut since, t0 + Duration::from_secs(5));
-        assert_eq!(since[&("NVDA".to_string(), Venue::Arcus)], t0);
+        let key = ("NVDA".to_string(), Venue::Arcus, Venue::LighterRh);
+        assert_eq!(since[&key], t0);
         let gone = view(vec![line(
             "NVDA",
             "long_a",
@@ -1139,10 +1170,7 @@ mod tests {
         track_holds(&gone, &s, &mut since, t0 + Duration::from_secs(6));
         assert!(since.is_empty());
         track_holds(&good, &s, &mut since, t0 + Duration::from_secs(7));
-        assert_eq!(
-            since[&("NVDA".to_string(), Venue::Arcus)],
-            t0 + Duration::from_secs(7)
-        );
+        assert_eq!(since[&key], t0 + Duration::from_secs(7));
     }
 
     #[test]

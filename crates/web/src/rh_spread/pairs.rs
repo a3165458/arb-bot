@@ -22,8 +22,30 @@ pub const SUPPORTED: [Venue; 5] = [
     Venue::HyperliquidIo,
 ];
 
-/// 默认监控的组：原来的一组 + Hyperliquid 股票子交易所与 RH 链上两家的组合。
+/// 没有识别出实盘场所时的默认组：原来的一组 + Hyperliquid 股票子交易所与 RH 链上两家的组合。
 pub const DEFAULT_PAIRS: &str = "arcus:lighter-rh,hyperliquid-xyz:lighter-rh,arcus:hyperliquid-xyz,hyperliquid-io:lighter-rh,arcus:hyperliquid-io";
+
+/// 组里谁当 a（基差被减数）：排在前面的。定死这个顺序，已经攒下的历史（`arcus:lighter-rh`、
+/// `hyperliquid-xyz:lighter-rh` …）方向不变。
+const ORDER: [Venue; 5] = [
+    Venue::Arcus,
+    Venue::Hyperliquid,
+    Venue::HyperliquidXyz,
+    Venue::HyperliquidIo,
+    Venue::LighterRh,
+];
+
+/// 这些场所里价差监控支持的、两两组合的全部组（顺序见 [`ORDER`]）。不到两家为空。
+pub fn all_pairs(venues: &[Venue]) -> Vec<Pair> {
+    let present: Vec<Venue> = ORDER.into_iter().filter(|v| venues.contains(v)).collect();
+    let mut out = Vec::new();
+    for (i, &a) in present.iter().enumerate() {
+        for &b in &present[i + 1..] {
+            out.push(Pair { a, b });
+        }
+    }
+    out
+}
 
 /// 一组场所。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]

@@ -185,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
         let auto = state.rh_auto.settings().await;
         if auto.enabled {
             warn!(
-                "RH 价差自动交易已开启（沿用上次的设置）：{}",
+                "价差自动交易已开启（沿用上次的设置）：{}",
                 rh_auto::describe(&auto)
             );
         }

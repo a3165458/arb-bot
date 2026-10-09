@@ -78,7 +78,7 @@ cargo build --release
 | 机会 | 全市场两两配对的资金费榜与价差榜（原有功能），附强平距离与保证金年化 |
 | 策略 | 选两家场所 → 同时上市的合约与两边费率（APR / 8h / 1h）→ 选中一对腿，右侧给出开仓计划、可复制的 `arb-paper` 命令，以及「下单」区（预览 → 纸面 / 实盘开仓） |
 | 持仓 | 纸面 / 实盘台账里的双腿仓位、两腿强平距离、规则与监控建议；平仓、重试退出、手动执行一轮规则；实盘账户的真实持仓与对账 |
-| 价差监控 | Arcus、Lighter RH、Hyperliquid xyz / io 之间同名合约的实时可成交价差、按时段统计的正常基差与提醒；点一行跳到下单界面；Arcus ↔ RH 组可选自动交易（默认关闭） |
+| 价差监控 | 配了 API 的交易所两两之间同名合约的实时可成交价差、按时段统计的正常基差与提醒；点一行跳到下单界面；可选自动交易（默认关闭） |
 
 ## 架构
 
@@ -807,7 +807,9 @@ Arcus（`/v1/funding`）；其它场所显示「未接入」，不拿 0 冒充�
 
 ### 多组监控
 
-默认监控 5 组：`arcus:lighter-rh`、`hyperliquid-xyz:lighter-rh`、`arcus:hyperliquid-xyz`、`hyperliquid-io:lighter-rh`、`arcus:hyperliquid-io`。
+默认（不设 `ARB_RH_SPREAD_PAIRS`）：**按凭据识别出的实盘场所**（与实盘同一套识别，`ARB_LIVE_VENUES` 或自动识别）里价差监控支持的，两两组合。
+5 家都配了 API 时是 10 组；识别不出两家时退回 `arcus:lighter-rh`、`hyperliquid-xyz:lighter-rh`、`arcus:hyperliquid-xyz`、`hyperliquid-io:lighter-rh`、`arcus:hyperliquid-io`。
+组内左右顺序固定（Arcus、Hyperliquid、HL-xyz、HL-io、Lighter RH），已攒的历史方向不变。
 每家只连一条行情 WebSocket，几组共用（Hyperliquid 用 `l2Book` 订阅，每侧 20 档完整快照，实测约 5 秒一次，15 秒没更新就不算数）。
 
 - **基差口径**：每组 `(左 − 右) / 均值`，方向 `long_a` = 多左空右。最早那组 `arcus:lighter-rh` 与原来同号，
@@ -819,7 +821,9 @@ Arcus（`/v1/funding`）；其它场所显示「未接入」，不拿 0 冒充�
   `hyperliquid-io` 还按 `ARB_ENTROPY_SELF_REBATE` 扣掉 Entropy 返佣：官方规则按 Entropy 那一半份额返，净费率 = 费率 × (1 − 返佣 / 2)，
   **最低 0、不算成负的**，且只在倍数为 1 时适用（文档写明的五五分成）。见 https://docs.entropy.io/about-entropy/referrals 。
   这套费率同样用于扫描器与下单前的价差核算（`taker_fee`）；**台账记的是交易所实际扣的手续费**，返佣到账要自己在 Entropy 领取，不进台账。
-- **自动交易目前只做 `arcus:lighter-rh`**。其它组只监控与提醒：先攒够正常基差的历史、并用第一笔真实成交核对过实际扣费，再开放。
+- **自动交易做全部组**，规则不变：回到正常净收益 ≥ 门槛、开仓可成交价差 > 0、收敛到 0 净收益 > 0、连续保持够久，
+  再走与手动下单同一条路径。实盘模式下两条腿都要是已连接的实盘场所。像 io ↔ RH 的 ANTHROPIC 这种长期差 2%、
+  开仓价差为负的「信号」不会下单。同一合约在任何一组已有仓位就不再开（不会在两组里重复开同一个合约）。
 
 ### 自动交易（默认关闭）
 

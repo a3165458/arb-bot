@@ -2741,8 +2741,13 @@ const VENUE_LABEL = {
 };
 const venueLabel = (venue) => VENUE_LABEL[venue] || venue;
 const pairLabel = (line) => `${venueLabel(line.a)} ↔ ${venueLabel(line.b)}`;
-// 自动交易目前只做这一组（与服务端 AUTO_PAIR 一致）。
-const RH_AUTO_PAIR = 'arcus:lighter-rh';
+// 自动交易做哪些组：两家都是实盘已连接的场所（纸面模式下全部组）。与服务端同一口径。
+function rhAutoTradable(pair) {
+  const mode = state.rhAuto?.data?.settings?.mode;
+  if (mode === 'paper') return true;
+  const venues = state.tradeConfig?.live?.venues || [];
+  return venues.includes(pair.a) && venues.includes(pair.b);
+}
 
 // 一个方向的两条腿：{ long, short }。
 function rhLegs(line, direction = line.best?.direction) {
@@ -2918,7 +2923,7 @@ function renderRhSpread() {
   ].map(([label, value, tone]) => `<div class="stat"><span>${label}</span><b class="${tone}">${esc(value)}</b></div>`).join('');
   const shownPairs = filter === 'all' ? pairs : pairs.filter((p) => p.id === filter);
   const feeText = (p) => p.fee_min_pct == null ? '—' : num(p.fee_min_pct) === num(p.fee_max_pct) ? `${num(p.fee_min_pct)}%` : `${num(p.fee_min_pct)}% ~ ${num(p.fee_max_pct)}%`;
-  const pairRows = shownPairs.map((p) => `<li><b>${esc(`${venueLabel(p.a)} ↔ ${venueLabel(p.b)}`)}</b>：${p.markets} 个合约，往返手续费 ${esc(feeText(p))}，已攒历史 ${(p.history_minutes / 60).toFixed(1)} 小时${p.id === RH_AUTO_PAIR ? '，<span class="pos">可自动交易</span>' : '，只监控'}${p.note ? ` <span class="muted">（${esc(p.note)}）</span>` : ''}</li>`).join('');
+  const pairRows = shownPairs.map((p) => `<li><b>${esc(`${venueLabel(p.a)} ↔ ${venueLabel(p.b)}`)}</b>：${p.markets} 个合约，往返手续费 ${esc(feeText(p))}，已攒历史 ${(p.history_minutes / 60).toFixed(1)} 小时${rhAutoTradable(p) ? '，<span class="pos">可自动交易</span>' : '，只监控（实盘没连这两家）'}${p.note ? ` <span class="muted">（${esc(p.note)}）</span>` : ''}</li>`).join('');
   const notices = [];
   if (view.error) notices.push(`<div class="notice error">${esc(view.error)}</div>`);
   if (pairRows) notices.push(`<div class="notice"><ul>${pairRows}</ul><span class="small muted">基差 = (左 − 右) / 均值。每个合约每个时段至少 ${view.min_minutes} 分钟样本才算出「正常基差」并开始提醒（窗口 ${view.window_days} 天）；在那之前只显示「收敛到 0」的估算，对股票类合约通常偏乐观。往返费按基础档上限算（HL 子交易所含 growth mode 折扣与 Entropy 返佣设置）。</span></div>`);
@@ -3056,12 +3061,12 @@ function rhAutoHtml(a, cfg) {
   const events = (data.events || []).slice(0, 12);
   return `
     <div class="row-head">
-      <h3>自动交易（只做 Arcus ↔ RH）</h3> ${badge}
+      <h3>自动交易（全部组）</h3> ${badge}
       <span class="grow"></span>
       <span class="small muted">${esc(data.status || '')}</span>
     </div>
     ${data.disabled_reason && !on ? `<div class="notice error">上次自动关闭的原因：${esc(data.disabled_reason)}</div>` : ''}
-    <p class="small muted">其它组（HL-xyz / HL-io）目前只监控和提醒：新组要先攒够正常基差历史、并用第一笔真实成交核对过手续费，再开放自动交易。Arcus ↔ RH 组的信号「回到正常净收益」达到门槛、连续保持够久后，按下面的参数自动下一笔价差单。每一笔都走和手动下单同一套检查：对账干净、按你的金额现拉盘口重算、单笔上限${maxSize ? `（${esc(String(maxSize))} USDT）` : ''}、持仓数上限、当日亏损、Telegram /pause 与熔断。同一合约已有仓位不再开；每次尝试后该合约冷却 10 分钟；执行中断（结果未知）或连续 ${data.max_failures} 次回滚会自动关闭。</p>
+    <p class="small muted">所有你配了 API 的交易所两两组成的组都参与（实盘：两家都已连接）。任何一组的信号「回到正常净收益」达到门槛、且开仓可成交价差与收敛到 0 净收益都为正、连续保持够久后，按下面的参数自动下一笔价差单。每一笔都走和手动下单同一套检查：对账干净、按你的金额现拉盘口重算、单笔上限${maxSize ? `（${esc(String(maxSize))} USDT）` : ''}、持仓数上限、当日亏损、Telegram /pause 与熔断。同一合约已有仓位不再开；每次尝试后该合约冷却 10 分钟；执行中断（结果未知）或连续 ${data.max_failures} 次回滚会自动关闭。</p>
     <div class="rh-auto-grid">
       <label class="field"><span>账户</span><select data-rh-auto="mode">
         <option value="paper"${f.mode === 'paper' ? ' selected' : ''}>纸面（不碰真实资金）</option>

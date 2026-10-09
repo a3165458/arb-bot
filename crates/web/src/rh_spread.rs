@@ -108,15 +108,28 @@ impl Config {
                 Some("1" | "on" | "true")
             ),
             dir: var("ARB_RH_SPREAD_DIR").map_or_else(|| PathBuf::from("rh-spread"), PathBuf::from),
-            pairs: Pair::parse_list(
-                var("ARB_RH_SPREAD_PAIRS")
-                    .as_deref()
-                    .unwrap_or(pairs::DEFAULT_PAIRS),
-            )
-            .map_err(|error| anyhow::anyhow!("ARB_RH_SPREAD_PAIRS：{error}"))?,
+            pairs: match var("ARB_RH_SPREAD_PAIRS") {
+                Some(raw) => Pair::parse_list(&raw)
+                    .map_err(|error| anyhow::anyhow!("ARB_RH_SPREAD_PAIRS：{error}"))?,
+                // 没指定：用户配了 API 的场所（与实盘同一套凭据识别，不联网）两两组合。
+                None => default_pairs(),
+            },
             entropy_rebate: arb_venues::hyperliquid::entropy_self_rebate_from_env()
                 .map_err(|error| anyhow::anyhow!("{error}"))?,
         })
+    }
+}
+
+/// 默认的组：按凭据识别出的实盘场所（`ARB_LIVE_VENUES` 或自动识别）里价差监控支持的，两两组合。
+/// 识别不出两家时退回 [`pairs::DEFAULT_PAIRS`]。
+fn default_pairs() -> Vec<Pair> {
+    let detected = arb_exec::live_connect::live_venues(None)
+        .map(|selection| pairs::all_pairs(&selection.venues))
+        .unwrap_or_default();
+    if detected.is_empty() {
+        Pair::parse_list(pairs::DEFAULT_PAIRS).expect("默认组合法")
+    } else {
+        detected
     }
 }
 
