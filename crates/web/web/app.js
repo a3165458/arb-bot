@@ -3059,6 +3059,22 @@ function rhAutoHtml(a, cfg) {
   }
   const opened = data.open_positions || [];
   const events = (data.events || []).slice(0, 12);
+  const stats = data.stats || {};
+  const count = (value) => Number(value) || 0;
+  const statCards = [
+    ['累计开仓', String(count(stats.opened)), ''],
+    ['今日开仓', String(count(stats.opened_today)), count(stats.opened_today) ? 'pos' : 'dim'],
+    ['仍持有', String(count(stats.open_now)), count(stats.open_now) ? 'pos' : 'dim'],
+    ['回滚', String(count(stats.unwound)), count(stats.unwound) ? 'neg' : 'dim'],
+    ['被拒', String(count(stats.rejected)), count(stats.rejected) ? 'neg' : 'dim'],
+    ['连续失败', `${count(stats.failures)}/${Number(data.max_failures) || 2}`, count(stats.failures) ? 'neg' : 'dim'],
+  ].map(([label, value, tone]) => `<div class="stat"><span>${label}</span><b class="${tone}">${esc(value)}</b></div>`).join('');
+  const symbols = Array.isArray(stats.symbols) ? stats.symbols : [];
+  const days = Array.isArray(stats.days) ? stats.days : [];
+  const symbolLine = symbols.length
+    ? symbols.map((row) => `${row.symbol} ${count(row.opened)} 笔${count(row.open) ? `（持有 ${count(row.open)}）` : ''}`).join(' · ')
+    : '还没有自动开仓记录';
+  const dayLine = days.map((row) => `${row.day} ${count(row.opened)}`).join(' · ');
   return `
     <div class="row-head">
       <h3>自动交易（全部组）</h3> ${badge}
@@ -3066,6 +3082,9 @@ function rhAutoHtml(a, cfg) {
       <span class="small muted">${esc(data.status || '')}</span>
     </div>
     ${data.disabled_reason && !on ? `<div class="notice error">上次自动关闭的原因：${esc(data.disabled_reason)}</div>` : ''}
+    <div class="stats rh-auto-stats">${statCards}</div>
+    <p class="small muted">按合约（最近 ${count(stats.recorded)} 笔记录）：${esc(symbolLine)}</p>
+    ${dayLine ? `<p class="small muted">近 7 日开仓（UTC）：${esc(dayLine)}</p>` : ''}
     <p class="small muted">所有你配了 API 的交易所两两组成的组都参与（实盘：两家都已连接）。任何一组的信号「回到正常净收益」达到门槛、且开仓可成交价差与收敛到 0 净收益都为正、连续保持够久后，按下面的参数自动下一笔价差单。每一笔都走和手动下单同一套检查：对账干净、按你的金额现拉盘口重算、单笔上限${maxSize ? `（${esc(String(maxSize))} USDT）` : ''}、持仓数上限、当日亏损、Telegram /pause 与熔断。同一合约已有仓位不再开；每次尝试后该合约冷却 10 分钟；执行中断（结果未知）或连续 ${data.max_failures} 次回滚会自动关闭。</p>
     <div class="rh-auto-grid">
       <label class="field"><span>账户</span><select data-rh-auto="mode">

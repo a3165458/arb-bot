@@ -167,6 +167,17 @@ pub struct Opened {
     pub at: DateTime<Utc>,
 }
 
+/// 写在 `auto.json` 里的累计计数。旧文件没有这块时从 0 开始，不回填。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Tally {
+    #[serde(default)]
+    opened: u64,
+    #[serde(default)]
+    unwound: u64,
+    #[serde(default)]
+    rejected: u64,
+}
+
 /// 写在 `auto.json` 里的全部状态。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Persisted {
@@ -180,6 +191,9 @@ struct Persisted {
     /// 最近一次被自动关闭的原因。
     #[serde(default)]
     disabled_reason: Option<String>,
+    /// 开仓 / 回滚 / 被拒的累计次数。重启不丢。
+    #[serde(default)]
+    tally: Tally,
 }
 
 /// 一条事件（页面上的「最近动作」）。
@@ -555,6 +569,14 @@ impl AutoTrader {
             "open_positions": open_auto,
             "cooldown": cooldown,
             "events": inner.events,
+            "stats": board_stats(
+                &inner.persisted.opened,
+                exposed.unwrap_or(&[]),
+                mode,
+                &inner.persisted.tally,
+                inner.persisted.failures,
+                today,
+            ),
         })
     }
 
@@ -760,6 +782,7 @@ impl AutoTrader {
         match outcome {
             Outcome::Opened(id) => {
                 inner.persisted.failures = 0;
+                inner.persisted.tally.opened += 1;
                 inner.persisted.opened.push(Opened {
                     id: id.clone(),
                     symbol: symbol.clone(),
@@ -790,6 +813,7 @@ impl AutoTrader {
             }
             Outcome::Unwound(id) => {
                 inner.persisted.failures += 1;
+                inner.persisted.tally.unwound += 1;
                 let failures = inner.persisted.failures;
                 inner.last_open = Some(now);
                 inner
@@ -812,6 +836,7 @@ impl AutoTrader {
                 }
             }
             Outcome::Rejected => {
+                inner.persisted.tally.rejected += 1;
                 inner
                     .cooldown
                     .insert(candidate.base.clone(), now + SYMBOL_COOLDOWN);
@@ -824,6 +849,7 @@ impl AutoTrader {
                     format!("下单前检查没通过（冷却 10 分钟）：{reason}"),
                 );
                 inner.status = format!("{} 没通过下单前检查", candidate.base);
+                self.save(&inner.persisted);
             }
             Outcome::Busy => {
                 inner.retry_at = Some(now + BUSY_RETRY);
@@ -853,6 +879,58 @@ impl AutoTrader {
             }
         }
     }
+}
+
+/// 自动交易统计看板。
+///
+/// 累计开仓 / 回滚 / 被拒来自 `tally`，写在 `auto.json` 里，重启不丢，旧文件从 0 起算。
+/// 近 7 个 UTC 日和按合约的笔数来自还留着的开仓记录（最多 [`OPENED_KEEP`] 笔）。
+/// `exposed` 是当前台账里仍敞着的仓位 `(id, symbol)`，用来数「仍持有」。
+fn board_stats(
+    opened: &[Opened],
+    exposed: &[(String, String)],
+    mode: Mode,
+    tally: &Tally,
+    failures: u32,
+    today: chrono::NaiveDate,
+) -> Value {
+    let mine: Vec<&Opened> = opened.iter().filter(|row| row.mode == mode).collect();
+    let open_ids: std::collections::HashSet<&str> =
+        exposed.iter().map(|(id, _)| id.as_str()).collect();
+    let mut by_symbol: HashMap<String, (u64, u64)> = HashMap::new();
+    for row in &mine {
+        let entry = by_symbol.entry(row.symbol.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        if open_ids.contains(row.id.as_str()) {
+            entry.1 += 1;
+        }
+    }
+    let mut symbols: Vec<_> = by_symbol.into_iter().collect();
+    symbols.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+    let symbols: Vec<Value> = symbols
+        .into_iter()
+        .take(8)
+        .map(|(symbol, (count, open))| json!({"symbol": symbol, "opened": count, "open": open}))
+        .collect();
+    let days: Vec<Value> = (0..7)
+        .rev()
+        .map(|ago| {
+            let day = today - chrono::Duration::days(ago);
+            let count = mine.iter().filter(|row| row.at.date_naive() == day).count();
+            json!({"day": day.format("%m-%d").to_string(), "opened": count})
+        })
+        .collect();
+    json!({
+        "opened": tally.opened,
+        "unwound": tally.unwound,
+        "rejected": tally.rejected,
+        "failures": failures,
+        "recorded": mine.len(),
+        "opened_today": mine.iter().filter(|row| row.at.date_naive() == today).count(),
+        "open_now": mine.iter().filter(|row| open_ids.contains(row.id.as_str())).count(),
+        "symbols": symbols,
+        "days": days,
+    })
 }
 
 /// 设置的一句话描述（事件与通知用）。
@@ -1286,6 +1364,58 @@ mod tests {
             assert_eq!(snapshot["settings"]["enabled"], json!(false));
             assert_eq!(snapshot["disabled_reason"], json!("测试"));
         });
+    }
+
+    #[test]
+    fn stats_board_counts_today_open_positions_and_keeps_lifetime_tallies() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let at = |day: u32, hour: u32| {
+            chrono::NaiveDate::from_ymd_opt(2026, 10, day)
+                .unwrap()
+                .and_hms_opt(hour, 0, 0)
+                .unwrap()
+                .and_utc()
+        };
+        let row = |id: &str, symbol: &str, day: u32, mode: Mode| Opened {
+            id: id.into(),
+            symbol: symbol.into(),
+            mode,
+            at: at(day, 1),
+        };
+        let opened = vec![
+            row("a", "NVDA/USDT", 18, Mode::Paper),
+            row("b", "NVDA/USDT", 18, Mode::Paper),
+            row("c", "SPY/USDT", 17, Mode::Paper),
+            row("live", "NVDA/USDT", 18, Mode::Live),
+        ];
+        let stats = board_stats(
+            &opened,
+            &[("a".into(), "NVDA/USDT".into())],
+            Mode::Paper,
+            &Tally {
+                opened: 9,
+                unwound: 2,
+                rejected: 4,
+            },
+            1,
+            today,
+        );
+        assert_eq!(stats["opened"], json!(9));
+        assert_eq!(stats["unwound"], json!(2));
+        assert_eq!(stats["rejected"], json!(4));
+        assert_eq!(stats["failures"], json!(1));
+        assert_eq!(stats["recorded"], json!(3));
+        assert_eq!(stats["opened_today"], json!(2));
+        assert_eq!(stats["open_now"], json!(1));
+        assert_eq!(stats["symbols"][0]["symbol"], json!("NVDA/USDT"));
+        assert_eq!(stats["symbols"][0]["opened"], json!(2));
+        assert_eq!(stats["symbols"][0]["open"], json!(1));
+        assert_eq!(stats["symbols"][1]["symbol"], json!("SPY/USDT"));
+        assert_eq!(stats["days"].as_array().unwrap().len(), 7);
+        assert_eq!(stats["days"][6]["day"], json!("10-18"));
+        assert_eq!(stats["days"][6]["opened"], json!(2));
+        assert_eq!(stats["days"][5]["opened"], json!(1));
+        // 同一天的实盘 NVDA 不进纸面计数（上面 NVDA 是 2，不是 3）。
     }
 
     #[test]

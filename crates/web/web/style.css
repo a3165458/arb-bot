@@ -432,6 +432,7 @@ footer p { margin: 0 0 6px; max-width: 980px; }
 
 /* RH 价差自动交易 */
 .rh-auto { margin: 12px 0; }
+.rh-auto-stats { margin: 10px 0; }
 .rh-auto h3 { margin: 0; }
 .rh-auto .row-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .rh-auto-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin: 10px 0; }
