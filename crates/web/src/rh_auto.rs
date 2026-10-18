@@ -165,9 +165,12 @@ pub struct Opened {
     pub symbol: String,
     pub mode: Mode,
     pub at: DateTime<Utc>,
+    /// 开仓当时的单腿名义（USDT）。旧记录没有这个字段，金额按 0。
+    #[serde(default)]
+    pub size_usdt: Decimal,
 }
 
-/// 写在 `auto.json` 里的累计计数。旧文件没有这块时从 0 开始，不回填。
+/// 写在 `auto.json` 里的累计计数和名义。旧文件没有这块时从 0 开始，不回填。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Tally {
     #[serde(default)]
@@ -176,6 +179,12 @@ struct Tally {
     unwound: u64,
     #[serde(default)]
     rejected: u64,
+    /// 成功开仓的单腿名义合计。记录被裁掉以后这个数还在。
+    #[serde(default)]
+    opened_usdt: Decimal,
+    /// 以回滚收场的尝试，按当时的单腿名义合计。
+    #[serde(default)]
+    unwound_usdt: Decimal,
 }
 
 /// 写在 `auto.json` 里的全部状态。
@@ -783,11 +792,14 @@ impl AutoTrader {
             Outcome::Opened(id) => {
                 inner.persisted.failures = 0;
                 inner.persisted.tally.opened += 1;
+                inner.persisted.tally.opened_usdt =
+                    add_usdt(inner.persisted.tally.opened_usdt, settings.size_usdt);
                 inner.persisted.opened.push(Opened {
                     id: id.clone(),
                     symbol: symbol.clone(),
                     mode: settings.mode,
                     at: Utc::now(),
+                    size_usdt: settings.size_usdt,
                 });
                 let excess = inner.persisted.opened.len().saturating_sub(OPENED_KEEP);
                 inner.persisted.opened.drain(..excess);
@@ -814,6 +826,8 @@ impl AutoTrader {
             Outcome::Unwound(id) => {
                 inner.persisted.failures += 1;
                 inner.persisted.tally.unwound += 1;
+                inner.persisted.tally.unwound_usdt =
+                    add_usdt(inner.persisted.tally.unwound_usdt, settings.size_usdt);
                 let failures = inner.persisted.failures;
                 inner.last_open = Some(now);
                 inner
@@ -881,11 +895,16 @@ impl AutoTrader {
     }
 }
 
+/// 单腿名义相加。溢出时保留已有合计，不把看板算崩。
+fn add_usdt(total: Decimal, part: Decimal) -> Decimal {
+    total.checked_add(part).unwrap_or(total)
+}
+
 /// 自动交易统计看板。
 ///
-/// 累计开仓 / 回滚 / 被拒来自 `tally`，写在 `auto.json` 里，重启不丢，旧文件从 0 起算。
-/// 近 7 个 UTC 日和按合约的笔数来自还留着的开仓记录（最多 [`OPENED_KEEP`] 笔）。
-/// `exposed` 是当前台账里仍敞着的仓位 `(id, symbol)`，用来数「仍持有」。
+/// 累计开仓 / 回滚 / 被拒，以及对应的单腿名义，来自 `tally`，写在 `auto.json` 里，重启不丢，
+/// 旧文件从 0 起算。近 7 个 UTC 日和按合约的笔数、名义来自还留着的开仓记录（最多 [`OPENED_KEEP`] 笔）。
+/// `exposed` 是当前台账里仍敞着的仓位 `(id, symbol)`，用来数「仍持有」和持有名义。
 fn board_stats(
     opened: &[Opened],
     exposed: &[(String, String)],
@@ -894,40 +913,73 @@ fn board_stats(
     failures: u32,
     today: chrono::NaiveDate,
 ) -> Value {
+    #[derive(Default)]
+    struct Bucket {
+        opened: u64,
+        open: u64,
+        usdt: Decimal,
+        open_usdt: Decimal,
+    }
     let mine: Vec<&Opened> = opened.iter().filter(|row| row.mode == mode).collect();
     let open_ids: std::collections::HashSet<&str> =
         exposed.iter().map(|(id, _)| id.as_str()).collect();
-    let mut by_symbol: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut by_symbol: HashMap<String, Bucket> = HashMap::new();
     for row in &mine {
-        let entry = by_symbol.entry(row.symbol.clone()).or_insert((0, 0));
-        entry.0 += 1;
+        let entry = by_symbol.entry(row.symbol.clone()).or_default();
+        entry.opened += 1;
+        entry.usdt = add_usdt(entry.usdt, row.size_usdt);
         if open_ids.contains(row.id.as_str()) {
-            entry.1 += 1;
+            entry.open += 1;
+            entry.open_usdt = add_usdt(entry.open_usdt, row.size_usdt);
         }
     }
     let mut symbols: Vec<_> = by_symbol.into_iter().collect();
-    symbols.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+    symbols.sort_by(|a, b| b.1.opened.cmp(&a.1.opened).then_with(|| a.0.cmp(&b.0)));
     let symbols: Vec<Value> = symbols
         .into_iter()
         .take(8)
-        .map(|(symbol, (count, open))| json!({"symbol": symbol, "opened": count, "open": open}))
+        .map(|(symbol, bucket)| {
+            json!({
+                "symbol": symbol,
+                "opened": bucket.opened,
+                "open": bucket.open,
+                "usdt": bucket.usdt,
+                "open_usdt": bucket.open_usdt,
+            })
+        })
         .collect();
     let days: Vec<Value> = (0..7)
         .rev()
         .map(|ago| {
             let day = today - chrono::Duration::days(ago);
-            let count = mine.iter().filter(|row| row.at.date_naive() == day).count();
-            json!({"day": day.format("%m-%d").to_string(), "opened": count})
+            let rows = mine.iter().filter(|row| row.at.date_naive() == day);
+            let (count, usdt) = rows.fold((0u64, Decimal::ZERO), |(count, usdt), row| {
+                (count + 1, add_usdt(usdt, row.size_usdt))
+            });
+            json!({"day": day.format("%m-%d").to_string(), "opened": count, "usdt": usdt})
         })
         .collect();
+    let today_rows = mine.iter().filter(|row| row.at.date_naive() == today);
+    let (opened_today, opened_today_usdt) = today_rows
+        .fold((0u64, Decimal::ZERO), |(count, usdt), row| {
+            (count + 1, add_usdt(usdt, row.size_usdt))
+        });
+    let open_rows = mine.iter().filter(|row| open_ids.contains(row.id.as_str()));
+    let (open_now, open_now_usdt) = open_rows.fold((0u64, Decimal::ZERO), |(count, usdt), row| {
+        (count + 1, add_usdt(usdt, row.size_usdt))
+    });
     json!({
         "opened": tally.opened,
         "unwound": tally.unwound,
         "rejected": tally.rejected,
         "failures": failures,
         "recorded": mine.len(),
-        "opened_today": mine.iter().filter(|row| row.at.date_naive() == today).count(),
-        "open_now": mine.iter().filter(|row| open_ids.contains(row.id.as_str())).count(),
+        "opened_today": opened_today,
+        "open_now": open_now,
+        "opened_usdt": tally.opened_usdt,
+        "unwound_usdt": tally.unwound_usdt,
+        "opened_today_usdt": opened_today_usdt,
+        "open_now_usdt": open_now_usdt,
         "symbols": symbols,
         "days": days,
     })
@@ -1376,17 +1428,18 @@ mod tests {
                 .unwrap()
                 .and_utc()
         };
-        let row = |id: &str, symbol: &str, day: u32, mode: Mode| Opened {
+        let row = |id: &str, symbol: &str, day: u32, mode: Mode, size: i64| Opened {
             id: id.into(),
             symbol: symbol.into(),
             mode,
             at: at(day, 1),
+            size_usdt: Decimal::from(size),
         };
         let opened = vec![
-            row("a", "NVDA/USDT", 18, Mode::Paper),
-            row("b", "NVDA/USDT", 18, Mode::Paper),
-            row("c", "SPY/USDT", 17, Mode::Paper),
-            row("live", "NVDA/USDT", 18, Mode::Live),
+            row("a", "NVDA/USDT", 18, Mode::Paper, 500),
+            row("b", "NVDA/USDT", 18, Mode::Paper, 800),
+            row("c", "SPY/USDT", 17, Mode::Paper, 200),
+            row("live", "NVDA/USDT", 18, Mode::Live, 9_999),
         ];
         let stats = board_stats(
             &opened,
@@ -1396,10 +1449,13 @@ mod tests {
                 opened: 9,
                 unwound: 2,
                 rejected: 4,
+                opened_usdt: Decimal::from(4500),
+                unwound_usdt: Decimal::from(1000),
             },
             1,
             today,
         );
+        let amount = |value: &Value| value.as_str().unwrap().parse::<Decimal>().unwrap();
         assert_eq!(stats["opened"], json!(9));
         assert_eq!(stats["unwound"], json!(2));
         assert_eq!(stats["rejected"], json!(4));
@@ -1407,15 +1463,37 @@ mod tests {
         assert_eq!(stats["recorded"], json!(3));
         assert_eq!(stats["opened_today"], json!(2));
         assert_eq!(stats["open_now"], json!(1));
+        // 累计名义来自 tally，不从还留着的记录重算（记录会被裁到 300 笔）。
+        assert_eq!(amount(&stats["opened_usdt"]), Decimal::from(4500));
+        assert_eq!(amount(&stats["unwound_usdt"]), Decimal::from(1000));
+        assert_eq!(amount(&stats["opened_today_usdt"]), Decimal::from(1300));
+        assert_eq!(amount(&stats["open_now_usdt"]), Decimal::from(500));
         assert_eq!(stats["symbols"][0]["symbol"], json!("NVDA/USDT"));
         assert_eq!(stats["symbols"][0]["opened"], json!(2));
         assert_eq!(stats["symbols"][0]["open"], json!(1));
+        assert_eq!(amount(&stats["symbols"][0]["usdt"]), Decimal::from(1300));
+        assert_eq!(
+            amount(&stats["symbols"][0]["open_usdt"]),
+            Decimal::from(500)
+        );
         assert_eq!(stats["symbols"][1]["symbol"], json!("SPY/USDT"));
+        assert_eq!(amount(&stats["symbols"][1]["usdt"]), Decimal::from(200));
         assert_eq!(stats["days"].as_array().unwrap().len(), 7);
         assert_eq!(stats["days"][6]["day"], json!("10-18"));
         assert_eq!(stats["days"][6]["opened"], json!(2));
+        assert_eq!(amount(&stats["days"][6]["usdt"]), Decimal::from(1300));
         assert_eq!(stats["days"][5]["opened"], json!(1));
-        // 同一天的实盘 NVDA 不进纸面计数（上面 NVDA 是 2，不是 3）。
+        assert_eq!(amount(&stats["days"][5]["usdt"]), Decimal::from(200));
+        // 同一天的实盘 NVDA（9,999）不进纸面计数，也不进纸面金额。
+        let legacy: Opened = serde_json::from_str(
+            r#"{"id":"old","symbol":"NVDA/USDT","mode":"paper","at":"2026-10-18T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.size_usdt, Decimal::ZERO);
+        let legacy_tally: Tally =
+            serde_json::from_str(r#"{"opened":1,"unwound":0,"rejected":0}"#).unwrap();
+        assert_eq!(legacy_tally.opened_usdt, Decimal::ZERO);
+        assert_eq!(legacy_tally.unwound_usdt, Decimal::ZERO);
     }
 
     #[test]

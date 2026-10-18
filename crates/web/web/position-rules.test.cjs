@@ -381,17 +381,22 @@ test('RH auto-trading panel round-trips settings, needs a token, and makes live 
   const cfg = { auth_configured: true };
   const a = { data: { settings, status: '监控中', max_failures: 2, events: [], open_positions: [], cooldown: [], paper_watch_sec: 0, live_can_trade: true, monitor_size_usdt: '2000' }, form, dirty: false };
   const html = app.rhAutoHtml(a, cfg);
-  for (const part of ['已关闭', '开启纸面自动交易', '纸面规则没有在看板后台运行', '监控中', '累计开仓', '今日开仓', '还没有自动开仓记录']) assert.ok(html.includes(part), part);
+  for (const part of ['已关闭', '开启纸面自动交易', '纸面规则没有在看板后台运行', '监控中', '累计开仓', '今日开仓', '还没有自动开仓记录', '0 USDT']) assert.ok(html.includes(part), part);
   a.data.stats = {
     opened: 9, unwound: 2, rejected: 4, failures: 1, recorded: 3,
     opened_today: 2, open_now: 1,
-    symbols: [{ symbol: 'NVDA/USDT', opened: 2, open: 1 }],
-    days: [{ day: '10-18', opened: 2 }],
+    opened_usdt: '4500', unwound_usdt: '1000', opened_today_usdt: '1300', open_now_usdt: '500',
+    symbols: [{ symbol: 'NVDA/USDT', opened: 2, open: 1, usdt: '1300', open_usdt: '500' }],
+    days: [{ day: '10-18', opened: 2, usdt: '1300' }],
   };
   const withStats = app.rhAutoHtml(a, cfg);
   assert.ok(withStats.includes('>9<'), withStats);
-  assert.match(withStats, /NVDA\/USDT 2 笔（持有 1）/);
-  assert.match(withStats, /近 7 日开仓（UTC）：10-18 2/);
+  assert.match(withStats, />4,500 USDT</);
+  assert.match(withStats, />1,300 USDT</);
+  assert.match(withStats, />500 USDT</);
+  assert.match(withStats, />1,000 USDT</);
+  assert.match(withStats, /NVDA\/USDT 2 笔 · 1,300 USDT（持有 1 · 500 USDT）/);
+  assert.match(withStats, /近 7 日开仓（UTC）：10-18 2 笔 · 1,300 USDT/);
   assert.match(withStats, /连续失败/);
   assert.match(withStats, />1\/2</);
   const noExit = app.rhAutoHtml({ ...a, form: { ...form, back_to_normal: false } }, cfg);
