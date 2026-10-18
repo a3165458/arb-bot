@@ -1176,9 +1176,37 @@ impl Broker for HyperliquidBroker {
         Ok(None)
     }
 
-    /// 本 dex 的账户价值减去已占用保证金（`clearinghouseState`）。HL 的 `withdrawable` 是能提走
-    /// 的钱，和「能拿来开新仓」不是一回事，所以不用它。各 dex 的余额互相独立。
+    /// 能拿来开新仓的 USDC。
+    ///
+    /// 标准账户（`disabled` / `default` / `dexAbstraction`）看本 dex 的
+    /// `clearinghouseState.marginSummary`：`accountValue − totalMarginUsed`。
+    /// `withdrawable` 是能提走的钱，和开新仓不是一回事，不用它。各 dex 的余额互相独立，
+    /// 现货里的 USDC 也不能拿来当永续保证金。
+    ///
+    /// 统一账户与组合保证金则相反：官方说明这两种模式的余额与占用都在
+    /// `spotClearinghouseState`，各 dex 的永续账户状态没有意义（经常整段是 0）。
+    /// 这时可用保证金是 USDC 的 `total − hold`（`hold` 已含挂单和已占用保证金）。
+    /// 主 dex 与 HIP-3 的 `xyz` / `io` 共用这一份 USDC，不再去读那个为 0 的永续账本。
+    /// 模式读不到就报错，不把「永续账本是 0」当成没钱。
+    ///
+    /// <https://hyperliquid.gitbook.io/hyperliquid-docs/trading/account-abstraction-modes>
+    /// <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot>
     async fn free_collateral(&self) -> ArbResult<Option<Decimal>> {
+        let mode: String = post(
+            &self.client,
+            INFO_URL,
+            &json!({"type":"userAbstraction", "user":self.account}),
+        )
+        .await?;
+        if abstraction_shares_spot(&mode) {
+            let spot: Value = post(
+                &self.client,
+                INFO_URL,
+                &json!({"type":"spotClearinghouseState", "user":self.account}),
+            )
+            .await?;
+            return unified_usdc_free(&spot).map(Some);
+        }
         let state: Value = post(
             &self.client,
             INFO_URL,
@@ -1188,16 +1216,7 @@ impl Broker for HyperliquidBroker {
             }),
         )
         .await?;
-        let summary = state.get("marginSummary");
-        let number = |key: &str| {
-            summary
-                .and_then(|summary| summary.get(key))
-                .and_then(Value::as_str)
-                .and_then(|raw| Decimal::from_str(raw).ok())
-        };
-        Ok(number("accountValue")
-            .zip(number("totalMarginUsed"))
-            .map(|(value, used)| (value - used).max(Decimal::ZERO)))
+        Ok(perp_free_collateral(&state))
     }
 
     fn supports_add_margin(&self) -> bool {
@@ -1405,6 +1424,52 @@ impl Journal {
 
 fn error(message: impl Into<String>) -> ArbError {
     ArbError::venue("hyperliquid", message)
+}
+
+/// 统一账户与组合保证金的抵押在现货清算所，不在各 dex 的永续账本。
+fn abstraction_shares_spot(mode: &str) -> bool {
+    matches!(mode, "unifiedAccount" | "portfolioMargin")
+}
+
+/// 标准账户：本 dex 永续账本里还能开新仓的 USDC。缺字段是「不知道」，不是 0。
+fn perp_free_collateral(state: &Value) -> Option<Decimal> {
+    let summary = state.get("marginSummary");
+    let number = |key: &str| {
+        summary
+            .and_then(|summary| summary.get(key))
+            .and_then(Value::as_str)
+            .and_then(|raw| Decimal::from_str(raw).ok())
+    };
+    number("accountValue")
+        .zip(number("totalMarginUsed"))
+        .map(|(value, used)| (value - used).max(Decimal::ZERO))
+}
+
+/// 统一账户 / 组合保证金：USDC 的 `total − hold`。
+///
+/// 没有 USDC 这一行就是 0（账户里没有这种抵押）。缺 `balances`、或有 USDC 但数字读不懂，
+/// 是响应坏了，报错，不当成 0。`hold` 大于 `total` 时按 0，不报负的可用保证金。
+fn unified_usdc_free(spot: &Value) -> ArbResult<Decimal> {
+    let balances = spot
+        .get("balances")
+        .and_then(Value::as_array)
+        .ok_or_else(|| error("missing spot balances"))?;
+    let Some(usdc) = balances.iter().find(|row| is_usdc(row)) else {
+        return Ok(Decimal::ZERO);
+    };
+    let total = decimal_field(usdc, "total")?;
+    let hold = decimal_field(usdc, "hold")?;
+    Ok(total
+        .checked_sub(hold)
+        .unwrap_or(Decimal::ZERO)
+        .max(Decimal::ZERO))
+}
+
+fn is_usdc(row: &Value) -> bool {
+    match row.get("coin").and_then(Value::as_str) {
+        Some(coin) => coin == "USDC",
+        None => row.get("token").and_then(Value::as_u64) == Some(0),
+    }
 }
 
 fn leg_state_from_position(position: &Value) -> VenueLegState {
@@ -2580,6 +2645,66 @@ mod tests {
         assert!(margin_ntli(dec!(0.0000001)).is_err());
         assert!(margin_ntli(dec!(1.2345678)).is_err());
         assert!(margin_ntli(Decimal::MAX).is_err());
+    }
+
+    #[test]
+    fn unified_account_collateral_comes_from_spot_usdc_not_a_zero_perp_ledger() {
+        // 统一账户 + 逐仓：永续账本整段是 0，钱在现货 USDC。这是图里那种「保证金被识别为 0」。
+        let perp = json!({
+            "marginSummary": {"accountValue":"0.0","totalMarginUsed":"0.0"},
+            "crossMarginSummary": {"accountValue":"0.0","totalMarginUsed":"0.0"},
+            "withdrawable": "0.0",
+            "assetPositions": []
+        });
+        assert_eq!(perp_free_collateral(&perp), Some(Decimal::ZERO));
+        let spot = json!({"balances":[
+            {"coin":"USDC","token":0,"hold":"0.0","total":"131.088941","entryNtl":"0.0"},
+            {"coin":"HYPE","token":150,"hold":"1","total":"2","entryNtl":"0"}
+        ]});
+        assert_eq!(unified_usdc_free(&spot).unwrap(), dec!(131.088941));
+        // hold 是已经占用的保证金和挂单，不能再拿去开仓。
+        let held = json!({"balances":[
+            {"coin":"USDC","token":0,"hold":"10.5","total":"131.088941","entryNtl":"0.0"}
+        ]});
+        assert_eq!(unified_usdc_free(&held).unwrap(), dec!(120.588941));
+        // 占用比余额大：没有负的可用保证金。
+        let over = json!({"balances":[{"coin":"USDC","token":0,"hold":"2","total":"1"}]});
+        assert_eq!(unified_usdc_free(&over).unwrap(), Decimal::ZERO);
+        // 没有 USDC 行 = 没有这种抵押。别的币不算进来。
+        assert_eq!(
+            unified_usdc_free(
+                &json!({"balances":[{"coin":"PURR","token":1,"hold":"0","total":"2000"}]})
+            )
+            .unwrap(),
+            Decimal::ZERO
+        );
+        // 坏响应不当成 0。
+        assert!(unified_usdc_free(&json!({})).is_err());
+        assert!(unified_usdc_free(&json!({"balances":[{"coin":"USDC","total":"1"}]})).is_err());
+        // 只写了 token 0、没写币名时仍认作 USDC；写了别的币名即使 token 是 0 也不认。
+        assert_eq!(
+            unified_usdc_free(&json!({"balances":[{"token":0,"hold":"0","total":"4"}]})).unwrap(),
+            dec!(4)
+        );
+        assert_eq!(
+            unified_usdc_free(
+                &json!({"balances":[{"coin":"USDT","token":0,"hold":"0","total":"9"}]})
+            )
+            .unwrap(),
+            Decimal::ZERO
+        );
+
+        assert!(abstraction_shares_spot("unifiedAccount"));
+        assert!(abstraction_shares_spot("portfolioMargin"));
+        for mode in ["disabled", "default", "dexAbstraction", ""] {
+            assert!(!abstraction_shares_spot(mode), "{mode}");
+        }
+        // 标准账户仍只用永续账本，现货 USDC 不掺进来。
+        let funded = json!({
+            "marginSummary": {"accountValue":"100.5","totalMarginUsed":"40"}
+        });
+        assert_eq!(perp_free_collateral(&funded), Some(dec!(60.5)));
+        assert_eq!(perp_free_collateral(&json!({})), None);
     }
 
     #[test]
