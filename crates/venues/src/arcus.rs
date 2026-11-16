@@ -152,6 +152,68 @@ pub struct ArcusMarket {
     pub off_hours_initial_margin_fraction: Option<String>,
     #[serde(default)]
     pub is_outside_rth: Option<bool>,
+    /// 成交价限制带（见 [`TradingBounds`]）。没报或为 null 时当不知道。
+    #[serde(default)]
+    pub upper_trading_bound: Option<String>,
+    #[serde(default)]
+    pub lower_trading_bound: Option<String>,
+}
+
+/// 成交价限制带：`/v1/markets` 的 `lowerTradingBound` ～ `upperTradingBound`。
+///
+/// 2026-10-17 实测：股票永续在盘后与周末（`isOutsideRth == true`）只能在结算价
+/// `currentSettlementPrice` ±5%（NBIS ±10%）之内成交；会成交在带外的单子整张被拒，
+/// `FILL_WILL_EXCEED_TRADING_BOUND`。带外的挂单照样留在盘口上：别家继续跌、Arcus 被钉在下限时，
+/// 这些成交不了的买单看起来比别家贵 1% 以上（MU、某合约 两次开仓第二腿被拒、回滚）。
+/// 所以盘口要先剔掉带外的档位再用，下单限价也收进带内。
+///
+/// **带边也成交不了**（2026-11-04）：被钉住时挂单就堆在带边价上（某合约 卖单在上限 45.69，Lighter 已 46.06），
+/// 按带边价下的单子照样被拒 `FILL_WILL_EXCEED_TRADING_BOUND`（某合约、某合约 卖在下限，某合约 两次买在上限，
+/// 四次都是第一腿成交、第二腿被拒、回滚）。价格带放宽后 Arcus 马上跳过去（某合约 46.8），那段价差本来就吃不到。
+/// 所以离带边 [`TRADING_BOUND_EDGE`] 以内的档位一律当带外，限价也只收到这个余量以内。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TradingBounds {
+    pub lower: Decimal,
+    pub upper: Decimal,
+}
+
+/// 带边余量（比例）：离上下限这么近的价格当成交不了。股票盘后带约 ±5%、指数约 ±1%，0.1% 不碍正常成交。
+pub const TRADING_BOUND_EDGE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
+
+/// Arcus 拒单原因：这一单会成交在价格带外（含带边）。同价重试、追更差的价都只会被收回带边、再被拒。
+pub const BOUND_REJECT: &str = "FILL_WILL_EXCEED_TRADING_BOUND";
+
+impl TradingBounds {
+    /// 真正能成交的区间：上下限各往里收 [`TRADING_BOUND_EDGE`]。带太窄收没了时上界小于下界，什么都不含。
+    fn tradable(&self) -> (Decimal, Decimal) {
+        (
+            self.lower * (Decimal::ONE + TRADING_BOUND_EDGE),
+            self.upper * (Decimal::ONE - TRADING_BOUND_EDGE),
+        )
+    }
+
+    /// 这个价格能不能成交：在带内，且离带边超过 [`TRADING_BOUND_EDGE`]。
+    pub fn contains(&self, price: Decimal) -> bool {
+        let (lower, upper) = self.tradable();
+        lower <= price && price <= upper
+    }
+
+    /// 剔掉带外的档位（两侧都可能被剔空）。
+    pub fn clip(&self, mut book: OrderBook) -> OrderBook {
+        book.bids.retain(|level| self.contains(level.price));
+        book.asks.retain(|level| self.contains(level.price));
+        book
+    }
+
+    /// 把限价收进能成交的区间（见 [`Self::contains`]）：卖不低于下限往里收的价、买不高于上限往里收的价。
+    /// 只会让单子更保守，带外与带边那部分本来也成交不了。
+    pub fn clamp(&self, side: arb_core::Side, price: Decimal) -> Decimal {
+        let (lower, upper) = self.tradable();
+        match side {
+            arb_core::Side::Sell => price.max(lower),
+            arb_core::Side::Buy => price.min(upper),
+        }
+    }
 }
 
 /// 价格分段的 tick：`up_to_price` 以下（不含）用 `tick`，最后一段没有上限。
@@ -213,6 +275,20 @@ impl ArcusMarket {
     pub fn oracle(&self) -> Option<Decimal> {
         positive(&self.oracle_price)
     }
+
+    /// 成交价限制带。缺一边、非正或上下颠倒都当不知道（不据此挡单）。
+    pub fn trading_bounds(&self) -> Option<TradingBounds> {
+        trading_bounds(
+            self.lower_trading_bound.as_deref(),
+            self.upper_trading_bound.as_deref(),
+        )
+    }
+}
+
+/// 两个原样字符串 → [`TradingBounds`]。价差监控直接读 `/v1/markets` 的 JSON，也用这个。
+pub fn trading_bounds(lower: Option<&str>, upper: Option<&str>) -> Option<TradingBounds> {
+    let (lower, upper) = (positive(lower?)?, positive(upper?)?);
+    (lower < upper).then_some(TradingBounds { lower, upper })
 }
 
 /// `baseAsset` → 本仓库的 [`Symbol`]。
@@ -350,7 +426,11 @@ impl VenueApi for ArcusApi {
             VENUE,
         )
         .await?;
-        depth_book(depth, symbol)
+        let book = depth_book(depth, symbol)?;
+        Ok(match market.trading_bounds() {
+            Some(bounds) => bounds.clip(book),
+            None => book,
+        })
     }
 
     fn supports_funding_history(&self) -> bool {
@@ -704,5 +784,129 @@ mod tests {
         let empty: DepthSnapshot =
             serde_json::from_str(r#"{"bids":[],"asks":[["100","1"]]}"#).unwrap();
         assert!(depth_book(empty, &arcus_symbol("BTC")).is_err());
+    }
+
+    fn amd_with_bounds(lower: Value, upper: Value) -> ArcusMarket {
+        let mut row = serde_json::from_str::<Value>(MARKETS_FIXTURE).unwrap()["markets"][2].clone();
+        row["lowerTradingBound"] = lower;
+        row["upperTradingBound"] = upper;
+        serde_json::from_value(row).unwrap()
+    }
+
+    #[test]
+    fn trading_bounds_come_from_the_market_row_and_unknown_is_none() {
+        // 2026-10-17 实测 AMD：结算价 527.29，带 500.93 ～ 553.65（±5%）。
+        let amd = amd_with_bounds("500.93".into(), "553.65".into());
+        assert_eq!(
+            amd.trading_bounds(),
+            Some(TradingBounds {
+                lower: Decimal::new(50093, 2),
+                upper: Decimal::new(55365, 2),
+            })
+        );
+        // 没报、null、"0"、上下颠倒：都当不知道，不据此挡单。
+        assert_eq!(market("AMD").trading_bounds(), None);
+        assert_eq!(
+            amd_with_bounds(Value::Null, "553.65".into()).trading_bounds(),
+            None
+        );
+        assert_eq!(
+            amd_with_bounds("0".into(), "553.65".into()).trading_bounds(),
+            None
+        );
+        assert_eq!(
+            amd_with_bounds("553.65".into(), "500.93".into()).trading_bounds(),
+            None
+        );
+    }
+
+    fn level(price: i64, scale: u32) -> Level {
+        Level {
+            price: Decimal::new(price, scale),
+            notional_usdt: Decimal::new(price, scale),
+        }
+    }
+
+    #[test]
+    fn a_book_pinned_below_the_lower_bound_has_no_bids_left_to_sell_into() {
+        // 2026-10-17 21:31 UTC MU：Lighter 跌到 819，Arcus 被钉在下限 831.38，买单挂在 829～831，
+        // 看起来比 Lighter 贵 1.5%，卖单被拒 FILL_WILL_EXCEED_TRADING_BOUND。
+        let bounds = TradingBounds {
+            lower: Decimal::new(83138, 2),
+            upper: Decimal::new(91888, 2),
+        };
+        let book = OrderBook {
+            venue: VENUE,
+            symbol: arcus_symbol("MU"),
+            bids: vec![level(83110, 2), level(82960, 2), level(82924, 2)],
+            asks: vec![
+                level(83138, 2),
+                level(83150, 2),
+                level(83300, 2),
+                level(91850, 2),
+                level(92000, 2),
+            ],
+        };
+        let clipped = bounds.clip(book);
+        assert!(clipped.bids.is_empty(), "带外的买单成交不了");
+        assert_eq!(
+            clipped.asks.iter().map(|l| l.price).collect::<Vec<_>>(),
+            vec![Decimal::new(83300, 2)],
+            "带边（下限 831.38 本身、离它 0.1% 以内的 831.50、离上限 0.1% 以内的 918.50）与带外都剔掉"
+        );
+    }
+
+    #[test]
+    fn a_book_pinned_at_the_band_edge_has_nothing_tradable_on_that_side() {
+        // 2026-11-04 05:51 UTC 某合约：带 43.91 ～ 45.69，Lighter 46.06，Arcus 卖单堆在上限 45.69 上，
+        // 看起来比 Lighter 便宜 0.8%；按 45.69 下的买单整张被拒 FILL_WILL_EXCEED_TRADING_BOUND。
+        let bounds = TradingBounds {
+            lower: Decimal::new(4391, 2),
+            upper: Decimal::new(4569, 2),
+        };
+        let book = OrderBook {
+            venue: VENUE,
+            symbol: arcus_symbol("SLV"),
+            bids: vec![level(4567, 2), level(4560, 2)],
+            asks: vec![level(4569, 2), level(4610, 2)],
+        };
+        let clipped = bounds.clip(book);
+        assert!(clipped.asks.is_empty(), "带边上的卖单买不到");
+        assert_eq!(
+            clipped.bids.iter().map(|l| l.price).collect::<Vec<_>>(),
+            vec![Decimal::new(4560, 2)],
+            "离上限 0.1% 以内的 45.67 也剔掉，45.60 还能卖"
+        );
+        assert_eq!(
+            bounds.clamp(arb_core::Side::Buy, Decimal::new(4578138, 5)),
+            Decimal::new(4569, 2) * (Decimal::ONE - TRADING_BOUND_EDGE),
+            "买单限价不再收到带边上"
+        );
+    }
+
+    #[test]
+    fn limits_are_pulled_inside_the_band_never_pushed_out() {
+        let bounds = TradingBounds {
+            lower: Decimal::new(83138, 2),
+            upper: Decimal::new(91888, 2),
+        };
+        // 强制补腿的卖价 816.67 在下限之下：收到下限往里 0.1%（831.38 × 1.001），带边本身也成交不了。
+        assert_eq!(
+            bounds.clamp(arb_core::Side::Sell, Decimal::new(81667, 2)),
+            Decimal::new(83221138, 5)
+        );
+        assert_eq!(
+            bounds.clamp(arb_core::Side::Buy, Decimal::new(93000, 2)),
+            Decimal::new(91796112, 5)
+        );
+        // 带内的不动。
+        assert_eq!(
+            bounds.clamp(arb_core::Side::Sell, Decimal::new(85000, 2)),
+            Decimal::new(85000, 2)
+        );
+        assert_eq!(
+            bounds.clamp(arb_core::Side::Buy, Decimal::new(85000, 2)),
+            Decimal::new(85000, 2)
+        );
     }
 }

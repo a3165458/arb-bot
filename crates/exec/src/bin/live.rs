@@ -246,6 +246,7 @@ async fn main() -> Result<()> {
                 auto_margin_max,
             } = *args;
             let request = OpenRequest {
+                maker: None,
                 margin_mode,
                 base: symbol,
                 quote: None,
@@ -264,7 +265,12 @@ async fn main() -> Result<()> {
                     take_profit_usdt: take_profit,
                     auto_margin_pct: auto_margin,
                     auto_margin_max_usdt: auto_margin_max,
+                    ..TaskRules::default()
                 },
+                relative_to_normal: false,
+                leg_order: arb_exec::preflight::LegOrder::CheapFirst,
+                depth_fit: None,
+                force_hedge_pct: None,
             };
             live.open(&request, cli.enable_trading).await
         }
@@ -466,9 +472,16 @@ impl Live {
             // 命令行直接问各券商的结算流水（不缓存）。
             funding: &executor,
             retries: &self.retries,
+            exit_confirm_gap: desk::EXIT_CONFIRM_GAP,
+        };
+        // 命令行沿用「对账不干净就全部冻结」：它只打印，不做续上建仓之后的二次对账。
+        let frozen = if rules {
+            desk::Frozen::Nothing
+        } else {
+            desk::Frozen::Everything
         };
         let reports =
-            desk::live_round(&executor, &self.ledger, &self.by_venue, &ctx, rules).await?;
+            desk::live_round(&executor, &self.ledger, &self.by_venue, &ctx, frozen).await?;
         println!("  监控 {} 笔有敞口的仓位", reports.len());
         for report in &reports {
             if report.retried_exit {

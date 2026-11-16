@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use arb_core::{Decimal, MarketSnapshot, Symbol, family_display_quote, settlement_family};
+use arb_core::{Decimal, MarketSnapshot, Symbol, Venue, family_display_quote, settlement_family};
 
 /// 参考价相差多少以内视为同一资产。
 ///
@@ -175,6 +175,98 @@ fn prune_mark_outliers(rates: &mut Vec<MarketSnapshot>, unverified: &mut Vec<Unv
 /// 标记价：同样只接受正数。
 fn mark_price(rate: &MarketSnapshot) -> Option<Decimal> {
     rate.mark_price.filter(|price| *price > Decimal::ZERO)
+}
+
+/// 已在台账里配成一对的两条腿（给这笔仓位补仓）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedPair {
+    pub base: String,
+    pub long: Venue,
+    pub short: Venue,
+}
+
+/// 已在台账里配成一对的两腿之间，参考价、标记价彼此相差多少以内仍认作同一资产。
+///
+/// 比分簇的 [`PRICE_TOLERANCE`] 宽：这两腿开仓时已经过身份判定，「同名不同资产」的价格差
+/// 几乎总是数倍；这里要挡的只是读数坏掉。2026-11-03 用户定为 10%（某合约 的 HL-io 溢价
+/// 一小时内从 4.57% 拉到 5.25%，5% 把补仓挡掉了）。
+pub const PINNED_TOLERANCE: Decimal = Decimal::from_parts(10, 0, 0, false, 2);
+
+/// [`pin_pair`] 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pinned {
+    /// 两腿本来就在同一个簇里，不用补。
+    AlreadyTogether,
+    /// 另加了一个只含这两腿的簇。
+    Added,
+    /// 没加：原因（要报给用户，说清楚差了多少）。
+    Refused(String),
+}
+
+/// 补仓时身份只在两腿之间核对：这两腿开仓时已经过身份判定、在台账里配成了一对。
+///
+/// 贪心分簇看的是簇均值，别家的报价会把它拉偏：某次实盘 十家 CEX/DEX 均值 1634.5，
+/// HL-io 1734 偏 6.1% 被单独拆出、丢掉，而它和这笔仓位的另一腿 lighter（1668）只差 3.96%，
+/// 补仓被拒成「两家没有落在同一个合约身份下」。
+///
+/// 两腿参考价与标记价彼此都在 [`PINNED_TOLERANCE`] 以内时，另加一个只含这两腿的簇
+/// （只含这两腿，不让别家借它配对）；缺读数、结算资产族不同、超过容差时不加并给出原因。
+pub fn pin_pair(clustering: &mut Clustering, raw: &[MarketSnapshot], pin: &PinnedPair) -> Pinned {
+    let together = clustering.clusters.iter().any(|cluster| {
+        cluster.symbol.base.eq_ignore_ascii_case(&pin.base)
+            && [pin.long, pin.short]
+                .iter()
+                .all(|venue| cluster.rates.iter().any(|rate| rate.venue == *venue))
+    });
+    if together {
+        return Pinned::AlreadyTogether;
+    }
+    if pin.long == pin.short {
+        return Pinned::Refused("两腿是同一场所".into());
+    }
+    let leg = |venue: Venue| {
+        raw.iter()
+            .find(|rate| rate.venue == venue && rate.symbol.base.eq_ignore_ascii_case(&pin.base))
+    };
+    let (Some(long), Some(short)) = (leg(pin.long), leg(pin.short)) else {
+        return Pinned::Refused("本轮扫描缺至少一条腿的读数".into());
+    };
+    let family = settlement_family(&long.symbol.quote);
+    if family != settlement_family(&short.symbol.quote) {
+        return Pinned::Refused(format!(
+            "两腿结算资产不同（{} / {}）",
+            long.symbol.quote, short.symbol.quote
+        ));
+    }
+    let (Some(long_ref), Some(short_ref)) = (reference_price(long), reference_price(short)) else {
+        return Pinned::Refused("缺参考价，无法核对两腿是不是同一资产".into());
+    };
+    let gap =
+        |a: Decimal, b: Decimal| ((a - b).abs() / a.min(b) * Decimal::ONE_HUNDRED).round_dp(2);
+    let limit = (PINNED_TOLERANCE * Decimal::ONE_HUNDRED).normalize();
+    let ref_gap = gap(long_ref, short_ref);
+    if ref_gap > limit {
+        return Pinned::Refused(format!(
+            "两腿参考价相差 {ref_gap}%（{} {long_ref} / {} {short_ref}），超过 {limit}%",
+            pin.long, pin.short
+        ));
+    }
+    if let (Some(long_mark), Some(short_mark)) = (mark_price(long), mark_price(short)) {
+        let mark_gap = gap(long_mark, short_mark);
+        if mark_gap > limit {
+            return Pinned::Refused(format!(
+                "两腿标记价相差 {mark_gap}%（{} {long_mark} / {} {short_mark}），超过 {limit}%",
+                pin.long, pin.short
+            ));
+        }
+    }
+    let mut rates = vec![long.clone(), short.clone()];
+    rates.sort_by_key(|rate| rate.venue);
+    clustering.clusters.push(Cluster {
+        symbol: Symbol::perp(&long.symbol.base, family_display_quote(family)),
+        rates,
+    });
+    Pinned::Added
 }
 
 /// 按参考价贪心分簇：价格排序后，与当前簇的均值相差超过容差就另起一簇。
@@ -445,5 +537,117 @@ mod tests {
                 .collect();
             assert_eq!(first, again);
         }
+    }
+
+    /// 某次实盘 的参考价：十家在 1612~1676，HL-io 1734。
+    fn anthropic() -> Vec<MarketSnapshot> {
+        [
+            (Venue::Variational, dec!(1612.03)),
+            (Venue::Aster, dec!(1613.86)),
+            (Venue::Binance, dec!(1613.86)),
+            (Venue::Mexc, dec!(1617.2)),
+            (Venue::Ourbit, dec!(1626.7)),
+            (Venue::Bitget, dec!(1627.42)),
+            (Venue::Bybit, dec!(1639.94)),
+            (Venue::Gate, dec!(1650.67)),
+            (Venue::Lighter, dec!(1668.0)),
+            (Venue::LighterRh, dec!(1675.6)),
+            (Venue::HyperliquidIo, dec!(1734.0)),
+        ]
+        .into_iter()
+        .map(|(venue, price)| rate(venue, "ANTHROPIC", Some(price)))
+        .collect()
+    }
+
+    fn pin(long: Venue, short: Venue) -> PinnedPair {
+        PinnedPair {
+            base: "ANTHROPIC".into(),
+            long,
+            short,
+        }
+    }
+
+    #[test]
+    fn a_ledger_pair_split_by_other_venues_is_pinned_as_its_own_two_leg_cluster() {
+        let raw = anthropic();
+        let mut clustering = cluster(raw.clone(), 2);
+        assert!(
+            clustering
+                .clusters
+                .iter()
+                .all(|c| c.rates.iter().all(|r| r.venue != Venue::HyperliquidIo)),
+            "HL-io 被均值拉偏的簇拆出去、单家丢掉"
+        );
+        let before = clustering.clusters.len();
+        assert_eq!(
+            pin_pair(
+                &mut clustering,
+                &raw,
+                &pin(Venue::Lighter, Venue::HyperliquidIo)
+            ),
+            Pinned::Added
+        );
+        assert_eq!(clustering.clusters.len(), before + 1);
+        let pinned = clustering.clusters.last().unwrap();
+        let venues: Vec<Venue> = pinned.rates.iter().map(|r| r.venue).collect();
+        assert_eq!(venues, vec![Venue::HyperliquidIo, Venue::Lighter]);
+        assert_eq!(pinned.symbol, Symbol::perp("ANTHROPIC", "USDT"));
+    }
+
+    #[test]
+    fn a_pinned_pair_still_needs_its_two_legs_within_ten_percent_of_each_other() {
+        let mut raw = anthropic();
+        // 2026-11-03 04:40 的标记价：lighter 1660.3、HL-io 1747.4，相差 5.25%，10% 以内照样成对。
+        for rate in &mut raw {
+            match rate.venue {
+                Venue::Lighter => rate.mark_price = Some(dec!(1660.3)),
+                Venue::HyperliquidIo => rate.mark_price = Some(dec!(1747.4)),
+                _ => {}
+            }
+        }
+        let mut clustering = cluster(raw.clone(), 2);
+        assert_eq!(
+            pin_pair(
+                &mut clustering,
+                &raw,
+                &pin(Venue::Lighter, Venue::HyperliquidIo)
+            ),
+            Pinned::Added
+        );
+        // HL-io 标记价拉到 1840：相差 10.82%，不成对，原因里写明差了多少。
+        let mut far = raw.clone();
+        for rate in &mut far {
+            if rate.venue == Venue::HyperliquidIo {
+                rate.mark_price = Some(dec!(1840));
+            }
+        }
+        let mut clustering = cluster(far.clone(), 2);
+        let before = clustering.clusters.len();
+        match pin_pair(
+            &mut clustering,
+            &far,
+            &pin(Venue::Lighter, Venue::HyperliquidIo),
+        ) {
+            Pinned::Refused(reason) => {
+                assert!(reason.contains("标记价相差 10.82%"), "{reason}");
+                assert!(reason.contains("超过 10%"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // 本来就在同一个簇里：什么都不做。
+        assert_eq!(
+            pin_pair(&mut clustering, &far, &pin(Venue::Lighter, Venue::Binance)),
+            Pinned::AlreadyTogether
+        );
+        // 缺一条腿的读数。
+        assert!(matches!(
+            pin_pair(
+                &mut clustering,
+                &far,
+                &pin(Venue::Lighter, Venue::HyperliquidXyz)
+            ),
+            Pinned::Refused(_)
+        ));
+        assert_eq!(clustering.clusters.len(), before);
     }
 }

@@ -21,7 +21,7 @@ const STORED_STRATEGY = (() => {
 const PRECHECK_POLL_MS = 8000;
 // 选中的那一行在等重查时多久再取一次。
 const FOCUS_POLL_MS = 4000;
-const PAGES = ['opps', 'strategy', 'positions', 'rhspread'];
+const PAGES = ['opps', 'strategy', 'positions', 'rhspread', 'chart'];
 // RH 价差页：服务端每秒算一次，页面每 3 秒取一次。
 const RH_REFRESH_MS = 3000;
 // 交易模式的本地存储键。要在 state 初始化之前定义：storedMode() 在初始化时就会用到。
@@ -32,6 +32,8 @@ let state = {
   rh: null,
   rhTimer: null,
   rhAuto: { data: null, form: rhAutoForm({}), dirty: false, busy: false, message: null },
+  // 价差图表页。form 在 wireChart() 里才初始化：它用到的常量定义在后面。
+  chart: { form: null, data: null, fund: null, error: null, fundError: null, loading: false, seq: 0, main: null, resize: null, loadedAt: 0, timer: null, tick: null },
   livePendingTimer: null,
   config: null,
   data: null,
@@ -73,6 +75,8 @@ let state = {
       basisExit: { on: true, value: '0.1' },
       takeProfit: { on: false, value: '10' },
       autoMargin: { on: false, value: '15', max: '100' },
+      timeout: { on: false, value: '4', max: '0.5' },
+      stopLoss: { on: false, value: '2' },
     },
     // 策略：funding（按费率定方向、赚资金费）或 spread（按价格定方向、赚基差收敛）。
     view: storedStrategyView(),
@@ -104,8 +108,14 @@ let state = {
     attempts: {},
   },
   pos: {
+    // 正在确认的那笔仓位 id 与操作（'close' 平仓 / 'add' 补仓）；addSize 是补仓输入框里的每腿名义。
     confirming: null,
-    confirmText: '',
+    confirmKind: null,
+    addSize: '',
+    // 补仓确认时的价差对比：价差监控快照（/api/rh-spread），确认期间每 2 秒刷新一次。
+    addQuote: null,
+    addQuoteTimer: null,
+    addQuoteSeq: 0,
     busy: false,
     round: null,
     account: null,
@@ -115,6 +125,15 @@ let state = {
     ruleDrafts: new Map(),
     modeSeq: 0,
     loadSeq: 0,
+    // 折叠了的持仓卡片（仓位 id）；首次用到时从浏览器读出，见 collapsedSet()。
+    collapsed: null,
+    // 「最近结束」里展开了双边明细的仓位 id。
+    closedOpen: new Set(),
+    // 「最近结束」看到第几页（从 1 起）；自动刷新停在这一页。
+    closedPage: 1,
+    // 「最近结束」连被移除（隐藏）的也列出来。
+    // 「交易统计」看哪个时间段（today / 7d / 30d / all）。
+    statsWindow: '7d',
   },
 };
 
@@ -435,14 +454,16 @@ function setMode(mode) {
   const p = state.pos;
   p.modeSeq += 1;
   p.loadSeq += 1;
+  p.closedPage = 1;
   for (const draft of p.ruleDrafts.values()) {
     draft.wouldTrigger = null;
     draft.force = false;
   }
   state.strategy.pairSeq += 1;
   state.strategy.planSeq += 1;
+  stopAddQuote();
   p.confirming = null;
-  p.confirmText = '';
+  p.confirmKind = null;
   p.flash = null;
   p.round = null;
   p.account = null;
@@ -907,18 +928,24 @@ const RULE_FIELDS = [
   { key: 'basisExit', id: 'rule-basis', field: 'basis_exit', source: 'basis_exit_pct', label: '基差收敛平仓', hint: '标记价基差收敛到目标以内后，服务端按盘口核对整笔净收益再决定平仓；目标可为负（-5 ~ 5）', unit: '%', value: '0.1', min: '-5', max: '5', step: '0.01' },
   { key: 'protect', id: 'rule-protect', field: 'liq_protection', source: 'liq_protection_pct', label: '爆仓保护', hint: '任一腿强平距离低于它就两腿等比例减仓', unit: '%', value: '10', min: '0', step: '0.5' },
   { key: 'mismatch', id: 'rule-mismatch', field: 'size_mismatch', source: 'size_mismatch_pct', label: '数量失衡平仓', hint: '两腿数量偏差超过它就整笔平仓（0.5 ~ 100）', unit: '%', value: '1', min: '0.5', step: '0.5' },
-  { key: 'takeProfit', id: 'rule-take-profit', field: 'take_profit', source: 'take_profit_usdt', label: '净收益止盈', hint: '含已结算资金费的净盈利达到目标后，服务端按盘口扣除退出成本再核对；资金费未知时不评估', unit: 'USDT', value: '10', min: '0', step: '0.01' },
-  { key: 'autoMargin', id: 'rule-auto-margin', field: 'auto_margin', source: 'auto_margin_pct', label: '自动追加保证金', hint: '仅逐仓：任一腿强平距离低于触发线时补保证金；两腿共用整笔累计额度，结果未知也占额度，不重发', unit: '%', value: '15', min: '0', step: '0.5' },
+  { key: 'takeProfit', id: 'rule-take-profit', field: 'take_profit', source: 'take_profit_usdt', label: '净收益止盈', hint: '含已结算资金费的净盈利达到目标后，服务端按盘口扣除退出成本再核对；另外后台逐秒盯两边盘口，盘口整笔平掉（含资金费）先到目标也会核对后平；资金费未知时不评估', unit: 'USDT', value: '10', min: '0', step: '0.01' },
+  { key: 'tpBook', id: 'rule-tp-book', field: 'take_profit_book_min', source: 'take_profit_book_min_usdt', label: '止盈盘口门槛', hint: '配合净收益止盈：标记价到止盈后，按两边盘口平掉的整笔净额（含资金费、平仓手续费与穿价）为正且 ≥ 它就平，不再要求盘口也到止盈金额；0 = 为正即平。不开 = 盘口也要到止盈金额。下单前照样重拉盘口复核，成交价可能比预估差', unit: 'USDT', value: '0', min: '0', step: '0.01' },
+  { key: 'autoMargin', id: 'rule-auto-margin', field: 'auto_margin', source: 'auto_margin_pct', label: '自动追加保证金', hint: '仅逐仓：任一腿强平距离低于触发线时补保证金；两腿共用整笔累计额度，结果未知也占额度，不重发', unit: '%', value: '15', min: '0', step: '0.5',
+    pair: { field: 'auto_margin_max', source: 'auto_margin_max_usdt', valueLabel: '触发线', label: '累计上限', unit: 'USDT', value: '100', step: '0.01', min: '0' } },
+  { key: 'stopLoss', id: 'rule-stop-loss', field: 'stop_loss', source: 'stop_loss_usdt', label: '止损', hint: '按两边盘口现在平掉的整笔净额（含资金费、平仓手续费与穿价）亏到 −它就整笔平仓；盘口拿不到时不按标记价平', unit: 'USDT', value: '2', min: '0', step: '0.1' },
+  { key: 'timeout', id: 'rule-timeout', field: 'timeout_hours', source: 'timeout_hours', label: '超时退出', hint: '持仓超过这么多小时、且按两边盘口现在平掉的亏损（含资金费）不超过右边的金额就整笔平仓，释放名额；0 = 保本才平。按盘口核对，不按标记价', unit: '小时', value: '4', min: '0', step: '0.5',
+    pair: { field: 'timeout_max_loss', source: 'timeout_max_loss_usdt', valueLabel: '持仓时长', label: '最多亏', unit: 'USDT', value: '0.5', step: '0.01', min: '0' } },
 ];
 
 function ruleControl(def, rule, id = def.id, showState = false, mode = 'isolated') {
   const hint = mode === 'cross' && def.key === 'protect' ? '全仓仅按交易所有效强平价判断，触发时整笔退出；缺数据会提示无法评估，不使用逐仓减仓公式' : def.hint;
   const disabled = rule.on ? '' : ' disabled';
-  return `<div class="rule${def.key === 'autoMargin' ? ' rule-pair' : ''}">
+  const pair = def.pair;
+  return `<div class="rule${pair ? ' rule-pair' : ''}">
     <input type="checkbox" id="${id}-on" data-rule-field="${def.key}" data-rule-part="on"${rule.on ? ' checked' : ''} aria-label="启用${def.label}" />
     <label class="desc" for="${id}-on">${def.label}${showState ? ` <span class="tag ${rule.on ? 'sky' : ''}" data-rule-state="${def.key}">${rule.on ? '已启用' : '已关闭'}</span>` : ''}<small>${hint}</small></label>
-    <span class="rule-values"><label><span class="sr-only">${def.label}${def.key === 'autoMargin' ? '触发线' : '阈值'}</span><input type="number" id="${id}-value" data-rule-field="${def.key}" data-rule-part="value" value="${esc(rule.value)}" step="${def.step}" min="${def.min}"${def.max ? ` max="${def.max}"` : ''}${disabled} /> ${def.unit}</label>
-      ${def.key === 'autoMargin' ? `<label>累计上限 <input type="number" id="${id}-max" data-rule-field="${def.key}" data-rule-part="max" value="${esc(rule.max)}" step="0.01" min="0"${disabled} /> USDT</label>` : ''}
+    <span class="rule-values"><label><span class="sr-only">${def.label}${pair ? pair.valueLabel : '阈值'}</span><input type="number" id="${id}-value" data-rule-field="${def.key}" data-rule-part="value" value="${esc(rule.value)}" step="${def.step}" min="${def.min}"${def.max ? ` max="${def.max}"` : ''}${disabled} /> ${def.unit}</label>
+      ${pair ? `<label>${pair.label} <input type="number" id="${id}-max" data-rule-field="${def.key}" data-rule-part="max" value="${esc(rule.max)}" step="${pair.step}" min="${pair.min}"${disabled} /> ${pair.unit}</label>` : ''}
     </span>
   </div>`;
 }
@@ -927,10 +954,10 @@ function ruleControl(def, rule, id = def.id, showState = false, mode = 'isolated
 function ruleFields(form, view = null) {
   const fields = {};
   for (const def of RULE_FIELDS) {
-    const rule = form[def.key];
+    const rule = form[def.key] || { on: false, value: def.value, max: def.pair?.value };
     const active = rule.on && !(view === 'spread' && def.key === 'minApr') && !(view === 'funding' && def.key === 'basisExit');
     fields[def.field] = active ? rule.value : 'off';
-    if (def.key === 'autoMargin') fields.auto_margin_max = active ? rule.max : 'off';
+    if (def.pair) fields[def.pair.field] = active ? rule.max : 'off';
   }
   return fields;
 }
@@ -941,15 +968,29 @@ function ruleFormError(form, view = null) {
   for (const def of RULE_FIELDS) {
     if (fields[def.field] !== 'off' && num(fields[def.field]) === null) return `${def.label}已启用，请填写有效数值或明确关闭。`;
   }
-  if (form.autoMargin.on && num(fields.auto_margin_max) === null) return '自动追加保证金已启用，请同时填写触发线和累计上限。';
+  for (const def of RULE_FIELDS) {
+    if (def.pair && fields[def.field] !== 'off' && num(fields[def.pair.field]) === null) {
+      return `${def.label}已启用，请同时填写${def.pair.valueLabel}和${def.pair.label}。`;
+    }
+  }
+  if (fields.take_profit_book_min !== 'off') {
+    if (fields.take_profit === 'off') return '止盈盘口门槛要和净收益止盈一起开：它只在止盈按标记价达标后才用。';
+    if (num(fields.take_profit_book_min) < 0) return '止盈盘口门槛不能为负（0 = 为正即平）。';
+    if (num(fields.take_profit_book_min) > num(fields.take_profit)) return '止盈盘口门槛不能高于止盈金额。';
+  }
   return null;
 }
 
 const marginModeLabel = (mode) => mode === 'cross' ? '全仓' : '逐仓';
 
 function marginModeError(venues, form) {
-  if (form.marginMode !== 'cross' || state.mode !== 'live') return null;
+  if (state.mode !== 'live') return null;
   const modes = state.tradeConfig?.margin_modes;
+  if (form.marginMode !== 'cross') {
+    // 只在能力清单明确说没有逐仓时拦（币安统一账户只有全仓）；清单缺失时由服务端核对。
+    const crossOnly = venues.filter((venue) => modes?.[venue] && !modes[venue].includes('isolated'));
+    return crossOnly.length ? `${crossOnly.join(' / ')} 只支持全仓（统一账户），请选择全仓或更换场所。` : null;
+  }
   if (!modes) return '尚未取得交易所保证金模式能力清单，请稍后重试。';
   const unsupported = venues.filter((venue) => !modes[venue]?.includes('cross'));
   return unsupported.length ? `${unsupported.join(' / ')} 暂不支持本机器人全仓开仓，请选择逐仓或更换场所。` : null;
@@ -1380,9 +1421,9 @@ function renderPlanShell() {
       f[def.key].on = $(`${def.id}-on`).checked;
       f[def.key].value = $(`${def.id}-value`).value;
       $(`${def.id}-value`).disabled = !f[def.key].on;
-      if (def.key === 'autoMargin') {
-        f.autoMargin.max = $('rule-auto-margin-max').value;
-        $('rule-auto-margin-max').disabled = !f.autoMargin.on;
+      if (def.pair) {
+        f[def.key].max = $(`${def.id}-max`).value;
+        $(`${def.id}-max`).disabled = !f[def.key].on;
       }
     }
     $('plan-auto-margin-note').innerHTML = autoMarginNote([s.selected.long, s.selected.short], f.autoMargin.on);
@@ -1551,7 +1592,9 @@ function resetTrade() {
 function tradeSucceeded(result) {
   const position = result?.position;
   if (!position || position.status !== 'open' || !position.long || !position.short || result.error || result.reconciliation_error) return false;
-  if (result.reconciliation?.divergences?.length) return false;
+  // 对账不一致只冻结出问题的币：别的币有不一致不影响这一笔（归不到币的仍算）。
+  const symbol = position.symbol;
+  if ((result.reconciliation?.divergences || []).some((d) => !d.symbol || d.symbol === symbol)) return false;
   return state.mode === 'paper' || Array.isArray(result.reconciliation?.divergences);
 }
 
@@ -1683,7 +1726,7 @@ function reconciliationText(reconciliation) {
   const divergences = reconciliation.divergences;
   const hints = [];
   if (divergences.some((d) => d.kind === 'position_mismatch' && /台账没有持仓/.test(d.detail))) {
-    hints.push('「台账之外的持仓」不是本程序开的（手动或其它程序）。它在的时候对账不会干净，实盘开仓会被拦住：平掉它，或给本程序单独用一个子账户 / API key。');
+    hints.push('「台账之外的持仓」不是本程序开的（手动或其它程序）。它在的时候这个币的对账不会干净，这个币的实盘开仓会被拦住、规则不执行：平掉它，或给本程序单独用一个子账户 / API key。');
   }
   if (divergences.some((d) => d.kind === 'unverified')) {
     hints.push('「未核对」是查询失败（限频或交易所临时故障），不代表有问题也不代表没问题；稍后点「刷新实盘账户」重试。');
@@ -1959,7 +2002,10 @@ function rulesText(rules, mode = 'isolated') {
   if (rules?.size_mismatch_pct != null) parts.push(`数量偏差 > ${num(rules.size_mismatch_pct)}% 平仓`);
   if (rules?.basis_exit_pct != null) parts.push(`基差收敛到 ≤ ${num(rules.basis_exit_pct)}% 平仓`);
   if (rules?.take_profit_usdt != null) parts.push(`含资金费净收益 ≥ ${usd(rules.take_profit_usdt)} 止盈`);
+  if (rules?.take_profit_book_min_usdt != null) parts.push(num(rules.take_profit_book_min_usdt) === 0 ? '止盈触发后盘口为正即平' : `止盈触发后盘口 ≥ ${usd(rules.take_profit_book_min_usdt)} 即平`);
   if (rules?.auto_margin_pct != null) parts.push(`强平距离 < ${num(rules.auto_margin_pct)}% 追加逐仓保证金，累计上限 ${usd(rules.auto_margin_max_usdt)}`);
+  if (rules?.stop_loss_usdt != null) parts.push(`按盘口亏到 −${usd(rules.stop_loss_usdt)} 止损`);
+  if (rules?.timeout_hours != null) parts.push(`持仓超过 ${num(rules.timeout_hours)} 小时、按盘口亏损 ≤ ${usd(rules.timeout_max_loss_usdt)} 就平仓`);
   return parts.length ? parts.map((p) => `<span class="tag sky">${esc(p)}</span>`).join('') : '<span class="muted">无规则</span>';
 }
 
@@ -1992,11 +2038,11 @@ function positionRuleForm(position) {
   for (const def of RULE_FIELDS) {
     const value = position.rules?.[def.source];
     form[def.key] = {
-      on: value != null || (def.key === 'autoMargin' && position.rules?.auto_margin_max_usdt != null),
+      on: value != null || (def.pair != null && position.rules?.[def.pair.source] != null),
       value: value == null ? text(remembered[def.key]?.value, def.value) : def.key === 'minApr' ? ruleAprPercent(value) : String(value),
     };
-    if (def.key === 'autoMargin') form.autoMargin.max = position.rules?.auto_margin_max_usdt == null
-      ? text(remembered.autoMargin?.max, '100') : String(position.rules.auto_margin_max_usdt);
+    if (def.pair) form[def.key].max = position.rules?.[def.pair.source] == null
+      ? text(remembered[def.key]?.max, def.pair.value) : String(position.rules[def.pair.source]);
   }
   return form;
 }
@@ -2005,7 +2051,7 @@ function rememberPositionRuleValues(id, form) {
   const values = {};
   for (const def of RULE_FIELDS) {
     values[def.key] = { value: form[def.key].value };
-    if (def.key === 'autoMargin') values.autoMargin.max = form.autoMargin.max;
+    if (def.pair) values[def.key].max = form[def.key].max;
   }
   try {
     localStorage.setItem(rulePreferenceKey(id), JSON.stringify(values));
@@ -2164,6 +2210,57 @@ async function loadCredentials() {
   return ok ? body : { error: body.error };
 }
 
+// 「最近结束」每页几笔：多了整页会拖得很长。
+const CLOSED_PER_PAGE = 10;
+
+// 「最近结束」的翻页条：一页放得下就不显示。
+function closedPagerHtml(data) {
+  const total = data?.closed_total || 0;
+  const per = data?.closed_per_page || CLOSED_PER_PAGE;
+  const pages = Math.max(1, Math.ceil(total / per));
+  if (pages <= 1) return '';
+  const page = Math.min(Math.max(1, data.closed_page || 1), pages);
+  const from = (page - 1) * per + 1;
+  const to = Math.min(total, page * per);
+  return `<button class="btn ghost" type="button" data-closed-page="${page - 1}"${page <= 1 ? ' disabled' : ''}>上一页</button>
+    <span class="small">第 ${page} / ${pages} 页 · 第 ${from}–${to} 笔，共 ${total} 笔</span>
+    <button class="btn ghost" type="button" data-closed-page="${page + 1}"${page >= pages ? ' disabled' : ''}>下一页</button>`;
+}
+
+// 正在进行的仓位（建仓中 / 平仓中 / 回滚中）。币安只挂单那几秒，开仓会以「建仓中、没有腿」出现在持仓里：
+// 说清楚在等什么、等了多久，正常几秒就结束；等太久才提醒可能卡住了，和真的卡住分得开。
+const IN_FLIGHT = new Set(['opening', 'closing', 'unwinding']);
+const IN_FLIGHT_STUCK_SEC = 60;
+const IN_FLIGHT_REFRESH_MS = 3000;
+
+function inFlightNotice(position, nowMs = Date.now()) {
+  if (position.status !== 'opening' || position.long || position.short) return null;
+  const opened = Date.parse(position.opened_at);
+  const sec = Number.isFinite(opened) ? Math.max(0, Math.round((nowMs - opened) / 1000)) : null;
+  if (sec !== null && sec >= IN_FLIGHT_STUCK_SEC) {
+    return {
+      tone: 'warn',
+      text: `建仓已经 ${sec} 秒还没结束，可能卡住了：看下面的备注与对账；第一腿是否成交以交易所为准。`,
+    };
+  }
+  return {
+    tone: 'info',
+    text: `正在建仓：第一腿已下单，等交易所成交（只挂单最多挂 20 秒，没成交会自动撤掉、不留仓位）${sec === null ? '' : `，已 ${sec} 秒`}。`,
+  };
+}
+
+// 有进行中的仓位时，3 秒后再拉一次持仓：它结束后很快从列表里消失，不用等 30 秒的自动刷新。
+function scheduleInFlightRefresh() {
+  const p = state.pos;
+  clearTimeout(p.inFlightTimer);
+  const inFlight = (state.positions?.open || []).some((position) => IN_FLIGHT.has(position.status));
+  if (!inFlight || state.page !== 'positions') return;
+  p.inFlightTimer = setTimeout(() => {
+    if (document.hidden || state.page !== 'positions' || p.busy || p.confirming) return;
+    loadPositions().catch(() => {});
+  }, IN_FLIGHT_REFRESH_MS);
+}
+
 async function loadPositions() {
   const p = state.pos;
   const mode = state.mode;
@@ -2178,14 +2275,17 @@ async function loadPositions() {
     return;
   }
   const [positions, round] = await Promise.all([
-    api(`/api/positions?mode=${mode}`, { auth: live }),
+    api(`/api/positions?mode=${mode}&closed_page=${p.closedPage}&closed_per_page=${CLOSED_PER_PAGE}`, { auth: live }),
     api(`/api/trade/round?mode=${mode}`, { auth: live }),
   ]);
   if (mode !== state.mode || seq !== p.loadSeq || modeSeq !== p.modeSeq) return;
   if (!positions.ok) throw new Error(positions.body.error);
   state.positions = positions.body;
+  // 结束的笔数变少、请求的页超出末页时，后端给的是末页：跟着它走。
+  if (positions.body.closed_page) p.closedPage = positions.body.closed_page;
   p.round = round.ok ? round.body : null;
   renderPositions();
+  scheduleInFlightRefresh();
 }
 
 // 实盘账户（真实持仓 + 对账）要打各家私有接口：进入实盘页、点按钮时立刻拉；停在实盘页时再每 60 秒
@@ -2241,6 +2341,28 @@ function maybeRefreshAccount() {
 
 const clockTime = (ms) => new Date(ms).toLocaleTimeString('zh-CN', { hour12: false });
 
+// 各场所的可用保证金（能拿来开新仓的部分）。只显示交易所给的数：没给就说没给，不当成 0。
+// 不给跨场所合计：Hyperliquid 统一账户下几个 dex 共用同一笔钱，加起来会重复算。
+function accountBalancesHtml(accounts) {
+  const list = accounts || [];
+  if (!list.length) return '';
+  const cell = (a) => {
+    if (a.balance_error) return `<span class="neg" title="${esc(a.balance_error)}">没查成</span>`;
+    if (a.free_collateral == null) return '<span class="muted">交易所没给</span>';
+    return `<b>${usd(a.free_collateral)}</b>`;
+  };
+  const hl = list.filter((a) => String(a.venue).startsWith('hyperliquid') && num(a.free_collateral) !== null);
+  const shared = hl.length > 1 && hl.every((a) => num(a.free_collateral) === num(hl[0].free_collateral));
+  const note = shared
+    ? '<span class="muted small">Hyperliquid 几个 dex 是同一个数：统一账户共用一笔余额，不要相加。</span>'
+    : '';
+  return `<div class="pnl-row balance-row" title="交易所报告的可用保证金：能拿来开新仓的部分，不含已经押在持仓上的保证金与浮动盈亏">
+    <span class="small">可用保证金（USDT）</span>
+    ${list.map((a) => `<span>${esc(a.venue)} ${cell(a)}</span>`).join('')}
+    ${note}
+  </div>`;
+}
+
 function renderAccount() {
   const p = state.pos;
   const box = $('pos-account');
@@ -2290,6 +2412,7 @@ function renderAccount() {
   box.innerHTML = `<section class="card account-card">
     <div class="row-head"><h3>实盘账户</h3><span class="muted small">${account.mode === 'trade' ? '可下单' : '只读'} · ${venues}（${how}）</span><span class="grow"></span><span class="muted small" id="account-updated">${updated}</span></div>
     ${stale}${recon}
+    ${accountBalancesHtml(account.accounts)}
     <div class="table-wrap"><table>
       <thead><tr><th>场所</th><th>合约</th><th class="num">净数量</th><th class="num">名义</th><th class="num">吃单费率</th></tr></thead>
       <tbody>${rows}</tbody>
@@ -2393,6 +2516,14 @@ function renderFlash() {
   $('pos-flash').innerHTML = flash ? `<div class="notice${flash.error ? ' error' : ''}">${flash.html}</div>` : '';
 }
 
+// 平仓 / 补仓的结果提示在持仓区顶部，按钮常在下面好几屏：不滚过去就像「点了没反应」
+// （某次实盘 补仓被拒，提示出在屏幕外）。
+function showActionFlash() {
+  renderFlash();
+  const box = $('pos-flash');
+  if (box && state.pos.flash) box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
 async function runMonitor() {
   const p = state.pos;
   if (p.busy) return;
@@ -2404,7 +2535,9 @@ async function runMonitor() {
     const lines = (body.reports || [])
       .filter((r) => r.executed || r.error || r.skipped)
       .map((r) => {
-        const what = r.retried_exit
+        const what = r.resumed
+          ? '续上中断的建仓'
+          : r.retried_exit
           ? '重试退出'
           : r.evaluation?.action?.action === 'close'
             ? '平仓'
@@ -2434,15 +2567,16 @@ async function closePosition(id) {
   const p = state.pos;
   if (p.busy) return;
   const live = state.mode === 'live';
-  if (live && p.confirmText.trim() !== id) return;
+  if (p.confirming !== id || p.confirmKind !== 'close') return;
   p.busy = true;
   renderPositions();
+  // 实盘的二次确认就是页面上那一下「确认平仓」：服务端要求 confirm = 仓位 id，这里自动带上。
   const body = { mode: state.mode, position_id: id };
-  if (live) body.confirm = p.confirmText.trim();
+  if (live) body.confirm = id;
   const response = await api('/api/trade/close', { method: 'POST', body, auth: true });
   p.busy = false;
   p.confirming = null;
-  p.confirmText = '';
+  p.confirmKind = null;
   if (response.ok) {
     const position = response.body.position;
     const status = STATUS_LABEL[position.status] || esc(position.status);
@@ -2460,9 +2594,25 @@ async function closePosition(id) {
   } else {
     p.flash = { error: true, html: `<b>${esc(id)}</b> 平仓失败：${esc(response.body.error)}` };
   }
-  renderFlash();
+  showActionFlash();
   await loadPositions().catch(() => {});
   if (live) loadAccount();
+}
+
+// 补仓输入框的默认每腿名义：自动交易的单腿名义（自动补仓也按它），没加载过就按这笔开仓时的单腿名义。
+function defaultAddSize(position) {
+  const auto = num(state.rhAuto?.data?.settings?.size_usdt);
+  if (auto && auto > 0) return String(auto);
+  const leg = position.long || position.short;
+  const notional = num(leg?.notional_usdt);
+  if (!notional) return '';
+  return String(Math.max(10, Math.round(notional / (1 + (num(leg.adds) || 0)) / 10) * 10));
+}
+
+// 能不能补仓：两腿齐全、持仓中的价差单；实盘还要记了杠杆（服务端同样会核，没记杠杆的实盘补仓直接拒绝）。
+function canAdd(position) {
+  if (state.mode === 'live' && position.leverage == null) return false;
+  return position.status === 'open' && position.strategy === 'spread' && Boolean(position.long && position.short);
 }
 
 function positionActions(position) {
@@ -2470,21 +2620,163 @@ function positionActions(position) {
   const cfg = state.tradeConfig;
   const live = state.mode === 'live';
   if (!cfg?.auth_configured || !token()) return '';
-  if (live && cfg.live?.mode !== 'trade') return '<span class="muted small">实盘只读，不能平仓</span>';
+  if (live && cfg.live?.mode !== 'trade') return '<span class="muted small">实盘只读，不能平仓 / 补仓</span>';
   const retry = position.status !== 'open';
   const label = retry ? '重试退出' : '平仓';
-  if (p.confirming !== position.id) {
-    return `<button type="button" class="btn ghost" data-close="${esc(position.id)}"${p.busy ? ' disabled' : ''}>${label}</button>`;
+  const where = live ? '实盘' : '纸面';
+  const disabled = p.busy ? ' disabled' : '';
+  const cancel = `<button type="button" class="btn ghost" data-pos-cancel="1"${disabled}>取消</button>`;
+  if (p.confirming === position.id && p.confirmKind === 'close') {
+    return `<span class="small">确认${where}${label} <b>${esc(position.symbol)}</b>（${esc(legsTextPlain(position))}）？两腿一起按市价平。</span>
+      <button type="button" class="btn ${live ? 'danger' : 'primary'}" data-close-go="${esc(position.id)}"${disabled}>${p.busy ? '执行中…' : `确认${label}`}</button>
+      ${cancel}`;
   }
-  if (!live) {
-    return `<span class="small">确认纸面${label}？</span>
-      <button type="button" class="btn primary" data-close-go="${esc(position.id)}"${p.busy ? ' disabled' : ''}>${p.busy ? '执行中…' : '确认'}</button>
-      <button type="button" class="btn ghost" data-close-cancel="1"${p.busy ? ' disabled' : ''}>取消</button>`;
+  if (p.confirming === position.id && p.confirmKind === 'add') {
+    const size = num(p.addSize);
+    const ok = size !== null && size > 0;
+    const lev = position.leverage == null ? '' : `，杠杆 ${num(position.leverage)}x`;
+    return `<label class="add-size small">每腿补 <input type="number" min="0" step="10" id="add-size" inputmode="decimal" value="${esc(p.addSize)}" /> USDT</label>
+      <span class="small muted">按原方向（${esc(legsTextPlain(position))}${lev}）两腿各补这么多名义；对账、现拉盘口、保证金、单笔上限照常检查</span>
+      <div class="add-spread small" id="add-spread">${addSpreadHtml(position)}</div>
+      <button type="button" class="btn ${live ? 'danger' : 'primary'}" data-add-go="${esc(position.id)}"${!ok || p.busy ? ' disabled' : ''}>${p.busy ? '执行中…' : `确认${where}补仓`}</button>
+      ${cancel}`;
   }
-  const matched = p.confirmText.trim() === position.id;
-  return `<input class="close-confirm" id="close-confirm" autocomplete="off" placeholder="输入 ${esc(position.id)} 确认" value="${esc(p.confirmText)}" />
-    <button type="button" class="btn danger" data-close-go="${esc(position.id)}"${!matched || p.busy ? ' disabled' : ''}>${p.busy ? '执行中…' : `实盘${label}`}</button>
-    <button type="button" class="btn ghost" data-close-cancel="1"${p.busy ? ' disabled' : ''}>取消</button>`;
+  const others = p.confirming ? ' disabled' : disabled;
+  return `<button type="button" class="btn ghost" data-close="${esc(position.id)}"${others}>${label}</button>${
+    canAdd(position) ? `<button type="button" class="btn ghost" data-add="${esc(position.id)}"${others}>补仓</button>` : ''
+  }`;
+}
+
+// 原仓位实际成交的开仓价差（%）：(空腿均价 − 多腿均价) / 两者均值 × 100，与自动补仓比较的口径相同。
+function positionEntrySpread(position) {
+  const long = num(position.long?.average_price);
+  const short = num(position.short?.average_price);
+  if (!long || !short) return null;
+  return ((short - long) / ((short + long) / 2)) * 100;
+}
+
+// 价差监控里这笔仓位那一组、同方向（多原多腿 / 空原空腿）的报价。
+function addSpreadQuote(position, view) {
+  const base = String(position.symbol || '').split('/')[0].toUpperCase();
+  const long = position.long?.venue;
+  const short = position.short?.venue;
+  const line = (view?.lines || []).find((l) => String(l.base).toUpperCase() === base
+    && ((l.a === long && l.b === short) || (l.a === short && l.b === long)));
+  if (!line) return { line: null, leg: null };
+  return { line, leg: line.a === long ? line.long_a : line.long_b };
+}
+
+// 补仓确认行里的价差对比：现在可成交价差 vs 原仓位开仓价差。只是参考，下单时服务端照样按现拉盘口重算。
+function addSpreadHtml(position) {
+  const p = state.pos;
+  const entry = positionEntrySpread(position);
+  const entryText = entry === null ? '原仓位开仓价差 <span class="muted">未知</span>' : `原仓位开仓价差 <b>${pctRaw(entry, 3)}</b>`;
+  const q = p.addQuote;
+  if (!q || (!q.view && !q.error)) return `${entryText} · 现在价差读取中…`;
+  if (q.error && !q.view) return `${entryText} · <span class="neg">读不到价差监控：${esc(q.error)}</span>`;
+  const { line, leg } = addSpreadQuote(position, q.view);
+  if (!line) return `${entryText} · <span class="muted">价差监控里没有这一组，看不到现在的价差（补仓时照样按现拉盘口检查）</span>`;
+  if (line.note) return `${entryText} · <span class="muted">现在：${esc(line.note)}</span>`;
+  if (!leg) return `${entryText} · <span class="muted">这个方向现在没有可成交报价</span>`;
+  // 监控按估算名义吃深度；补得比它大时，有逐档数据（有信号的方向才有）就取够这笔的那一档。
+  let now = num(leg.entry_pct);
+  let at = num(q.view.size_usdt);
+  const size = num(p.addSize);
+  const ladder = leg.ladder || [];
+  let partial = false;
+  if (size && at && size > at) {
+    const rung = ladder.find((r) => num(r.size_usdt) >= size) || ladder[ladder.length - 1];
+    if (rung && num(rung.size_usdt) > at) {
+      now = num(rung.entry_pct);
+      at = num(rung.size_usdt);
+    }
+    partial = at < size;
+  }
+  const atText = at ? `按 ${usd(at, 0)} 吃深度${partial ? '，比这笔小、偏乐观' : ''}` : '';
+  const age = num(line.age_sec);
+  const ageText = age !== null && age > 5 ? `，盘口 ${age} 秒没更新` : '';
+  const parts = [`现在可成交价差 <b>${pctRaw(now, 3)}</b> <span class="muted">（${atText}${ageText}）</span>`, entryText];
+  if (entry !== null && now !== null) {
+    const diff = now - entry;
+    const verdict = diff > 0 ? '比原仓位好' : diff < 0 ? '比原仓位差' : '和原仓位一样';
+    parts.push(`<b class="${cls(diff)}">${verdict} ${pctRaw(diff, 3)}</b>`);
+    const min = num(state.rhAuto?.data?.settings?.add_min_improve_pct);
+    if (min !== null) parts.push(`<span class="muted">自动补仓门槛 +${min}%（${diff >= min ? '够' : '不够'}）</span>`);
+  }
+  const net = num(leg.net_to_normal_pct);
+  if (net !== null) parts.push(`回到正常净收益 <b class="${cls(net)}">${pctRaw(net, 3)}</b>`);
+  return parts.join(' · ');
+}
+
+// 补仓确认期间每 2 秒刷新价差对比（只重画对比那一块，不动输入框）；确认关掉就停。
+async function refreshAddQuote() {
+  const p = state.pos;
+  clearTimeout(p.addQuoteTimer);
+  if (p.confirmKind !== 'add' || !p.confirming) return;
+  const seq = p.addQuoteSeq;
+  const id = p.confirming;
+  // 只取这个合约的行（各组加起来几行），不拉整份快照（两千多行）。
+  const position = (state.positions?.open || []).find((x) => x.id === id);
+  const base = String(position?.symbol || '').split('/')[0];
+  const result = await api(`/api/rh-spread?${new URLSearchParams({ base, limit: '100' })}`).catch((error) => ({ ok: false, body: { error: error.message } }));
+  if (seq !== p.addQuoteSeq || p.confirmKind !== 'add' || p.confirming !== id) return;
+  p.addQuote = result.ok
+    ? { view: result.body, error: null }
+    : { view: p.addQuote?.view || null, error: result.body?.error || `HTTP ${result.status}` };
+  paintAddSpread();
+  p.addQuoteTimer = setTimeout(refreshAddQuote, 2000);
+}
+
+function paintAddSpread() {
+  const p = state.pos;
+  const box = $('add-spread');
+  const position = (state.positions?.open || []).find((x) => x.id === p.confirming);
+  if (box && position) box.innerHTML = addSpreadHtml(position);
+}
+
+function stopAddQuote() {
+  const p = state.pos;
+  clearTimeout(p.addQuoteTimer);
+  p.addQuoteTimer = null;
+  p.addQuoteSeq += 1;
+  p.addQuote = null;
+}
+
+function legsTextPlain(position) {
+  return `多 ${position.long?.venue || '—'} / 空 ${position.short?.venue || '—'}`;
+}
+
+async function addToPosition(id) {
+  const p = state.pos;
+  if (p.busy || p.confirming !== id || p.confirmKind !== 'add') return;
+  const size = String(p.addSize).trim();
+  if (!(num(size) > 0)) return;
+  const live = state.mode === 'live';
+  stopAddQuote();
+  p.busy = true;
+  renderPositions();
+  const body = { mode: state.mode, position_id: id, size };
+  if (live) body.confirm = id;
+  const response = await api('/api/trade/add', { method: 'POST', body, auth: true });
+  p.busy = false;
+  p.confirming = null;
+  p.confirmKind = null;
+  if (response.ok) {
+    const position = response.body.position;
+    const note = position?.note ? esc(position.note) : '';
+    p.flash = response.body.added
+      ? { error: false, html: `<b>${esc(id)}</b> 已补仓：两腿各约 ${usd(response.body.prepared?.size_usdt ?? size)}。${note}` }
+      : { error: true, html: `<b>${esc(id)}</b> 补仓没补成（台账未变或已回滚）。${note}` };
+    if (response.body.reconciliation_error) {
+      p.flash.html += `<br />补仓后对账失败：${esc(response.body.reconciliation_error)}`;
+      p.flash.error = true;
+    }
+  } else {
+    p.flash = { error: true, html: `<b>${esc(id)}</b> 补仓失败：${esc(response.body.error)}` };
+  }
+  showActionFlash();
+  await loadPositions().catch(() => {});
+  if (live) loadAccount();
 }
 
 // 一条腿开仓以来实际收付的资金费（交易所结算流水）。
@@ -2496,18 +2788,57 @@ function legFundingText(leg, label) {
 }
 
 // 上一轮后台规则按两边盘口估的「现在平掉整笔」含资金费净额。与标记价净额口径不同，分开展示。
+// 上一轮后台规则按两边盘口估的「现在整笔平掉」含资金费净额（数）。页面上所有「净收益」都用它：
+// 标记价会偏离真实成交价（某次实盘：Lighter 标记价比盘口高约 4%，标记价净收益为正、盘口净额为负），
+// 按标记价估值的浮亏 / 浮盈拿不到。拿不到（没核对过、盘口用不了、资金费未知）为 null。
+function bookNet(report) {
+  const obs = report?.evaluation?.observation;
+  const exit = obs?.exit;
+  const funding = num(obs?.funding_usdt);
+  if (!exit || num(exit.net_usdt) === null || funding === null) return null;
+  return num(exit.net_usdt) + funding;
+}
+
 function bookExitText(report) {
   if (!report) return '<span class="muted" title="等后台规则轮核对">待核对</span>';
   const obs = report.evaluation?.observation;
   const exit = obs?.exit;
-  const funding = num(obs?.funding_usdt);
-  if (exit && num(exit.net_usdt) !== null && funding !== null) {
-    const net = num(exit.net_usdt) + funding;
+  const net = bookNet(report);
+  if (net !== null) {
     const title = `多腿卖 ${exit.long_price}、空腿买回 ${exit.short_price}；已扣已付与预估平仓手续费、含已结算资金费`;
     return `<b class="${cls(net)}" title="${esc(title)}">${pnlUsd(net)}</b>`;
   }
-  if (obs?.exit_unavailable) return `<span class="muted" title="${esc(obs.exit_unavailable)}">盘口用不了</span>`;
+  if (obs?.exit_unavailable) {
+    // 原因直接写在页面上：触屏没有悬停提示，只放 title 的话看到的只是一句「用不了」。
+    const why = String(obs.exit_unavailable);
+    const shown = why.length > 80 ? `${why.slice(0, 80)}…` : why;
+    return `<span class="muted" title="${esc(why)}">盘口用不了（${esc(shown)}）</span>`;
+  }
   return '<span class="muted">未知</span>';
+}
+
+// 顶部合计：算得出来的几笔加起来，缺数据的（缺行情 / 盘口还没核对）单独标明有几笔没计入，一笔都算不出才显示「—」。
+// 不能因为一笔缺行情就整个合计消失（某次实盘 在 HL xyz 的价格比 CEX 低 5% 以上，被价差扫描当成另一个资产剔出快照，
+// 这一笔评估不了，每日资金费合计就一直是「—」）；也不能悄悄少算一笔：数量写在合计后面，名单写在悬停提示里。
+function positionTotals(open, reports) {
+  const totalOf = (valueOf) => {
+    const values = open.map((p) => ({ symbol: p.symbol, value: valueOf(p) }));
+    const known = values.filter((v) => v.value !== null);
+    return {
+      sum: known.length ? known.reduce((a, v) => a + v.value, 0) : null,
+      missing: values.filter((v) => v.value === null).map((v) => v.symbol),
+    };
+  };
+  const shown = (total) => {
+    if (!open.length || total.sum === null) return { text: '—', title: total.missing.length ? `算不出：${total.missing.join('、')}` : '', sum: total.sum };
+    return total.missing.length
+      ? { text: `${pnlUsd(total.sum)}（${total.missing.length} 笔缺数据未计入）`, title: `没计入：${total.missing.join('、')}（缺行情或盘口还没核对）`, sum: total.sum }
+      : { text: pnlUsd(total.sum), title: '', sum: total.sum };
+  };
+  return {
+    net: shown(totalOf((p) => bookNet((reports || []).find((r) => r.position_id === p.id)))),
+    daily: shown(totalOf((p) => num(p.evaluation?.observation?.pnl?.funding_daily_usdt))),
+  };
 }
 
 function pnlSummary(position, observation, report) {
@@ -2516,7 +2847,9 @@ function pnlSummary(position, observation, report) {
   const funding = position.funding;
   const net = observation?.net_with_funding_usdt;
   const target = position.rules?.take_profit_usdt;
-  const scope = '按服务端标记价计，含已减仓部分已实现价格盈亏、已结算资金费及已付手续费；未扣预估平仓手续费与穿价';
+  const bookMin = position.rules?.take_profit_book_min_usdt;
+  const bookRule = bookMin == null ? `盘口也要 ≥ ${usd(target)}` : num(bookMin) === 0 ? '盘口为正即平' : `盘口 ≥ ${usd(bookMin)} 即平`;
+  const scope = '整笔净收益按两边盘口现在平掉的预估（后台规则每轮核对），已扣已付与预估平仓手续费、含已减仓部分已实现盈亏与已结算资金费；上面的价格盈亏按服务端标记价，标记价和盘口偏离时两者对不上';
   return `${pnl ? `<div class="pnl-row">
     ${cell('剩余两腿价格盈亏', pnl.price_pnl_usdt)}
     <span>剩余两腿已付手续费 <b>${usd(pnl.fees_usdt, 4)}</b></span>
@@ -2525,12 +2858,12 @@ function pnlSummary(position, observation, report) {
   </div>` : ''}
   <div class="pnl-row funding-row">
     ${cell(state.mode === 'paper' ? '已结算资金费（纸面为 0）' : '已结算资金费', observation?.funding_usdt)}
-    ${cell('整笔净收益（含资金费）', net)}
+    <span>整笔净收益（按盘口，含资金费） ${bookExitText(report)}</span>
     <span class="muted small">${scope}</span>
     ${funding ? `<span class="small" title="交易所流水按账户及合约记录，同账户同合约的其他仓位也可能计入">${[legFundingText(funding.long, '多'), legFundingText(funding.short, '空')].filter(Boolean).join(' · ')}</span>` : ''}
   </div>
   <div class="pnl-row rule-progress">
-    <span data-take-profit-progress>止盈进度（标记价）：${target == null ? '未启用' : `<b class="${cls(net)}">${num(net) === null ? '未知' : pnlUsd(net)}</b> / 目标 <b>${usd(target)}</b>（USDT；触发后仍须核对盘口）`}</span>
+    <span data-take-profit-progress>止盈进度（标记价）：${target == null ? '未启用' : `<b class="${cls(net)}">${num(net) === null ? '未知' : pnlUsd(net)}</b> / 目标 <b>${usd(target)}</b>（USDT；触发后核对盘口：${bookRule}）`}</span>
     ${target == null ? '' : `<span data-book-exit title="实际止盈以这个数为准：按两边盘口整笔吃单均价、扣平仓手续费">按盘口现在平仓可得：${bookExitText(report)}</span>`}
     <span data-margin-used title="整笔仓位累计尝试追加额；结果未知也占额度，明确拒绝不占额度。关闭规则不清零。">累计追加保证金额度已用 <b>${usd(position.margin_added_usdt)}</b> / 上限 <b>${position.rules?.auto_margin_max_usdt == null ? '未启用' : usd(position.rules.auto_margin_max_usdt)}</b> USDT</span>
   </div>`;
@@ -2558,6 +2891,73 @@ function positionLeg(leg, status, label, pnl, mode = 'isolated') {
 }
 
 // 已平仓的已实现盈亏：价格盈亏 − 手续费 + 资金费。没记录的如实说没记录，不显示成 0。
+// ───────────── 持仓卡片折叠 ─────────────
+//
+// 折叠状态存在 state 里（每轮自动刷新会整体重写 innerHTML），并记进浏览器：刷新页面不丢。
+// 浏览器存储读写可能抛错（隐私模式、被禁用），一律吞掉，只是不记住而已。
+const COLLAPSED_KEY = 'arb.positions.collapsed';
+const COLLAPSED_MAX = 200;
+
+function collapsedSet() {
+  if (!state.pos.collapsed) {
+    let saved = [];
+    try {
+      saved = JSON.parse(localStorage.getItem(COLLAPSED_KEY) || '[]');
+    } catch {
+      saved = [];
+    }
+    state.pos.collapsed = new Set(Array.isArray(saved) ? saved.map(String) : []);
+  }
+  return state.pos.collapsed;
+}
+
+function saveCollapsed() {
+  try {
+    localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...collapsedSet()].slice(-COLLAPSED_MAX)));
+  } catch {
+    // 记不住就算了：折叠在本次页面里照样有效。
+  }
+}
+
+// 正在平仓确认的那笔永远展开：折叠了就看不到确认输入框。
+function isCollapsed(id) {
+  return state.pos.confirming !== id && collapsedSet().has(id);
+}
+
+function toggleCollapsed(id) {
+  const set = collapsedSet();
+  if (set.has(id)) set.delete(id);
+  else set.add(id);
+  saveCollapsed();
+}
+
+function setAllCollapsed(collapsed) {
+  const set = collapsedSet();
+  for (const position of state.positions?.open || []) {
+    if (collapsed) set.add(position.id);
+    else set.delete(position.id);
+  }
+  saveCollapsed();
+}
+
+// 需要人看一眼的事有几条：折叠后也在头部数出来，问题不会被折叠藏起来。
+function positionAlertCount(position, external = []) {
+  const evaluation = position.evaluation;
+  return (
+    external.length +
+    (position.quotes_missing ? 1 : 0) +
+    (evaluation?.skipped || []).length +
+    (position.note ? 1 : 0) +
+    (evaluation && evaluation.action?.action !== 'hold' ? 1 : 0) +
+    (position.status !== 'open' ? 1 : 0)
+  );
+}
+
+// 折叠后头部的一行摘要：整笔净收益（按盘口现在平仓，含资金费）。
+function collapsedSummary(position, observation, report) {
+  return `<span class="pos-brief small"><span title="按两边盘口现在整笔平掉的预估，已扣手续费与穿价、含已结算资金费">净收益 ${bookExitText(report)}</span></span>`;
+}
+
 function realizedCell(p) {
   if (p.realized_source) {
     const price = num(p.realized_pnl_usdt);
@@ -2576,6 +2976,237 @@ function realizedCell(p) {
   return '<span class="muted">—</span>';
 }
 
+// 成交数量：去掉末尾的 0，最多 10 位有效数字（0.4911802 这种要原样看到）。
+const qtyText = (value) => {
+  const parsed = num(value);
+  return parsed === null ? '—' : String(Number(parsed.toPrecision(10)));
+};
+
+function orderRoleText(role, status) {
+  if (role?.kind === 'trim') return `第 ${role.n} 次减仓`;
+  if (role?.kind === 'undo') return role.n === 0 ? '开仓零头退回' : `第 ${role.n} 次补仓退回`;
+  if (role?.kind === 'exit') return `${status === 'unwound' ? '回滚' : '平仓'}${role.n > 1 ? ` #${role.n}` : ''}`;
+  return '开仓';
+}
+
+// 一笔已结束仓位的双边明细（服务端从台账订单还原，口径与执行器入账相同）：每条腿开仓、减仓、
+// 平仓各成交多少、什么价、多少手续费，这条腿的价格盈亏。合计与「已实现盈亏」那一列同一口径。
+function closedDetailHtml(position) {
+  const b = position.breakdown;
+  if (!b) return '<div class="muted small">台账里没有这笔的成交记录，拆不出双边明细。</div>';
+  const legRows = (leg, label) => {
+    if (!leg) return `<tr><td>${label}</td><td colspan="7" class="muted">没有成交</td></tr>`;
+    const sideCls = leg.side === 'buy' ? 'long-c' : 'short-c';
+    const entry = `<tr>
+        <td class="${sideCls}">${label}</td><td>${esc(leg.venue)}</td><td>开仓${leg.adds ? `（含 ${leg.adds} 次补仓，均价加权）` : ''}</td>
+        <td class="num">${leg.entry_price == null ? '<span class="muted">台账里没有开仓单</span>' : qtyText(leg.entry_quantity)}</td>
+        <td class="num">${price(leg.entry_price)}</td>
+        <td class="num">${usd(leg.entry_notional_usdt)}</td>
+        <td class="num">${usd(leg.entry_fee_usdt, 4)}</td>
+        <td class="num dim">—</td>
+      </tr>`;
+    const exits = (leg.exits || []).map((exit) => `<tr>
+        <td></td><td></td><td>${orderRoleText(exit.role, position.status)}</td>
+        <td class="num">${qtyText(exit.quantity)}</td>
+        <td class="num">${price(exit.average_price)}</td>
+        <td class="num">${usd(exit.notional_usdt)}</td>
+        <td class="num">${usd(exit.fee_usdt, 4)}</td>
+        <td class="num ${cls(exit.price_pnl_usdt)}">${exit.price_pnl_usdt == null ? '—' : pnlUsd(exit.price_pnl_usdt)}</td>
+      </tr>`).join('');
+    const legNet = num(leg.price_pnl_usdt) - num(leg.fee_usdt);
+    const subtotal = `<tr class="subtotal">
+        <td colspan="6" class="small">${label}小计：价格盈亏 <b class="${cls(leg.price_pnl_usdt)}">${pnlUsd(leg.price_pnl_usdt)}</b> − 手续费 <b>${usd(leg.fee_usdt, 4)}</b></td>
+        <td class="num">${usd(leg.fee_usdt, 4)}</td>
+        <td class="num"><b class="${cls(legNet)}">${pnlUsd(legNet)}</b></td>
+      </tr>`;
+    return entry + exits + subtotal;
+  };
+  const funding = position.realized_funding_usdt == null ? null : num(position.realized_funding_usdt);
+  const notes = [];
+  if (b.external) {
+    notes.push('<div class="alert info">这笔是在交易所里平掉的：台账里只有开仓侧（和期间的减仓），平仓按交易所成交记录核算，合计以「已实现盈亏」那一列为准。</div>');
+  }
+  if (b.pnl_gap_usdt != null || b.fee_gap_usdt != null) {
+    const gaps = [
+      b.pnl_gap_usdt != null ? `价格盈亏差 ${pnlUsd(b.pnl_gap_usdt)}` : '',
+      b.fee_gap_usdt != null ? `手续费差 ${pnlUsd(b.fee_gap_usdt)}` : '',
+    ].filter(Boolean).join('，');
+    notes.push(`<div class="alert warn">两腿明细之和与台账汇总对不上（${gaps}）：以「已实现盈亏」为准，这里如实列出差额。</div>`);
+  }
+  const total = b.external
+    ? ''
+    : `<div class="pnl-row">
+        <span>两腿价格盈亏 <b class="${cls(b.price_pnl_usdt)}">${pnlUsd(b.price_pnl_usdt)}</b></span>
+        <span>手续费合计 <b>−${usd(b.fee_usdt, 4)}</b></span>
+        <span>资金费 <b class="${cls(funding)}">${funding == null ? '没查到' : pnlUsd(funding)}</b></span>
+        <span>已实现净额 ${realizedCell(position)}</span>
+      </div>`;
+  const report = position.open_report
+    ? `<details class="open-report-box"><summary>开仓执行：预估 vs 实际</summary>${openReportHtml(position.open_report)}</details>`
+    : '';
+  return `<div class="closed-detail-box">
+    <div class="table-wrap"><table class="breakdown-table">
+      <thead><tr><th>腿</th><th>场所</th><th>动作</th><th class="num">数量</th><th class="num">成交均价</th><th class="num">名义</th><th class="num">手续费</th><th class="num">价格盈亏</th></tr></thead>
+      <tbody>${legRows(b.long, '多腿')}${legRows(b.short, '空腿')}</tbody>
+    </table></div>
+    ${total}${notes.join('')}${report}
+  </div>`;
+}
+
+// ───────── 「最近结束」的移除 ─────────
+// 移除只是把仓位从这个列表里隐藏：台账原样保留，对账、当日盈亏、熔断都照旧把它算进去（后端见 dismissed.rs）。
+// 没成交过的（被交易所拒了、第一腿没吃到、准备阶段就没过）什么都没发生，一点就移除，还能一键清理；
+// 有成交的是真实交易记录，移除前要确认。面板上没有恢复入口；要找回得改 .dismissed.json。
+
+// 每行最右边的按钮。要有令牌才显示（移除要鉴权）。
+function closedActionHtml(p) {
+  if (!state.tradeConfig?.auth_configured || !token()) return '';
+  const noTrade = p.traded === false;
+  const hint = noTrade
+    ? '什么都没成交：从列表里移除（台账保留）'
+    : '这笔有成交：只是从列表里隐藏，台账和盈亏统计不变（移除前会让你确认）';
+  return `<button type="button" class="btn ghost tiny" data-closed-dismiss="${esc(p.id)}" data-traded="${noTrade ? '0' : '1'}" title="${esc(hint)}">移除</button>`;
+}
+
+// 状态旁边的小标签：没成交的一眼能认出来。
+function closedTagsHtml(p) {
+  const tags = [];
+  if (p.traded === false) tags.push('<span class="pill tag-muted" title="这笔的订单一笔都没成交：被交易所拒了、第一腿没吃到，或者准备阶段就没过。什么都没发生。">没成交</span>');
+  return tags.length ? ` ${tags.join(' ')}` : '';
+}
+
+// 标题行右侧：一键清理没成交的。
+function closedToolsHtml(data) {
+  if (!state.tradeConfig?.auth_configured || !token()) return '';
+  const parts = [];
+  const failed = Number(data?.failed_count) || 0;
+  if (failed > 0) {
+    parts.push(`<button type="button" class="btn ghost tiny" data-closed-clean title="一次移除所有一笔都没成交的已结束仓位（被拒、没吃到、准备没过）；有成交的不动">清理 ${failed} 笔没成交的</button>`);
+  }
+  return parts.join('');
+}
+
+// 移除 / 一键清理。ids 是仓位 id 列表；traded = 其中有成交的（要确认）。
+async function dismissClosed(ids, { traded = false, allFailed = false } = {}) {
+  const p = state.pos;
+  if (p.busy) return;
+  if (allFailed) {
+    const count = Number(state.positions?.failed_count) || 0;
+    if (!window.confirm(`清理 ${count} 笔没成交的已结束仓位？\n它们一笔都没成交，什么都没发生；只是从「最近结束」里隐藏，台账原样保留。`)) return;
+  } else if (traded) {
+    if (!window.confirm(`${ids[0]} 有成交，这是一笔真实交易的记录。\n移除只是从「最近结束」列表里隐藏：台账原样保留，当日盈亏、对账、熔断仍把它算进去。\n确定移除？`)) return;
+  }
+  p.busy = true;
+  const body = { mode: state.mode, ids, restore: false, all_failed: allFailed, allow_traded: traded && !allFailed };
+  const response = await api('/api/trade/dismiss', { method: 'POST', body, auth: true });
+  p.busy = false;
+  if (response.ok) {
+    const changed = (response.body.changed || []).length;
+    const skipped = response.body.skipped || [];
+    const why = skipped.length ? `；没处理 ${skipped.length} 笔：${skipped.map(([id, reason]) => `${esc(id)}（${esc(reason)}）`).join('、')}` : '';
+    p.flash = {
+      error: changed === 0 && skipped.length > 0,
+      html: `已移除 ${changed} 笔${why}。台账原样保留、统计照旧。`,
+    };
+  } else {
+    p.flash = { error: true, html: `移除失败：${esc(response.body.error)}` };
+  }
+  renderFlash();
+  await loadPositions().catch(() => {});
+}
+
+// 交易统计（服务端按全量台账算，见 crates/web/src/stats.rs）：选中时间段的汇总、按合约、按日。
+// 盈亏没核出来的只计笔数、不当 0 加进金额；外部平仓的平仓侧成交额是估算的，都在脚注里说明。
+function tradeStatsParts(stats, windowKey) {
+  const windows = stats?.windows || [];
+  const chosen = windows.find((w) => w.key === windowKey) || windows[0];
+  if (!chosen) return null;
+  const seg = windows
+    .map((w) => `<button type="button" data-stats-window="${esc(w.key)}" class="${w.key === chosen.key ? 'on' : ''}">${esc(w.label)}</button>`)
+    .join('');
+  const s = chosen.summary;
+  const decided = s.wins + s.losses;
+  const winRate = decided ? `${((s.wins / decided) * 100).toFixed(0)}%` : '—';
+  const avg = s.settled ? num(s.net_usdt) / s.settled : null;
+  const tiles = [
+    ['已实现净盈亏', s.settled ? pnlUsd(s.net_usdt) : '—', s.settled ? cls(s.net_usdt) : 'dim', `价格盈亏 ${pnlUsd(s.price_pnl_usdt)} − 手续费 ${usd(s.fee_usdt, 4)} + 资金费 ${pnlUsd(s.funding_usdt)}`],
+    ['结束笔数', `${s.ended} 笔`, '', `平仓 ${s.closed} 笔 · 回滚 ${s.unwound} 笔`],
+    ['胜率', winRate, '', `盈利 ${s.wins} 笔 · 亏损 ${s.losses} 笔（净额为 0 的不计）`],
+    ['每笔平均', avg === null ? '—' : pnlUsd(avg), cls(avg), '核出盈亏的那些笔的平均净额'],
+    ['成交额（两腿）', usd(s.volume_usdt, 0), '', '两条腿开仓、补仓、减仓、平仓、回滚的成交名义合计'],
+    ['手续费', usd(s.fee_usdt, 2), '', '已结束仓位付过的全部手续费（开仓 + 平仓）'],
+    ['资金费', pnlUsd(s.funding_usdt), cls(s.funding_usdt), '持仓期间实际收付的资金费合计（正 = 收到）'],
+    ['最好 / 最差', s.best_usdt == null ? '—' : `${pnlUsd(s.best_usdt)} / ${pnlUsd(s.worst_usdt)}`, '', '单笔净额最高与最低'],
+  ]
+    .map(([label, value, tone, title]) => `<div class="stat" title="${esc(title)}"><span>${esc(label)}</span><b class="${tone}">${esc(value)}</b></div>`)
+    .join('');
+  const foot = [
+    `这段时间新开 ${s.opened} 笔（含还在持有的）`,
+    s.unwound ? `回滚 ${s.unwound} 笔合计 ${pnlUsd(s.unwound_net_usdt)}` : '',
+    s.unknown ? `${s.unknown} 笔盈亏没核出来，未计入金额` : '',
+    s.funding_missing ? `${s.funding_missing} 笔资金费没查到，按 0 计` : '',
+    s.volume_estimated ? `${s.volume_estimated} 笔在交易所手动平仓，平仓侧成交额按开仓名义估算` : '',
+    chosen.key === 'today' ? '「今日」按 UTC 日，与当日亏损上限同一日界' : '',
+    stats.excluded ? `按你的要求有 ${stats.excluded} 笔整笔不计入（盈亏、笔数、成交额都不算；当日亏损上限照算）` : '',
+  ].filter(Boolean).join('；') + '。';
+  const winLoss = (row) => `${row.wins} / ${row.losses}`;
+  const unknownNote = (n) => (n ? ` <span class="muted small">另 ${n} 笔没核出</span>` : '');
+  const rows = chosen.by_symbol || [];
+  const symbols = rows.length
+    ? rows
+        .map(
+          (row) => `<tr><td>${esc(row.symbol)}</td><td class="num">${row.ended}</td><td class="num">${winLoss(row)}</td>
+            <td class="num"><b class="${row.ended > row.unknown ? cls(row.net_usdt) : 'dim'}">${row.ended > row.unknown ? pnlUsd(row.net_usdt) : '—'}</b>${unknownNote(row.unknown)}</td>
+            <td class="num">${usd(row.fee_usdt, 4)}</td><td class="num">${usd(row.volume_usdt, 0)}</td></tr>`,
+        )
+        .join('')
+    : '<tr><td colspan="6" class="muted">这段时间没有交易。</td></tr>';
+  const daily = (stats.daily || [])
+    .map(({ date, summary: d }) => `<tr><td>${esc(date)}</td><td class="num">${d.ended}</td><td class="num">${winLoss(d)}</td>
+      <td class="num"><b class="${d.settled ? cls(d.net_usdt) : 'dim'}">${d.settled ? pnlUsd(d.net_usdt) : '—'}</b>${unknownNote(d.unknown)}</td>
+      <td class="num">${usd(d.fee_usdt, 4)}</td><td class="num ${cls(d.funding_usdt)}">${pnlUsd(d.funding_usdt)}</td><td class="num">${d.opened}</td><td class="num">${usd(d.volume_usdt, 0)}</td></tr>`)
+    .join('');
+  return { key: chosen.key, seg, tiles, foot, symbols, venues: venueStatsRows(chosen), daily };
+}
+
+// 按交易所：成交额（含外部平仓估算）、占比、挂单部分、订单数、仓位笔数、订单回报的手续费与折合费率。
+function venueStatsRows(chosen) {
+  const rows = chosen.by_venue || [];
+  if (!rows.length) return '<tr><td colspan="7" class="muted">这段时间没有成交。</td></tr>';
+  const total = rows.reduce((sum, row) => sum + (num(row.volume_usdt) || 0), 0);
+  return rows
+    .map((row) => {
+      const volume = num(row.volume_usdt) || 0;
+      const share = total > 0 ? `${((volume / total) * 100).toFixed(1)}%` : '—';
+      const maker = num(row.maker_volume_usdt) || 0;
+      const estimated = num(row.estimated_usdt) || 0;
+      const fee = num(row.fee_usdt) || 0;
+      const rate = volume > 0 ? `${((fee / volume) * 100).toFixed(4)}%` : '—';
+      const estimatedNote = estimated > 0 ? ` <span class="muted small" title="在交易所里手动平掉的平仓侧，按开仓名义估算">含估算 ${usd(estimated, 0)}</span>` : '';
+      return `<tr class="${volume > 0 ? '' : 'dim'}"><td>${esc(venueLabel(row.venue))}</td><td class="num">${usd(volume, 0)}${estimatedNote}</td><td class="num">${share}</td>
+        <td class="num">${maker > 0 ? usd(maker, 0) : '—'}</td><td class="num">${row.orders}</td><td class="num">${row.positions}</td>
+        <td class="num">${usd(fee, 4)} <span class="muted small">${rate}</span></td></tr>`;
+    })
+    .join('');
+}
+
+function renderTradeStats(stats) {
+  const parts = tradeStatsParts(stats, state.pos.statsWindow);
+  if (!parts) return;
+  $('trade-stats-seg').innerHTML = parts.seg;
+  $('trade-stats-tiles').innerHTML = parts.tiles;
+  $('trade-stats-foot').textContent = parts.foot;
+  $('trade-stats-symbols').innerHTML = parts.symbols;
+  $('trade-stats-venues').innerHTML = parts.venues;
+  $('trade-stats-daily').innerHTML = parts.daily;
+  for (const button of $('trade-stats-seg').querySelectorAll('[data-stats-window]')) {
+    button.addEventListener('click', () => {
+      state.pos.statsWindow = button.getAttribute('data-stats-window');
+      renderTradeStats(stats);
+    });
+  }
+}
+
 function renderPositions() {
   const data = state.positions;
   const p = state.pos;
@@ -2586,13 +3217,16 @@ function renderPositions() {
   $('pos-intro').innerHTML = setup
     ? '按 .env 里填的凭据，自动识别你在哪几家交易所有可用账户；凑齐两家就能开启实盘。'
     : live
-      ? '实盘台账里的双腿仓位（真实资金）。平仓要输入仓位 id 二次确认；规则由看板后台执行，对账不干净时自动跳过。'
+      ? '实盘台账里的双腿仓位（真实资金）。平仓 / 补仓点按钮后再点一下确认；规则由看板后台执行，对账不一致时只跳过出问题的币；建仓中断的会自动核实、补第二腿。'
       : '纸面台账里的双腿仓位，按当前行情评估每笔仓位的规则。配置了令牌时可以在这里平仓、手动跑一轮规则。';
   $('pos-closed-wrap').classList.toggle('hidden', setup);
+  $('trade-stats').classList.toggle('hidden', setup || !data?.stats);
   $('pos-monitor').classList.toggle('hidden', setup);
   if (setup) {
     $('pos-round').innerHTML = '<span class="h-caution">实盘未开启（ARB_WEB_LIVE=off）</span>';
     $('pos-account-btn').classList.add('hidden');
+    $('pos-collapse-all').classList.add('hidden');
+    $('pos-expand-all').classList.add('hidden');
     $('pos-account').innerHTML = '';
     $('pos-stats').innerHTML = '';
     renderFlash();
@@ -2610,23 +3244,18 @@ function renderPositions() {
     .map(num)
     .filter((v) => v !== null);
   const pending = open.filter((p) => p.evaluation && p.evaluation.action.action !== 'hold').length;
-  // 合计只在每一笔都算得出来时才给；有一笔缺行情就显示「—」，不拿部分和冒充全部。
-  const sumOf = (pick) => {
-    const values = open.map((p) => num(pick(p.evaluation?.observation)));
-    return values.length && values.every((v) => v !== null) ? values.reduce((a, b) => a + b, 0) : null;
-  };
-  const netTotal = sumOf((obs) => obs?.net_with_funding_usdt);
-  const fundingTotal = sumOf((obs) => obs?.pnl?.funding_daily_usdt);
+  const totals = positionTotals(open, state.pos.round?.last_round?.reports);
   $('pos-stats').innerHTML = [
-    ['持仓', `${open.length} 笔`, ''],
-    ['两腿名义合计', usd(notional, 0), ''],
-    ['整笔净收益（含资金费）', open.length ? pnlUsd(netTotal) : '—', cls(netTotal)],
-    ['每日资金费（估）', open.length ? pnlUsd(fundingTotal) : '—', cls(fundingTotal)],
-    ['最近的强平距离', distances.length ? `${Math.min(...distances).toFixed(2)}%` : '—', ''],
-    ['规则触发', `${pending} 笔`, ''],
+    ['持仓', `${open.length} 笔`, '', ''],
+    ['两腿名义合计', usd(notional, 0), '', ''],
+    ['整笔净收益（按盘口，含资金费）', totals.net.text, cls(totals.net.sum), totals.net.title],
+    ['每日资金费（估）', totals.daily.text, cls(totals.daily.sum), totals.daily.title],
+    ['最近的强平距离', distances.length ? `${Math.min(...distances).toFixed(2)}%` : '—', '', ''],
+    ['规则触发', `${pending} 笔`, '', ''],
   ]
-    .map(([label, value, tone]) => `<div class="stat"><span>${label}</span><b class="${tone}">${esc(value)}</b></div>`)
+    .map(([label, value, tone, title]) => `<div class="stat"${title ? ` title="${esc(title)}"` : ''}><span>${label}</span><b class="${tone}">${esc(value)}</b></div>`)
     .join('');
+  renderTradeStats(data.stats);
 
   const broken = data.broken_lines ? `<div class="notice">台账里有 ${data.broken_lines} 行无法解析，已跳过。</div>` : '';
   $('pos-open').innerHTML =
@@ -2646,7 +3275,9 @@ function renderPositions() {
             const exitWithFunding = num(exit?.net_usdt) !== null && exitFunding !== null ? num(exit.net_usdt) + exitFunding : null;
             // 对账发现的「不是看板平掉的」情况：只平了一条腿（裸敞口）、或等第二次确认。
             const external = (state.pos.round?.last_round?.external || []).filter((n) => n.position_id === p.id);
+            const inFlight = inFlightNotice(p);
             const notes = [
+              inFlight ? `<div class="alert ${inFlight.tone}">${esc(inFlight.text)}</div>` : '',
               ...external.map((n) => `<div class="alert warn"><b>对账发现：</b>${esc(n.message)}</div>`),
               exit
                 ? `<div class="alert info">上一轮（${when(state.pos.round.last_round.at)}）按盘口核对平仓：多腿卖 ${price(exit.long_price)}、空腿买回 ${price(exit.short_price)}，平仓价差 ${pctRaw(exit.exit_basis_pct, 3)}，整笔预估 <b class="${cls(exit.net_usdt)}">${pnlUsd(exit.net_usdt)}</b>（资金费前，已扣已付与预估平仓手续费）；含该轮已结算资金费合计 <b class="${cls(exitWithFunding)}">${exitWithFunding === null ? '未知' : pnlUsd(exitWithFunding)}</b>。是否执行以服务端本轮规则报告为准。</div>`
@@ -2655,8 +3286,10 @@ function renderPositions() {
               ...(evaluation?.skipped || []).map((s) => `<div class="alert warn">未评估：${esc(s)}</div>`),
               p.note ? `<div class="alert info">${esc(p.note)}</div>` : '',
             ].join('');
-            return `<div class="card pos-card">
-              <div class="pos-head">
+            const collapsed = isCollapsed(p.id);
+            const alerts = positionAlertCount(p, external);
+            const head = `<div class="pos-head">
+                <button type="button" class="collapse-btn" data-collapse="${esc(p.id)}" aria-expanded="${!collapsed}" title="${collapsed ? '展开这笔' : '折叠这笔'}">${collapsed ? '▸' : '▾'}</button>
                 <span class="sym">${esc(p.symbol)}</span>
                 <span class="small">${legsText(p.long?.venue, p.short?.venue)}</span>
                 <span class="pill status">${STATUS_LABEL[p.status] || esc(p.status)}</span>
@@ -2664,9 +3297,14 @@ function renderPositions() {
                 <span class="tag sky">${marginModeLabel(p.margin_mode)}</span>
                 ${p.strategy === 'spread' ? '<span class="tag sky">价差套利</span>' : ''}
                 ${p.trims ? `<span class="tag warn">已减仓 ${p.trims} 次</span>` : ''}
+                ${collapsed ? collapsedSummary(p, obs, lastReport) : ''}
+                ${collapsed && alerts ? `<span class="tag warn" title="展开查看">${alerts} 条提醒</span>` : ''}
                 <span class="grow"></span>
                 <span class="muted small">${esc(p.id)} · 开仓 ${when(p.opened_at)}</span>
-              </div>
+              </div>`;
+            if (collapsed) return `<div class="card pos-card collapsed">${head}</div>`;
+            return `<div class="card pos-card">
+              ${head}
               <div class="legs-grid">${positionLeg(p.long, obs?.long, '做多', obs?.pnl?.long, p.margin_mode)}${positionLeg(p.short, obs?.short, '做空', obs?.pnl?.short, p.margin_mode)}</div>
               ${pnlSummary(p, obs, lastReport)}
               ${p.open_report ? `<details class="open-report-box"><summary>开仓执行：预估 vs 实际（锁定价差 ${pctRaw(num(p.open_report.actual_basis) * 100, 3)}，两腿间隔 ${secondsText(p.open_report.unhedged_ms)}）</summary>${openReportHtml(p.open_report)}</details>` : ''}
@@ -2690,46 +3328,957 @@ function renderPositions() {
   wirePositionRules();
   if (focusedRule) $(focusedRule)?.focus({ preventScroll: true });
 
+  // 全部折叠 / 展开：有两笔以上才有意义。
+  $('pos-collapse-all').classList.toggle('hidden', open.length < 2);
+  $('pos-expand-all').classList.toggle('hidden', open.length < 2);
+  for (const button of $('pos-open').querySelectorAll('[data-collapse]')) {
+    button.addEventListener('click', () => {
+      toggleCollapsed(button.getAttribute('data-collapse'));
+      renderPositions();
+    });
+  }
+
   for (const button of $('pos-open').querySelectorAll('[data-close]')) {
     button.addEventListener('click', () => {
+      stopAddQuote();
       p.confirming = button.getAttribute('data-close');
-      p.confirmText = '';
+      p.confirmKind = 'close';
       renderPositions();
-      $('close-confirm')?.focus();
+    });
+  }
+  for (const button of $('pos-open').querySelectorAll('[data-add]')) {
+    button.addEventListener('click', () => {
+      const id = button.getAttribute('data-add');
+      p.confirming = id;
+      p.confirmKind = 'add';
+      p.addSize = defaultAddSize((state.positions?.open || []).find((x) => x.id === id) || {});
+      stopAddQuote();
+      renderPositions();
+      $('add-size')?.focus();
+      refreshAddQuote();
     });
   }
   for (const button of $('pos-open').querySelectorAll('[data-close-go]')) {
     button.addEventListener('click', () => closePosition(button.getAttribute('data-close-go')));
   }
-  for (const button of $('pos-open').querySelectorAll('[data-close-cancel]')) {
+  for (const button of $('pos-open').querySelectorAll('[data-add-go]')) {
+    button.addEventListener('click', () => addToPosition(button.getAttribute('data-add-go')));
+  }
+  for (const button of $('pos-open').querySelectorAll('[data-pos-cancel]')) {
     button.addEventListener('click', () => {
+      stopAddQuote();
       p.confirming = null;
-      p.confirmText = '';
+      p.confirmKind = null;
       renderPositions();
     });
   }
-  $('close-confirm')?.addEventListener('input', (event) => {
-    p.confirmText = event.target.value;
-    const go = $('pos-open').querySelector('[data-close-go]');
-    if (go) go.disabled = p.confirmText.trim() !== p.confirming || p.busy;
+  $('add-size')?.addEventListener('input', (event) => {
+    p.addSize = event.target.value;
+    const go = $('pos-open').querySelector('[data-add-go]');
+    const size = num(p.addSize);
+    if (go) go.disabled = !(size !== null && size > 0) || p.busy;
+    paintAddSpread();
+  });
+  $('add-size')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') addToPosition(p.confirming);
   });
 
   const closed = data.closed || [];
+  // 点一行展开它的双边明细；展开了哪几笔存在 state 里，自动刷新重画后不收起。
+  const expanded = state.pos.closedOpen;
   $('pos-closed').innerHTML = closed
     .map(
-      (p) => `<tr>
-        <td class="dim">${esc(p.id)}</td>
+      (p) => `<tr class="closed-row" data-closed-toggle="${esc(p.id)}" tabindex="0" aria-expanded="${expanded.has(p.id)}" title="点开看双边下单盈亏与手续费">
+        <td class="dim"><span class="caret">${expanded.has(p.id) ? '▾' : '▸'}</span> ${esc(p.id)}</td>
         <td>${esc(p.symbol)}</td>
         <td>${p.long || p.short ? legsText(p.long?.venue, p.short?.venue) : '<span class="muted">两腿已退出</span>'}</td>
-        <td><span class="pill status">${STATUS_LABEL[p.status] || esc(p.status)}</span></td>
+        <td><span class="pill status">${STATUS_LABEL[p.status] || esc(p.status)}</span>${closedTagsHtml(p)}</td>
         <td class="dim">${when(p.opened_at)}</td>
         <td class="dim">${when(p.closed_at)}</td>
         <td class="num">${realizedCell(p)}</td>
         <td class="small">${esc(p.note || '')}${p.pnl_unattributed ? esc(` 实际盈亏没能核出：${p.pnl_unattributed}`) : ''}</td>
-      </tr>`,
+        <td class="closed-action">${closedActionHtml(p)}</td>
+      </tr>${expanded.has(p.id) ? `<tr class="closed-detail"><td colspan="9">${closedDetailHtml(p)}</td></tr>` : ''}`,
     )
     .join('');
   $('pos-closed-empty').textContent = closed.length ? '' : '还没有结束的仓位。';
+  const tools = $('pos-closed-tools');
+  tools.innerHTML = closedToolsHtml(data);
+  tools.querySelector('[data-closed-clean]')?.addEventListener('click', () => dismissClosed([], { allFailed: true }));
+  for (const button of $('pos-closed').querySelectorAll('[data-closed-dismiss]')) {
+    // 按钮在可点开的行里：不能让点击 / 回车冒泡成「展开明细」。
+    const stop = (event) => event.stopPropagation();
+    button.addEventListener('keydown', stop);
+    button.addEventListener('click', (event) => {
+      stop(event);
+      const id = button.getAttribute('data-closed-dismiss');
+      dismissClosed([id], { traded: button.getAttribute('data-traded') === '1' });
+    });
+  }
+  const pager = $('pos-closed-pager');
+  pager.innerHTML = closedPagerHtml(data);
+  pager.classList.toggle('hidden', !pager.innerHTML);
+  for (const button of pager.querySelectorAll('[data-closed-page]')) {
+    button.addEventListener('click', () => {
+      state.pos.closedPage = Number(button.getAttribute('data-closed-page'));
+      for (const b of pager.querySelectorAll('button')) b.disabled = true;
+      loadPositions().catch((error) => {
+        state.pos.flash = { error: true, html: `翻页没成功：${esc(error.message)}` };
+        renderPositions();
+      });
+    });
+  }
+  for (const row of $('pos-closed').querySelectorAll('[data-closed-toggle]')) {
+    const toggle = () => {
+      const id = row.getAttribute('data-closed-toggle');
+      if (expanded.has(id)) expanded.delete(id);
+      else expanded.add(id);
+      renderPositions();
+    };
+    row.addEventListener('click', toggle);
+    row.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        toggle();
+      }
+    });
+  }
+}
+
+// ───────────────────────────── 价差图表（参照 zuudot trading 页） ─────────────────────────────
+//
+// 一张图、两个窗格（lightweight-charts v5 的 pane，十字线与时间轴天然同步）：
+// - 主图：两家 K 线（左轴）+ 价差（右轴，空腿 − 多腿，与 zuudot 的 long1_short2 同口径）+ 开 / 关仓参考线。
+// - 资金费：两家已结算的资金费率（每周期原始费率 × 100，%）+ 结算点 + 按方向算的净资金费结算柱（左轴）。
+// K 线来自 GET /api/spread-chart，资金费来自 GET /api/spread-chart/funding，各拉各的：一个失败不拖累另一个。
+// 价差是成交价（K 线收盘）算的，不是盘口可成交价差。参考线与 zuudot 同一个公式：
+// 关 = 价差的 SMA，开 = 关 + 2 × (两腿手续费) + 最小利润。
+
+const CHART_VENUES = ['okx', 'binance', 'bybit', 'hyperliquid', 'hyperliquid-xyz', 'hyperliquid-io', 'lighter', 'lighter-rh', 'arcus', 'mexc', 'bitget', 'aster'];
+const CHART_VENUE_NAME = {
+  okx: 'OKX', binance: 'Binance', bybit: 'Bybit', hyperliquid: 'Hyperliquid', 'hyperliquid-xyz': 'HL-xyz',
+  'hyperliquid-io': 'HL-io', lighter: 'Lighter', 'lighter-rh': 'Lighter RH', arcus: 'Arcus', mexc: 'MEXC', bitget: 'Bitget', aster: 'Aster',
+};
+const chartVenueName = (venue) => CHART_VENUE_NAME[venue] || venue;
+// zuudot 链接里的交易所名：Hyperliquid 的子交易所只靠 instId 前缀（xyz: / io:）区分。
+const ZUU_EXCHANGE = {
+  okx: 'OKX', binance: 'Binance', bybit: 'Bybit', hyperliquid: 'Hyperliquid', 'hyperliquid-xyz': 'Hyperliquid',
+  'hyperliquid-io': 'Hyperliquid', lighter: 'Lighter', 'lighter-rh': 'lighter-rh', arcus: 'Arcus',
+};
+// 周期：默认天数、最多天数、「再加载」一次加几天（与 zuudot 一致；它的 10 分钟这里是 15 分钟）。
+const CHART_INTERVALS = [
+  { name: '1m', label: '1分', minutes: 1, days: 16 / 24, max: 2, step: 1 },
+  { name: '5m', label: '5分', minutes: 5, days: 3, max: 8, step: 2 },
+  { name: '15m', label: '15分', minutes: 15, days: 6, max: 12, step: 3 },
+  { name: '30m', label: '30分', minutes: 30, days: 12, max: 24, step: 6 },
+  { name: '1h', label: '1小时', minutes: 60, days: 24, max: 48, step: 12 },
+  { name: '4h', label: '4小时', minutes: 240, days: 48, max: 96, step: 24 },
+];
+const CHART_PARAMS_KEY = 'arb-web-chart-params';
+// zuudot 的默认值：两腿手续费 0.05% / 0.055%、最小利润 0.5%、SMA 1000 分钟。
+const CHART_FEE1 = 0.05;
+const CHART_FEE2 = 0.055;
+const CHART_MIN_PROFIT = 0.5;
+const CHART_SMA_MINUTES = 1000;
+const CHART_REFRESH_MS = 60000;
+// 颜色与 zuudot 一致。
+const CHART_COLOR = {
+  spread: '#2563eb', openLine: '#2dd4bf', closeLine: '#fb923c', levels: '#f5a623',
+  klineA: { up: 'rgba(22, 163, 74, 0.6)', down: 'rgba(220, 38, 38, 0.6)', line: 'rgba(22, 163, 74, 0.66)', dot: '#16a34a' },
+  klineB: { up: 'rgba(14, 165, 233, 0.6)', down: 'rgba(147, 51, 234, 0.6)', line: 'rgba(14, 165, 233, 0.66)', dot: '#0ea5e9' },
+  fundA: '#16a34a', fundB: '#0ea5e9', netPos: 'rgba(22, 163, 74, 0.85)', netNeg: 'rgba(220, 38, 38, 0.85)',
+};
+// 图层开关（图例上点一下切换）。
+const CHART_LAYERS = [
+  { key: 'spread', pane: 0, label: () => '价差', color: CHART_COLOR.spread },
+  { key: 'openLine', pane: 0, label: () => '开仓参考线', color: CHART_COLOR.openLine },
+  { key: 'closeLine', pane: 0, label: () => '关仓参考线', color: CHART_COLOR.closeLine },
+  { key: 'levels', pane: 0, label: () => '最高 / 中位 / 最低', color: CHART_COLOR.levels },
+  { key: 'klineA', pane: 0, label: (n) => `K线 · ${n.a}`, color: CHART_COLOR.klineA.dot },
+  { key: 'klineB', pane: 0, label: (n) => `K线 · ${n.b}`, color: CHART_COLOR.klineB.dot },
+  { key: 'fundA', pane: 1, label: (n) => `资金费 · ${n.a}`, color: CHART_COLOR.fundA },
+  { key: 'fundB', pane: 1, label: (n) => `资金费 · ${n.b}`, color: CHART_COLOR.fundB },
+  { key: 'net', pane: 1, label: () => '净资金费结算柱', color: CHART_COLOR.netPos, square: true },
+  { key: 'marks', pane: 1, label: () => 'Funding 结算点', color: '#cbd5e1' },
+];
+const chartLayerDefaults = () => Object.fromEntries(CHART_LAYERS.map((l) => [l.key, l.key !== 'levels']));
+
+function chartDefaults() {
+  let saved = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(CHART_PARAMS_KEY) || '{}') || {};
+  } catch {
+    saved = {};
+  }
+  const text = (v, fallback) => (typeof v === 'string' && v.trim() ? v.trim() : fallback);
+  const layers = chartLayerDefaults();
+  for (const key of Object.keys(layers)) if (typeof saved.layers?.[key] === 'boolean') layers[key] = saved.layers[key];
+  return {
+    symbol: text(saved.symbol, 'OPENAI'),
+    a: CHART_VENUES.includes(saved.a) ? saved.a : 'okx',
+    b: CHART_VENUES.includes(saved.b) ? saved.b : 'binance',
+    ratio1: text(saved.ratio1, '1'),
+    ratio2: text(saved.ratio2, '1'),
+    interval: CHART_INTERVALS.some((i) => i.name === saved.interval) ? saved.interval : '5m',
+    days: text(saved.days, ''),
+    unit: saved.unit === 'diff' ? 'diff' : 'pct',
+    kline: saved.kline === 'line' ? 'line' : 'candle',
+    sma: text(saved.sma, ''),
+    fee1: text(saved.fee1, ''),
+    fee2: text(saved.fee2, ''),
+    minProfit: text(saved.minProfit, ''),
+    layers,
+  };
+}
+
+const chartInterval = (name) => CHART_INTERVALS.find((i) => i.name === name) || CHART_INTERVALS[1];
+
+// 这次要拉多少天：留空 = 这个周期的默认天数；超过上限夹到上限。
+function chartDays(f) {
+  const interval = chartInterval(f.interval);
+  const days = num(f.days);
+  return days && days > 0 ? Math.min(days, interval.max) : interval.days;
+}
+
+// 请求参数（纯函数，便于测试）。
+function chartQuery(f) {
+  const interval = chartInterval(f.interval);
+  const q = new URLSearchParams({
+    symbol: String(f.symbol || '').trim().toUpperCase(),
+    exchange1: f.a,
+    exchange2: f.b,
+    interval: interval.name,
+    days: String(chartDays(f)),
+    ratio1: String(num(f.ratio1) || 1),
+    ratio2: String(num(f.ratio2) || 1),
+    direction: 'long1_short2',
+  });
+  return `/api/spread-chart?${q}`;
+}
+
+function fundingQuery(f) {
+  const q = new URLSearchParams({
+    symbol: String(f.symbol || '').trim().toUpperCase(),
+    exchange1: f.a,
+    exchange2: f.b,
+    days: String(chartDays(f)),
+    direction: 'long1_short2',
+  });
+  return `/api/spread-chart/funding?${q}`;
+}
+
+// 「再加载 N 天」「加载至 M 天」两个按钮（纯函数）：到了上限就不能再加。
+function chartRangeButtons(f) {
+  const interval = chartInterval(f.interval);
+  const days = chartDays(f);
+  const more = Math.min(interval.max, days + interval.step);
+  const atMax = days >= interval.max - 1e-9;
+  return [
+    { days: more, label: `再加载 ${interval.step} 天`, disabled: atMax },
+    { days: interval.max, label: `加载至 ${interval.max} 天`, disabled: atMax },
+  ];
+}
+
+// zuudot 链接的交易所名 → 这里的场所。也认这里自己的短名（hyperliquid-xyz 等）。
+function zuuVenue(exchange, instId) {
+  const e = String(exchange || '').trim().toLowerCase().replace(/[\s_]+/g, '-');
+  const inst = String(instId || '').trim();
+  if (e === 'hyperliquid' || e === 'hl') {
+    if (/^xyz:/i.test(inst)) return 'hyperliquid-xyz';
+    if (/^io:/i.test(inst)) return 'hyperliquid-io';
+    return 'hyperliquid';
+  }
+  if (e === 'lighterrh' || e === 'lighter-rh' || e === 'rh') return 'lighter-rh';
+  return CHART_VENUES.includes(e) ? e : null;
+}
+
+// 从 instId 猜合约名：去掉 `xyz:` 这类前缀和 USDT / -USDT-SWAP / -USD 后缀。
+const symbolFromInst = (inst) => String(inst || '').trim().replace(/^[a-z0-9]+:/i, '').replace(/(-USDT-SWAP|-USDT|-USD|USDT|USDC)$/i, '').toUpperCase();
+
+// 解析 zuudot 风格的链接参数（/trading?symbol=…&exchange1=Binance&exchange2=Hyperliquid&instId2=xyz:…）。
+// 这里的图永远是「A 多、B 空」：short1_long2 就把两边对调。认不出来返回 null。
+function chartParamsFromUrl(search) {
+  const q = new URLSearchParams(search || '');
+  let a = zuuVenue(q.get('exchange1'), q.get('instId1'));
+  let b = zuuVenue(q.get('exchange2'), q.get('instId2'));
+  if (!a || !b) return null;
+  const symbol = (q.get('symbol') || q.get('assetId') || symbolFromInst(q.get('instId1')) || symbolFromInst(q.get('instId2'))).trim().toUpperCase();
+  if (!/^[A-Z0-9]+$/.test(symbol)) return null;
+  let ratio1 = num(q.get('ratio1')) ? q.get('ratio1') : '1';
+  let ratio2 = num(q.get('ratio2')) ? q.get('ratio2') : '1';
+  if (q.get('direction') === 'short1_long2') {
+    [a, b] = [b, a];
+    [ratio1, ratio2] = [ratio2, ratio1];
+  }
+  const out = { symbol, a, b, ratio1, ratio2 };
+  const interval = q.get('interval');
+  if (CHART_INTERVALS.some((i) => i.name === interval)) out.interval = interval;
+  return out;
+}
+
+// 这一家这个合约在接口里的名字（服务端回查失败时的猜测）。
+function chartInstGuess(venue, base) {
+  if (venue === 'binance' || venue === 'bybit') return `${base}USDT`;
+  if (venue === 'okx') return `${base}-USDT-SWAP`;
+  if (venue === 'hyperliquid-xyz') return `xyz:${base}`;
+  if (venue === 'hyperliquid-io') return `io:${base}`;
+  if (venue === 'arcus') return `${base}-USD`;
+  return base;
+}
+
+// 当前图的分享链接（zuudot 同款参数，可以原样贴到 zuudot 或这里打开）。
+function chartShareUrl(f, insts = []) {
+  const base = String(f.symbol || '').trim().toUpperCase();
+  const q = new URLSearchParams({
+    symbol: base,
+    exchange1: ZUU_EXCHANGE[f.a] || f.a,
+    exchange2: ZUU_EXCHANGE[f.b] || f.b,
+    instId1: insts[0] || chartInstGuess(f.a, base),
+    instId2: insts[1] || chartInstGuess(f.b, base),
+    ratio1: String(num(f.ratio1) || 1),
+    ratio2: String(num(f.ratio2) || 1),
+    direction: 'long1_short2',
+    interval: chartInterval(f.interval).name,
+  });
+  return `/trading?${q}`;
+}
+
+// 开 / 关仓参考线（纯函数）：关 = 价差的 SMA（窗口按分钟换算成点数，开头不够就用已有的点），
+// 开 = 关 + 2 × (费 1 + 费 2) + 最小利润。费率、利润都是 %；价格差口径按每点两边均价换算。
+function chartRefLines(points, { unit = 'pct', intervalMinutes = 5, smaMinutes = CHART_SMA_MINUTES, fee1 = CHART_FEE1, fee2 = CHART_FEE2, minProfit = CHART_MIN_PROFIT } = {}) {
+  const window = Math.max(1, Math.round(smaMinutes / intervalMinutes));
+  const cost = (2 * (fee1 + fee2) + minProfit) / 100;
+  const pick = (p) => (unit === 'diff' ? p.diff : p.pct);
+  const close = [];
+  const open = [];
+  let sum = 0;
+  points.forEach((p, i) => {
+    sum += pick(p);
+    if (i >= window) sum -= pick(points[i - window]);
+    const sma = sum / Math.min(i + 1, window);
+    const add = unit === 'diff' ? cost * (p.a + p.b) / 2 : cost * 100;
+    close.push({ time: p.time, value: sma });
+    open.push({ time: p.time, value: sma + add });
+  });
+  return { open, close, window, cost };
+}
+
+// 资金费副图的数据（纯函数）：结算点对齐到图的周期（同一根 K 线里留最后一次），末尾接上当前预测费率；
+// 净结算柱同一根里求和。值都是 %（每周期原始费率 × 100）。
+function chartFundingSeries(fund, intervalSec, nowSec) {
+  const step = Math.max(60, intervalSec);
+  const bucket = (sec) => sec - (((sec % step) + step) % step);
+  const legs = (fund?.legs || []).map((leg) => {
+    const byT = new Map();
+    for (const s of leg.settlements || []) {
+      if (Number.isFinite(s.rate)) byT.set(bucket(Math.floor(s.t / 1000)), s.rate * 100);
+    }
+    const marks = [...byT.keys()].sort((x, y) => x - y);
+    const line = marks.map((time) => ({ time, value: byT.get(time) }));
+    const rate = leg.current?.rate;
+    if (Number.isFinite(rate)) {
+      const time = bucket(nowSec);
+      const last = line[line.length - 1];
+      if (last && last.time === time) last.value = rate * 100;
+      else if (!last || last.time < time) line.push({ time, value: rate * 100 });
+    }
+    return { venue: leg.venue, line, marks };
+  });
+  const netBy = new Map();
+  for (const p of fund?.net || []) {
+    if (!Number.isFinite(p.net)) continue;
+    const time = bucket(Math.floor(p.t / 1000));
+    netBy.set(time, (netBy.get(time) || 0) + p.net * 100);
+  }
+  const net = [...netBy.entries()]
+    .sort((x, y) => x[0] - y[0])
+    .map(([time, value]) => ({ time, value, color: value >= 0 ? CHART_COLOR.netPos : CHART_COLOR.netNeg }));
+  return { legs, net };
+}
+
+const fmtTime = (sec) => new Date(sec * 1000).toISOString().slice(5, 16).replace('T', ' ');
+const fmtFundPct = (rate, digits = 4) => (Number.isFinite(rate) ? `${rate >= 0 ? '' : '−'}${Math.abs(rate * 100).toFixed(digits)}%` : '—');
+const signTone = (v) => (v > 0 ? 'pos' : v < 0 ? 'neg' : '');
+
+// 434.3K / 1.2M 这种短写法（美元名义）。
+function compactUsd(v) {
+  const a = Math.abs(v);
+  if (a >= 1e9) return `${(v / 1e9).toFixed(2)}B`;
+  if (a >= 1e6) return `${(v / 1e6).toFixed(2)}M`;
+  if (a >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
+  return v.toFixed(0);
+}
+
+// 距结算还有多久：3h16m / 16m / 45s。
+function fmtCountdown(ms) {
+  if (!Number.isFinite(ms)) return '—';
+  if (ms <= 0) return '结算中';
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`;
+  if (m > 0) return `${m}m`;
+  return `${total}s`;
+}
+
+// 顶部资金费条：每家现在的费率、周期、距结算；最后是快照多久前（纯函数，nowMs 由调用方给）。
+function chartFundingStripHtml(fund, nowMs, loadedAtMs = nowMs) {
+  if (!fund) return '<span class="muted small">资金费 —</span>';
+  const legs = (fund.legs || []).map((leg) => {
+    const c = leg.current;
+    const meta = [leg.interval_h ? `${leg.interval_h}h` : null, c ? `结算${fmtCountdown(c.next_ms - nowMs)}` : null].filter(Boolean).join(' · ');
+    return `<span class="zc-fund-leg"><b>${esc(chartVenueName(leg.venue))}</b> <b class="mono ${c ? signTone(c.rate) : ''}">${c ? fmtFundPct(c.rate) : '—'}</b> <span class="muted mono">${esc(meta)}</span></span>`;
+  });
+  const ages = (fund.legs || []).map((l) => l.current?.age_sec).filter(Number.isFinite);
+  const money = (v) => (Number.isFinite(v) ? compactUsd(v) : '—');
+  const books = (fund.legs || []).filter((l) => Number.isFinite(l.current?.volume_24h) || Number.isFinite(l.current?.open_interest))
+    .map((l) => `<span class="zc-fund-leg muted small"><b>${esc(chartVenueName(l.venue))}</b> 24h ${money(l.current.volume_24h)} · 持仓 ${money(l.current.open_interest)}</span>`);
+  const age = ages.length ? Math.max(...ages) + Math.max(0, Math.round((nowMs - loadedAtMs) / 1000)) : null;
+  return `<span class="muted small">资金费</span>${legs.join('')}${age === null ? '' : `<span class="muted small">${age} 秒前</span>`}`
+    + (books.length ? `<span class="zc-break"></span><span class="muted small">成交额 / 持仓量</span>${books.join('')}` : '');
+}
+
+// 资金费副图下面的合计（纯函数）。
+function chartFundingSummaryHtml(fund) {
+  if (!fund) return '';
+  const name = (venue) => esc(chartVenueName(venue));
+  const out = [];
+  for (const leg of fund.legs || []) {
+    if (leg.error) out.push(`<div class="notice error">${name(leg.venue)} 资金费历史拉不到：${esc(leg.error)}</div>`);
+  }
+  const s = fund.summary;
+  const kind = (k) => (k === 'both' ? '两家同时结算' : k === 'long' ? `仅 ${name(fund.long)} 结算` : `仅 ${name(fund.short)} 结算`);
+  if (s) {
+    const days = s.days >= 1 ? `${Number(s.days.toFixed(2))} 天` : `${Math.round(s.days * 24)} 小时`;
+    // 一家历史更短（上新不久、OKX 只给约 3 个月）：只算两家都有数据的那段。
+    const span = Number.isFinite(fund.days) && s.days < fund.days * 0.99 ? `两家都有数据的 ${days}` : `所选 ${days}`;
+    out.push(`<div>${span}内结算 <b>${s.count}</b> 次（同时 ${s.both} · 仅 ${name(fund.long)} ${s.long_only} · 仅 ${name(fund.short)} ${s.short_only}），`
+      + `按「${name(fund.long)} 多 / ${name(fund.short)} 空」净资金费合计 <b class="mono ${signTone(s.total)}">${fmtFundPct(s.total)}</b>`
+      + `（年化 <b class="mono ${signTone(s.apr)}">${fmtFundPct(s.apr, 2)}</b>，单利、相对单腿名义）</div>`);
+  }
+  const n = fund.next;
+  if (n) {
+    out.push(`<div>下次结算 ${esc(fmtTime(n.t / 1000))} UTC：${kind(n.kind)}，按现在的预测费率净 <b class="mono ${signTone(n.net)}">${fmtFundPct(n.net)}</b></div>`);
+  }
+  const notes = ['历史点是各家已结算的费率（每个结算周期的原始费率，不折算），最后一点是现在的预测费率（下次结算适用）。', ...(fund.notes || [])];
+  out.push(`<div class="muted">${notes.map(esc).join(' ')}</div>`);
+  return out.join('');
+}
+
+// 统计卡片：最高、最低、中位数、当前与当前分位。按显示单位给数。
+function chartStatsHtml(data, unit) {
+  const c = data.chart;
+  const s = c.stats;
+  if (!s) return '<div class="stat"><span>历史</span><b class="dim">两家没有能对上的 K 线</b></div>';
+  const at = (sec) => c.points.find((p) => p.time === sec);
+  const show = (pctValue, sec) => {
+    const p = at(sec);
+    if (unit === 'diff' && p) return `${p.diff >= 0 ? '+' : ''}${p.diff.toFixed(4)}`;
+    return `${pctValue >= 0 ? '+' : ''}${pctValue.toFixed(3)}%`;
+  };
+  const range = unit === 'diff'
+    ? (() => { const vals = c.points.map((p) => p.diff); return `${(Math.max(...vals) - Math.min(...vals)).toFixed(4)}`; })()
+    : `${(s.max_pct - s.min_pct).toFixed(3)}%`;
+  const tone = s.last_percentile >= 80 ? 'pos' : s.last_percentile <= 20 ? 'neg' : '';
+  return [
+    ['最高', `${show(s.max_pct, s.max_at)}`, `${fmtTime(s.max_at)}`],
+    ['最低', `${show(s.min_pct, s.min_at)}`, `${fmtTime(s.min_at)}`],
+    ['高低差', range, `${s.points} 根`],
+    ['中位数', `${s.median_pct >= 0 ? '+' : ''}${s.median_pct.toFixed(3)}%`, `p10 ${s.p10_pct.toFixed(3)}% · p90 ${s.p90_pct.toFixed(3)}%`],
+    ['当前', show(s.last_pct, s.last_at), fmtTime(s.last_at)],
+    ['当前分位', `${s.last_percentile.toFixed(0)}%`, s.last_percentile >= 80 ? '价差偏高：适合开' : s.last_percentile <= 20 ? '价差偏低：开了没空间' : '半山腰'],
+  ].map(([label, value, sub], i) => `<div class="stat"><span>${label}</span><b class="${i === 5 ? tone : ''}">${esc(value)}</b><span class="small muted">${esc(sub)}</span></div>`).join('');
+}
+
+// 图例：一排可点的图层开关，下面一行是十字线所在时刻的读数（纯函数）。
+function chartLegendHtml(pane, layers, names, values = []) {
+  const items = CHART_LAYERS.filter((l) => l.pane === pane).map((l) => {
+    const on = layers[l.key] !== false;
+    return `<button type="button" class="zc-leg${on ? '' : ' off'}" data-layer="${l.key}" title="${on ? '隐藏' : '显示'}"><i class="${l.square ? 'sq' : ''}" style="background:${l.color}"></i>${esc(l.label(names))}</button>`;
+  });
+  const vals = values.filter(Boolean).map(([label, value, tone, color]) => `<span><i style="background:${color || 'transparent'}"></i>${esc(label)} <b class="mono ${tone || ''}">${esc(value)}</b></span>`);
+  return `<div class="zc-leg-row">${items.join('')}</div>${vals.length ? `<div class="zc-vals">${vals.join('')}</div>` : ''}`;
+}
+
+// 价格精度：按价格量级给小数位。
+function chartPricePrecision(price) {
+  const p = Math.abs(price || 0);
+  if (p >= 1000) return 2;
+  if (p >= 10) return 3;
+  if (p >= 1) return 4;
+  if (p >= 0.01) return 6;
+  return 8;
+}
+
+// 时间上 ≤ t 的最后一个点（数据按时间升序）。
+function chartValueAt(series, t) {
+  let lo = 0;
+  let hi = series.length - 1;
+  let found = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (series[mid].time <= t) {
+      found = series[mid];
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return found;
+}
+
+function chartFormFromInputs() {
+  const f = state.chart.form;
+  f.symbol = $('chart-symbol').value.trim().toUpperCase() || f.symbol;
+  f.a = $('chart-a').value;
+  f.b = $('chart-b').value;
+  f.ratio1 = $('chart-ratio1').value;
+  f.ratio2 = $('chart-ratio2').value;
+  f.sma = $('chart-sma').value;
+  f.fee1 = $('chart-fee1').value;
+  f.fee2 = $('chart-fee2').value;
+  f.minProfit = $('chart-min-profit').value;
+  return f;
+}
+
+function saveChartForm() {
+  try {
+    localStorage.setItem(CHART_PARAMS_KEY, JSON.stringify(state.chart.form));
+  } catch {
+    // 存不了就只在本次会话里生效。
+  }
+}
+
+function fillChartControls(f = state.chart.form) {
+  const opt = (v) => `<option value="${esc(v)}">${esc(chartVenueName(v))}</option>`;
+  for (const id of ['chart-a', 'chart-b']) {
+    if (!$(id).options.length) $(id).innerHTML = CHART_VENUES.map(opt).join('');
+  }
+  $('chart-symbol').value = f.symbol;
+  $('chart-a').value = f.a;
+  $('chart-b').value = f.b;
+  $('chart-ratio1').value = f.ratio1;
+  $('chart-ratio2').value = f.ratio2;
+  $('chart-sma').value = f.sma;
+  $('chart-fee1').value = f.fee1;
+  $('chart-fee2').value = f.fee2;
+  $('chart-min-profit').value = f.minProfit;
+  renderChartToolbar();
+}
+
+// 工具栏：方向、历史范围、周期、K 线样式、单位。
+function renderChartToolbar() {
+  const f = state.chart.form;
+  $('chart-dir').innerHTML = `<span class="muted small">价差 方向</span> <b class="pos">${esc(chartVenueName(f.a))} 多</b> <span class="muted">/</span> <b class="neg">${esc(chartVenueName(f.b))} 空</b>`;
+  const days = chartDays(f);
+  $('chart-range').innerHTML = `<span class="muted small">当前 ${days >= 1 ? `${Number(days.toFixed(2))} 天` : `${Math.round(days * 24)} 小时`}</span>`
+    + chartRangeButtons(f).map((b) => `<button type="button" data-days="${b.days}"${b.disabled ? ' disabled' : ''}>${esc(b.label)}</button>`).join('');
+  $('chart-interval').innerHTML = CHART_INTERVALS.map((i) => `<button type="button" data-interval="${i.name}" class="${i.name === f.interval ? 'on' : ''}">${esc(i.label)}</button>`).join('');
+  for (const button of $('chart-kline').querySelectorAll('button')) button.classList.toggle('on', button.dataset.kline === f.kline);
+  for (const button of $('chart-unit').querySelectorAll('button')) button.classList.toggle('on', button.dataset.unit === f.unit);
+  const fee = (i) => state.chart.fund?.legs?.[i]?.current?.taker_fee;
+  $('chart-fee1').placeholder = String(Number.isFinite(fee(0)) ? Number((fee(0) * 100).toFixed(4)) : CHART_FEE1);
+  $('chart-fee2').placeholder = String(Number.isFinite(fee(1)) ? Number((fee(1) * 100).toFixed(4)) : CHART_FEE2);
+  $('chart-sma').placeholder = String(CHART_SMA_MINUTES);
+  $('chart-min-profit').placeholder = String(CHART_MIN_PROFIT);
+  $('chart-fee1-label').textContent = `${chartVenueName(f.a)} 手续费 %`;
+  $('chart-fee2-label').textContent = `${chartVenueName(f.b)} 手续费 %`;
+}
+
+// 参考线用的参数：没填就用扫描快照里的吃单费率，再没有用 zuudot 的默认值。
+function chartRefParams(f) {
+  const fee = (i, fallback) => {
+    const typed = num(f[`fee${i + 1}`]);
+    if (typed !== null && typed >= 0) return typed;
+    const snap = state.chart.fund?.legs?.[i]?.current?.taker_fee;
+    return Number.isFinite(snap) ? snap * 100 : fallback;
+  };
+  const sma = num(f.sma);
+  const minProfit = num(f.minProfit);
+  return {
+    unit: f.unit,
+    intervalMinutes: chartInterval(f.interval).minutes,
+    smaMinutes: sma && sma > 0 ? sma : CHART_SMA_MINUTES,
+    fee1: fee(0, CHART_FEE1),
+    fee2: fee(1, CHART_FEE2),
+    minProfit: minProfit !== null && minProfit >= 0 ? minProfit : CHART_MIN_PROFIT,
+  };
+}
+
+async function loadChart({ silent = false, keepRange = false } = {}) {
+  const c = state.chart;
+  // 后台刷新只重拉已加载的那组，不读输入框：用户可能正改到一半还没点「加载」。
+  const f = silent ? c.form : chartFormFromInputs();
+  if (!silent) saveChartForm();
+  if (f.a === f.b) {
+    $('chart-status').textContent = '两边不能是同一家';
+    return;
+  }
+  const seq = ++c.seq;
+  c.loading = true;
+  if (!silent) $('chart-status').textContent = '加载中…（两家 K 线和资金费各拉一遍，几秒钟）';
+  const [k, fu] = await Promise.all([api(chartQuery(f)), api(fundingQuery(f))]);
+  if (seq !== c.seq) return;
+  c.loading = false;
+  c.key = `${f.symbol}|${f.a}|${f.b}|${f.interval}|${chartDays(f)}|${f.ratio1}|${f.ratio2}`;
+  c.data = k.ok ? k.body : null;
+  c.error = k.ok ? null : k.body.error || '加载失败';
+  c.fund = fu.ok ? fu.body : null;
+  c.fundError = fu.ok ? null : fu.body.error || '资金费加载失败';
+  c.loadedAt = Date.now();
+  const auto = chartAutoRefreshMs(f) === null ? ' · 含 Lighter：不自动刷新，点「加载」更新' : '';
+  $('chart-status').textContent = c.data
+    ? `${chartVenueName(c.data.long)} ${c.data.chart.a_bars} 根 · ${chartVenueName(c.data.short)} ${c.data.chart.b_bars} 根 · 对上 ${c.data.chart.points.length} 根 · ${new Date(c.loadedAt).toLocaleTimeString()} 更新${auto}`
+    : '';
+  if (state.page === 'chart') {
+    const insts = (c.fund?.legs || []).map((l) => l.inst_id);
+    history.replaceState(null, '', `${chartShareUrl(f, insts)}#chart`);
+  }
+  renderChartToolbar();
+  renderChart({ keepRange });
+}
+
+function renderChartHead() {
+  const c = state.chart;
+  const f = c.form;
+  const base = String(f.symbol || '').toUpperCase();
+  const insts = [0, 1].map((i) => c.fund?.legs?.[i]?.inst_id || chartInstGuess(i ? f.b : f.a, base));
+  $('chart-title').textContent = base || '—';
+  $('chart-insts').textContent = `${chartVenueName(f.a)}: ${insts[0]} / ${chartVenueName(f.b)}: ${insts[1]}`;
+  $('chart-funding-strip').innerHTML = c.fundError
+    ? `<span class="muted small">资金费</span><span class="neg small">${esc(c.fundError)}</span>`
+    : chartFundingStripHtml(c.fund, Date.now(), c.loadedAt || Date.now());
+}
+
+// 净资金费结算柱（lightweight-charts 自定义序列）：柱宽不随 K 线间距变窄（至少 6px，否则 5 分钟线上
+// 每小时一根的结算柱只有 1px，看不见），并画一条淡淡的零线。与 zuudot 的画法一致。
+class ChartNetBars {
+  constructor(LW) {
+    this.LW = LW;
+    this.data = null;
+  }
+
+  renderer() {
+    return { draw: (target, priceToCoordinate) => this.draw(target, priceToCoordinate) };
+  }
+
+  update(data) {
+    this.data = data;
+  }
+
+  priceValueBuilder(item) {
+    return [0, item.value];
+  }
+
+  isWhitespace(item) {
+    return !Number.isFinite(item.value);
+  }
+
+  defaultOptions() {
+    return { ...this.LW.customSeriesDefaultOptions, color: CHART_COLOR.netPos };
+  }
+
+  draw(target, priceToCoordinate) {
+    const zero = priceToCoordinate(0);
+    if (zero === null || !this.data?.visibleRange) return;
+    target.useBitmapCoordinateSpace(({ context, bitmapSize, horizontalPixelRatio: hr, verticalPixelRatio: vr }) => {
+      const z = Math.round(zero * vr);
+      context.save();
+      context.globalAlpha = 0.4;
+      context.fillStyle = '#94a3b8';
+      context.fillRect(0, z, bitmapSize.width, Math.max(1, Math.round(vr)));
+      context.restore();
+      const half = (Math.max(6, this.data.barSpacing * 0.88) * hr) / 2;
+      const { from, to } = this.data.visibleRange;
+      for (let i = from; i < to; i += 1) {
+        const bar = this.data.bars[i];
+        const y = priceToCoordinate(bar.originalData.value);
+        if (y === null) continue;
+        const top = Math.round(Math.min(y, zero) * vr);
+        const height = Math.max(1, Math.round(Math.abs(y - zero) * vr));
+        // 按正负取色：lightweight-charts 不把自定义序列数据里的 color 原样留在 originalData 里。
+        context.fillStyle = bar.originalData.value >= 0 ? CHART_COLOR.netPos : CHART_COLOR.netNeg;
+        context.fillRect(Math.round(bar.x * hr - half), top, Math.max(1, Math.round(half * 2)), height);
+      }
+    });
+  }
+}
+
+function renderChart({ keepRange = false } = {}) {
+  const c = state.chart;
+  const f = c.form;
+  const data = c.data;
+  const fund = c.fund;
+  renderChartHead();
+  $('chart-stats').innerHTML = data ? chartStatsHtml(data, f.unit) : '';
+  $('chart-notes').innerHTML = [
+    c.error ? `<div class="notice error">K 线：${esc(c.error)}</div>` : '',
+    ...(data?.chart?.notes || []).map((n) => `<div class="notice">${esc(n)}</div>`),
+  ].join('');
+  $('chart-funding-summary').innerHTML = c.fundError ? `<div class="notice error">资金费：${esc(c.fundError)}</div>` : chartFundingSummaryHtml(fund);
+  let range = null;
+  if (c.main) {
+    if (keepRange) range = c.main.timeScale().getVisibleLogicalRange();
+    c.main.remove();
+    c.main = null;
+  }
+  if (c.resize) {
+    c.resize.disconnect();
+    c.resize = null;
+  }
+  $('chart-legend').innerHTML = '';
+  $('chart-funding-legend').innerHTML = '';
+  if (!data && !fund) return;
+  const LW = globalThis.LightweightCharts;
+  if (!LW) {
+    $('chart-notes').innerHTML += '<div class="notice error">图表库没加载上（/vendor/lightweight-charts.js）</div>';
+    return;
+  }
+  const layers = f.layers;
+  const names = { a: chartVenueName(data?.long || fund?.long || f.a), b: chartVenueName(data?.short || fund?.short || f.b) };
+  const root = getComputedStyle(document.documentElement);
+  const textColor = root.getPropertyValue('--text-3').trim() || '#9aa4b2';
+  const gridColor = 'rgba(128, 128, 128, 0.12)';
+  const chart = LW.createChart($('chart-main'), {
+    autoSize: true,
+    layout: {
+      background: { color: 'transparent' },
+      textColor,
+      fontSize: 11,
+      panes: { separatorColor: 'rgba(128, 128, 128, 0.3)', separatorHoverColor: 'rgba(74, 159, 200, 0.35)', enableResize: true },
+    },
+    grid: { vertLines: { color: gridColor }, horzLines: { color: gridColor } },
+    crosshair: { mode: LW.CrosshairMode.Normal },
+    timeScale: { timeVisible: true, secondsVisible: false, rightOffset: 4, borderVisible: false },
+    rightPriceScale: { visible: true, borderVisible: false },
+    leftPriceScale: { visible: true, borderVisible: false },
+  });
+  c.main = chart;
+
+  const pts = data?.chart?.points || [];
+  const unitFmt = f.unit === 'diff' ? (v) => v.toFixed(4) : (v) => `${v.toFixed(3)}%`;
+  const spreadFormat = { type: 'custom', formatter: unitFmt, minMove: f.unit === 'diff' ? 0.0001 : 0.001 };
+  const pricePrecision = chartPricePrecision(pts[pts.length - 1]?.a);
+  const priceFormat = { type: 'price', precision: pricePrecision, minMove: 10 ** -pricePrecision };
+  const lookups = [];
+
+  // 主图：两家 K 线（左轴）。
+  for (const [key, candles, color] of [['klineA', data?.candles_a, CHART_COLOR.klineA], ['klineB', data?.candles_b, CHART_COLOR.klineB]]) {
+    if (!candles?.length || !layers[key]) continue;
+    const label = key === 'klineA' ? names.a : names.b;
+    if (f.kline === 'candle') {
+      const s = chart.addSeries(LW.CandlestickSeries, {
+        priceScaleId: 'left', upColor: color.up, downColor: color.down, borderVisible: false,
+        wickUpColor: color.up, wickDownColor: color.down, priceFormat, lastValueVisible: true, priceLineVisible: false, title: label,
+      }, 0);
+      s.setData(candles);
+      lookups.push({ pane: 0, label, color: color.dot, data: candles, value: (p) => p.close, fmt: (v) => v.toFixed(pricePrecision), exact: true });
+    } else {
+      const line = candles.map((x) => ({ time: x.time, value: x.close }));
+      const s = chart.addSeries(LW.LineSeries, { priceScaleId: 'left', color: color.line, lineWidth: 1, priceFormat, priceLineVisible: false, title: label }, 0);
+      s.setData(line);
+      lookups.push({ pane: 0, label, color: color.dot, data: line, value: (p) => p.value, fmt: (v) => v.toFixed(pricePrecision), exact: true });
+    }
+  }
+  // 主图：价差与参考线（右轴）。
+  if (pts.length) {
+    const pick = (p) => (f.unit === 'diff' ? p.diff : p.pct);
+    const ref = chartRefLines(pts, chartRefParams(f));
+    if (layers.spread) {
+      const line = pts.map((p) => ({ time: p.time, value: pick(p) }));
+      const s = chart.addSeries(LW.LineSeries, { priceScaleId: 'right', color: CHART_COLOR.spread, lineWidth: 2, priceFormat: spreadFormat, priceLineVisible: false, title: '价差' }, 0);
+      s.setData(line);
+      const st = data.chart.stats;
+      if (layers.levels && st) {
+        const at = (sec) => pts.find((p) => p.time === sec);
+        const level = (pctValue, sec) => (f.unit === 'diff' ? (at(sec)?.diff ?? 0) : pctValue);
+        const median = f.unit === 'diff' ? (() => { const v = pts.map((p) => p.diff).sort((x, y) => x - y); return v[Math.floor(v.length / 2)]; })() : st.median_pct;
+        for (const [price, title, color] of [[level(st.max_pct, st.max_at), '最高', '#26a69a'], [median, '中位数', CHART_COLOR.levels], [level(st.min_pct, st.min_at), '最低', '#ef5350']]) {
+          s.createPriceLine({ price, color, lineWidth: 1, lineStyle: LW.LineStyle.Dashed, axisLabelVisible: true, title });
+        }
+      }
+      lookups.push({ pane: 0, label: '价差', color: CHART_COLOR.spread, data: line, value: (p) => p.value, fmt: unitFmt, exact: true, tone: true });
+    }
+    for (const [key, series, title] of [['openLine', ref.open, '开'], ['closeLine', ref.close, '关']]) {
+      if (!layers[key]) continue;
+      const s = chart.addSeries(LW.LineSeries, { priceScaleId: 'right', color: CHART_COLOR[key], lineWidth: 1, priceFormat: spreadFormat, priceLineVisible: false, crosshairMarkerVisible: false, title }, 0);
+      s.setData(series);
+      lookups.push({ pane: 0, label: key === 'openLine' ? '开仓参考' : '关仓参考', color: CHART_COLOR[key], data: series, value: (p) => p.value, fmt: unitFmt, exact: true });
+    }
+  }
+  // 资金费窗格：两家费率（右轴）、结算点、净结算柱（左轴）。
+  const intervalSec = chartInterval(f.interval).minutes * 60;
+  const fs = chartFundingSeries(fund, intervalSec, Math.floor((c.loadedAt || Date.now()) / 1000));
+  const fundFmt = (v) => `${v.toFixed(4)}%`;
+  const fundFormat = { type: 'custom', formatter: fundFmt, minMove: 0.0001 };
+  let fundingPane = false;
+  fs.legs.forEach((leg, i) => {
+    const key = i === 0 ? 'fundA' : 'fundB';
+    if (!layers[key] || !leg.line.length) return;
+    const color = CHART_COLOR[key];
+    const s = chart.addSeries(LW.LineSeries, { priceScaleId: 'right', color, lineWidth: 2, priceFormat: fundFormat, priceLineVisible: false, title: '' }, 1);
+    s.setData(leg.line);
+    if (layers.marks && leg.marks.length) {
+      LW.createSeriesMarkers(s, leg.marks.map((time) => ({ time, position: 'inBar', shape: 'circle', color, size: 0.5 })));
+    }
+    fundingPane = true;
+    lookups.push({ pane: 1, label: i === 0 ? names.a : names.b, color, data: leg.line, value: (p) => p.value, fmt: fundFmt, exact: false, tone: true });
+  });
+  if (layers.net && fs.net.length) {
+    const s = typeof chart.addCustomSeries === 'function'
+      ? chart.addCustomSeries(new ChartNetBars(LW), { priceScaleId: 'left', priceFormat: fundFormat, priceLineVisible: false, lastValueVisible: false }, 1)
+      : chart.addSeries(LW.HistogramSeries, { priceScaleId: 'left', priceFormat: fundFormat, priceLineVisible: false, lastValueVisible: false, base: 0 }, 1);
+    s.setData(fs.net);
+    fundingPane = true;
+    lookups.push({ pane: 1, label: '净', color: CHART_COLOR.netPos, data: fs.net, value: (p) => p.value, fmt: fundFmt, exact: true, tone: true });
+  }
+  const panes = chart.panes();
+  if (panes.length > 1) {
+    panes[0].setStretchFactor(3);
+    panes[1].setStretchFactor(2);
+  }
+  if (range) chart.timeScale().setVisibleLogicalRange(range);
+  else chart.timeScale().fitContent();
+
+  // 图例与读数。
+  const lastTime = Math.max(0, ...lookups.map((l) => l.data[l.data.length - 1]?.time || 0));
+  const legend = (time) => {
+    const t = time ?? lastTime;
+    const values = (pane) => [
+      pane === 0 ? ['', `${fmtTime(t)} UTC`, '', null] : null,
+      ...lookups.filter((l) => l.pane === pane).map((l) => {
+        const p = l.exact ? l.data.find((x) => x.time === t) || (time === undefined || time === null ? l.data[l.data.length - 1] : null) : chartValueAt(l.data, t);
+        if (!p) return null;
+        const v = l.value(p);
+        return [l.label, l.fmt(v), l.tone ? signTone(v) : '', l.color];
+      }),
+    ];
+    $('chart-legend').innerHTML = chartLegendHtml(0, layers, names, values(0));
+    $('chart-funding-legend').innerHTML = fund || c.fundError ? chartLegendHtml(1, layers, names, values(1)) : '';
+    placeFundingLegend();
+  };
+  const placeFundingLegend = () => {
+    const ps = chart.panes();
+    const el = $('chart-funding-legend');
+    el.hidden = ps.length < 2 && !fund;
+    el.style.top = ps.length > 1 ? `${ps[0].getHeight() + 6}px` : 'auto';
+    el.style.bottom = ps.length > 1 ? 'auto' : '30px';
+  };
+  chart.subscribeCrosshairMove((param) => legend(param.time));
+  legend(null);
+  if (!fundingPane && fund) placeFundingLegend();
+  c.resize = new ResizeObserver(() => placeFundingLegend());
+  c.resize.observe($('chart-main'));
+}
+
+// 图例上的图层开关。
+function toggleChartLayer(key) {
+  const layers = state.chart.form.layers;
+  if (!(key in layers)) return;
+  layers[key] = !layers[key];
+  saveChartForm();
+  renderChart({ keepRange: true });
+}
+
+// 自动重拉的间隔（纯函数）：至少 1 分钟、至少一根 K 线；有一腿是 Lighter 就不自动重拉（null）——
+// 它的公开额度很紧，而且和实盘交易共用同一个 IP，K 线一拉就是好几页。
+function chartAutoRefreshMs(f) {
+  if ([f.a, f.b].some((v) => v === 'lighter' || v === 'lighter-rh')) return null;
+  return Math.max(CHART_REFRESH_MS, chartInterval(f.interval).minutes * 60000);
+}
+
+// 图表页：按 chartAutoRefreshMs 重拉（服务端 K 线缓存 1 分钟、资金费缓存 5 分钟），资金费条每秒走一次倒计时。
+function scheduleChart() {
+  const c = state.chart;
+  clearInterval(c.timer);
+  clearInterval(c.tick);
+  c.timer = null;
+  c.tick = null;
+  if (state.page !== 'chart') return;
+  c.timer = setInterval(() => {
+    const every = c.form ? chartAutoRefreshMs(c.form) : null;
+    if (every === null || document.hidden || state.page !== 'chart' || c.loading || !(c.data || c.fund)) return;
+    if (Date.now() - c.loadedAt < every - 1000) return;
+    loadChart({ silent: true, keepRange: true }).catch(() => {});
+  }, CHART_REFRESH_MS);
+  c.tick = setInterval(() => {
+    if (!document.hidden && state.page === 'chart' && c.fund) renderChartHead();
+  }, 1000);
+}
+
+function wireChart() {
+  state.chart.form = state.chart.form || chartDefaults();
+  fillChartControls(state.chart.form);
+  $('chart-load').addEventListener('click', () => loadChart());
+  $('chart-symbol').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') loadChart();
+  });
+  $('chart-swap').addEventListener('click', () => {
+    const f = chartFormFromInputs();
+    [f.a, f.b] = [f.b, f.a];
+    [f.ratio1, f.ratio2] = [f.ratio2, f.ratio1];
+    [f.fee1, f.fee2] = [f.fee2, f.fee1];
+    fillChartControls(f);
+    loadChart();
+  });
+  $('chart-interval').addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-interval]');
+    if (!button) return;
+    state.chart.form.interval = button.dataset.interval;
+    state.chart.form.days = '';
+    renderChartToolbar();
+    loadChart();
+  });
+  $('chart-range').addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-days]');
+    if (!button || button.disabled) return;
+    state.chart.form.days = button.dataset.days;
+    renderChartToolbar();
+    loadChart();
+  });
+  for (const [id, field] of [['chart-kline', 'kline'], ['chart-unit', 'unit']]) {
+    $(id).addEventListener('click', (event) => {
+      const button = event.target.closest('button');
+      if (!button) return;
+      state.chart.form[field] = button.dataset[field];
+      saveChartForm();
+      renderChartToolbar();
+      renderChart({ keepRange: true });
+    });
+  }
+  for (const id of ['chart-sma', 'chart-fee1', 'chart-fee2', 'chart-min-profit']) {
+    $(id).addEventListener('change', () => {
+      chartFormFromInputs();
+      saveChartForm();
+      renderChart({ keepRange: true });
+    });
+  }
+  $('chart-share').addEventListener('click', async () => {
+    const f = chartFormFromInputs();
+    const url = new URL(chartShareUrl(f, (state.chart.fund?.legs || []).map((l) => l.inst_id)), location.href).href;
+    try {
+      await navigator.clipboard.writeText(url);
+      $('chart-status').textContent = '链接已复制（zuudot 同款参数）';
+    } catch {
+      $('chart-status').textContent = url;
+    }
+  });
+  for (const id of ['chart-legend', 'chart-funding-legend']) {
+    $(id).addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-layer]');
+      if (button) toggleChartLayer(button.dataset.layer);
+    });
+  }
+}
+
+// 从价差监控页的一行跳过来：带上这组的两家与合约，多 = 现在建议做多的那家。
+function openChartFor(line) {
+  const legs = rhLegs(line) || { long: line.a, short: line.b };
+  Object.assign(state.chart.form, { symbol: line.base, a: legs.long, b: legs.short, ratio1: '1', ratio2: '1', fee1: '', fee2: '' });
+  fillChartControls(state.chart.form);
+  state.chart.data = null;
+  state.chart.fund = null;
+  showPage('chart');
 }
 
 // ───────────────────────────── 价差监控（RH 价差页） ─────────────────────────────
@@ -2737,7 +4286,8 @@ function renderPositions() {
 // 按「组」监控：每组两家 a / b，基差 = (a − b) / 均值，方向 long_a = 多 a 空 b、long_b = 多 b 空 a。
 
 const VENUE_LABEL = {
-  arcus: 'Arcus', 'lighter-rh': 'RH', hyperliquid: 'HL', 'hyperliquid-xyz': 'HL-xyz', 'hyperliquid-io': 'HL-io',
+  arcus: 'Arcus', 'lighter-rh': 'RH', hyperliquid: 'HL', 'hyperliquid-xyz': 'HL-xyz', 'hyperliquid-io': 'HL-io', binance: 'BN',
+  lighter: 'Lighter', gate: 'Gate', bitget: 'Bitget', ondo: 'Ondo', popdex: 'PopDEX', mexc: 'MEXC', aster: 'Aster',
 };
 const venueLabel = (venue) => VENUE_LABEL[venue] || venue;
 const pairLabel = (line) => `${venueLabel(line.a)} ↔ ${venueLabel(line.b)}`;
@@ -2767,7 +4317,41 @@ function rhBestLeg(line) {
   return direction ? line[direction] : null;
 }
 
+// 只观察的行（Binance）：挂单测算里更好的那个方向（按「回到正常」吃单退出的净收益，没有就按入场价差）。
+function rhMakerBest(line) {
+  const maker = line.maker;
+  if (!maker) return null;
+  const score = (leg) => (leg ? num(leg.net_to_normal_taker_exit_pct) ?? num(leg.entry_pct) : null);
+  const options = [['long_a', maker.long_a], ['long_b', maker.long_b]].filter(([, leg]) => leg);
+  if (!options.length) return null;
+  options.sort((x, y) => (score(y[1]) ?? -Infinity) - (score(x[1]) ?? -Infinity));
+  const [direction, leg] = options[0];
+  const legs = rhLegs(line, direction);
+  const side = legs.long === maker.venue ? '多' : '空';
+  return { direction, leg, legs, side, maker };
+}
+
+function rhMakerText(line) {
+  const best = rhMakerBest(line);
+  if (!best) return '';
+  const { leg, side, maker } = best;
+  const nets = leg.net_to_normal_taker_exit_pct == null
+    ? '回到正常：等正常基差样本'
+    : `回到正常 ${pctRaw(leg.net_to_normal_taker_exit_pct, 3)}（吃单平，费 ${num(maker.fee_taker_exit_pct)}%）/ ${pctRaw(leg.net_to_normal_maker_exit_pct, 3)}（挂单平，费 ${num(maker.fee_maker_exit_pct)}%）`;
+  return `<div class="small muted" title="假设在 ${esc(venueLabel(maker.venue))} 挂单（做多挂买一、做空挂卖一）、另一家按深度吃单对冲；只是测算，不下单">挂单测算：${side} ${esc(venueLabel(maker.venue))} @${esc(String(num(leg.price)))}，入场 ${pctRaw(leg.entry_pct, 3)}；${nets}</div>`;
+}
+
 function rhStatus(line, view) {
+  if (line.watch_only) {
+    const base = '<span class="tag pc-pending" title="观察组：这家还没有实盘账户，只攒价差历史，不提醒、不交易">观察</span>';
+    if (line.note) return `${base} <span class="muted small">${esc(line.note)}</span>`;
+    if (line.normal == null) return `${base} <span class="muted small">攒样本 还差 ${line.normal_missing_minutes} 分钟</span>`;
+    return line.best?.signal ? `${base} <span class="pos small" title="达到提醒门槛（观察组不推送）">够门槛</span>` : base;
+  }
+  if (line.observe_only) {
+    const base = '<span class="tag pc-pending" title="Binance 的组只观察：不提醒、不自动交易；按挂单（0 费率）测算，并记录虚拟挂单被成交后的对冲收益">仅观察</span>';
+    return line.note ? `${base} <span class="muted small">${esc(line.note)}</span>` : base;
+  }
   if (line.note) return `<span class="muted">${esc(line.note)}</span>`;
   if (line.normal == null) {
     return `<span class="tag pc-pending" title="同一时段至少要 ${view.min_minutes} 分钟样本才给正常水平；在那之前不提醒">攒样本 还差 ${line.normal_missing_minutes} 分钟</span>`;
@@ -2790,8 +4374,14 @@ function rhRow(line, view) {
   const net = leg?.net_to_normal_pct;
   const usdText = line.best?.net_usdt == null ? '' : ` <span class="muted small">≈ ${pnlUsd(line.best.net_usdt)}</span>`;
   const fee = line.fee_round_trip_pct == null ? '' : ` · 往返费 ${num(line.fee_round_trip_pct)}%`;
-  return `<tr class="${line.best?.signal ? 'rh-signal' : ''}" data-rh-pair="${esc(line.pair)}" data-rh-base="${esc(line.base)}" title="点击打开下单界面：带上方向和回到正常基差的收敛目标（仍需预览确认）">
-    <td><b>${esc(line.base)}</b> <span class="muted small">${esc((line.category || '').toLowerCase())}</span><br><span class="muted small">${esc(pairLabel(line))}${esc(fee)}</span></td>
+  const signal = line.best?.signal && !line.observe_only && !line.watch_only;
+  const title = line.watch_only
+    ? '观察组：这家还没有实盘账户，不从这里下单'
+    : line.observe_only
+      ? '只观察：Binance 的组按挂单测算，不从这里下单'
+      : '点击打开下单界面：带上方向和回到正常基差的收敛目标（仍需预览确认）';
+  return `<tr class="${signal ? 'rh-signal' : ''}" data-rh-pair="${esc(line.pair)}" data-rh-base="${esc(line.base)}" title="${esc(title)}">
+    <td><b>${esc(line.base)}</b> <span class="muted small">${esc((line.category || '').toLowerCase())}</span>${CHART_VENUES.includes(line.a) && CHART_VENUES.includes(line.b) ? ' <a href="#chart" class="small" data-rh-chart title="看这组的历史价差 K 线">历史价差</a>' : ''}<br><span class="muted small">${esc(pairLabel(line))}${esc(fee)}</span></td>
     <td>${esc(RH_SESSION[line.session] || line.session)}</td>
     <td class="num ${cls(line.basis_pct)}">${pctRaw(line.basis_pct, 3)}</td>
     <td class="num">${normalText}</td>
@@ -2799,7 +4389,7 @@ function rhRow(line, view) {
     <td>${line.best ? esc(rhDirectionText(line) || line.best.direction) : '<span class="muted">—</span>'}</td>
     <td class="num">${leg ? `${pctRaw(leg.entry_pct, 3)} <span class="muted small" title="平仓穿价">−${pctRaw(leg.exit_cross_pct, 3).replace('+', '')}</span>` : '—'}</td>
     <td class="num ${cls(leg?.net_to_zero_pct)}">${leg ? pctRaw(leg.net_to_zero_pct, 3) : '—'}</td>
-    <td class="num ${cls(net)}">${net == null ? '<span class="muted">—</span>' : pctRaw(net, 3)}${usdText}</td>
+    <td class="num ${cls(net)}">${net == null ? '<span class="muted">—</span>' : pctRaw(net, 3)}${usdText}${rhMakerText(line)}</td>
     <td>${rhStatus(line, view)}</td>
   </tr>`;
 }
@@ -2877,6 +4467,66 @@ function openRhInStrategy(line) {
   showPage('strategy');
 }
 
+// 「显示观察组」：存在本机，默认不显示。
+function rhShowWatch() {
+  try {
+    return localStorage.getItem('arb-web-rh-watch') === '1';
+  } catch {
+    return Boolean(state.rhWatch);
+  }
+}
+
+function setRhShowWatch(on) {
+  state.rhWatch = on;
+  try {
+    localStorage.setItem('arb-web-rh-watch', on ? '1' : '0');
+  } catch {
+    // 存不了就只在本次会话里生效。
+  }
+  reloadRhSpread();
+}
+
+// 「显示行数」：只取净收益最高的前 N 行（0 = 全部）。存在本机，默认 100 —— 整份两千多行每 3 秒重画一次会把页面拖卡。
+const RH_LIMITS = ['50', '100', '300', '0'];
+function rhLimit() {
+  let value = state.rhLimit;
+  try {
+    value = localStorage.getItem('arb-web-rh-limit') || value;
+  } catch {
+    // 读不了就用本次会话里的。
+  }
+  return RH_LIMITS.includes(value) ? value : '100';
+}
+
+function setRhLimit(value) {
+  state.rhLimit = value;
+  try {
+    localStorage.setItem('arb-web-rh-limit', value);
+  } catch {
+    // 存不了就只在本次会话里生效。
+  }
+  reloadRhSpread();
+}
+
+// 筛选变了：马上按新条件取一次（筛选在服务端做）。
+function reloadRhSpread() {
+  loadRhSpread().catch((error) => {
+    $('rh-notice').__html = null;
+    $('rh-notice').innerHTML = `<div class="notice error">取数失败：${esc(error.message)}</div>`;
+  });
+}
+
+// 这次取数带的筛选参数。选了某一组时总是带上观察组的行（选中的可能就是观察组；不是的话服务端按组筛完也没有）。
+function rhQuery() {
+  const params = new URLSearchParams();
+  const pair = rhPairFilter();
+  if (pair !== 'all') params.set('pair', pair);
+  if ($('rh-signal-only').checked) params.set('signal', '1');
+  if (rhShowWatch() || pair !== 'all') params.set('watch', '1');
+  params.set('limit', rhLimit());
+  return params;
+}
+
 // 组选择：全部 / 某一组。存在本机。
 function rhPairFilter() {
   try {
@@ -2893,7 +4543,7 @@ function setRhPairFilter(value) {
   } catch {
     // 存不了就只在本次会话里生效。
   }
-  renderRhSpread();
+  reloadRhSpread();
 }
 
 function renderRhSpread() {
@@ -2903,46 +4553,122 @@ function renderRhSpread() {
   const dot = (ok, name) => `<span class="${ok ? 'pos' : 'neg'}">${ok ? '●' : '○'} ${esc(name)}</span>`;
   const venues = Object.entries(conn.venues || {});
   $('rh-status').innerHTML = `${venues.map(([venue, up]) => dot(up, venueLabel(venue))).join(' · ')} · 更新于 ${when(view.updated_at)}${conn.reconnects ? ` · 重连 ${conn.reconnects} 次` : ''}`;
-  const pairs = view.pairs || [];
+  const tradingPairs = view.pairs || [];
+  const watchPairs = view.watch?.pairs || [];
+  const showWatch = rhShowWatch();
+  const watchBox = $('rh-watch');
+  if (watchBox) {
+    watchBox.checked = showWatch;
+    watchBox.closest('label').hidden = !watchPairs.length;
+  }
+  const pairs = tradingPairs.concat(watchPairs);
   const filter = pairs.some((p) => p.id === rhPairFilter()) ? rhPairFilter() : 'all';
+  const watchFilter = watchPairs.some((p) => p.id === filter);
   const select = $('rh-pair');
   if (select) {
-    select.innerHTML = [`<option value="all">全部组（${pairs.length}）</option>`]
-      .concat(pairs.map((p) => `<option value="${esc(p.id)}"${p.id === filter ? ' selected' : ''}>${esc(`${venueLabel(p.a)} ↔ ${venueLabel(p.b)}`)}（${p.markets}）</option>`))
+    const option = (p) => `<option value="${esc(p.id)}"${p.id === filter ? ' selected' : ''}>${esc(`${venueLabel(p.a)} ↔ ${venueLabel(p.b)}`)}（${p.markets}）${p.watch_only ? ' · 观察' : ''}</option>`;
+    select.innerHTML = [`<option value="all">全部组（${tradingPairs.length}${showWatch && watchPairs.length ? ` + 观察 ${watchPairs.length}` : ''}）</option>`]
+      .concat(tradingPairs.map(option))
+      .concat(watchPairs.length ? [`<optgroup label="观察组（没有实盘账户）">${watchPairs.map(option).join('')}</optgroup>`] : [])
       .join('');
     select.value = filter;
   }
-  const all = view.lines || [];
-  const lines = filter === 'all' ? all : all.filter((l) => l.pair === filter);
-  const signals = lines.filter((l) => l.best?.signal);
+  const limitSelect = $('rh-limit');
+  if (limitSelect) limitSelect.value = rhLimit();
+  // 组、只看信号、观察组、行数都在服务端筛好了（见 rhQuery）：这里拿到的就是要显示的行，按净收益从高到低。
+  // 观察组的行默认不带：勾了「显示观察组」或选中某个观察组才有。
+  // 服务端本来就不带观察组的行；这里再挡一次（老接口、缓存的旧响应也不会让观察组悄悄冒出来）。
+  // 选中了某一组就只留这一组的行（同上：服务端已经筛过，这里是兜底）。
+  const shown = (view.lines || [])
+    .concat(showWatch || watchFilter ? view.watch?.lines || [] : [])
+    .filter((l) => filter === 'all' || l.pair === filter);
+  // 总数由服务端数（只观察的组和观察组不算信号）；老接口没有 counts 时退回数返回的行。
+  const counts = view.counts || { lines: shown.length, signals: shown.filter((l) => l.best?.signal && !l.observe_only && !l.watch_only).length, shown: shown.length };
   $('rh-stats').innerHTML = [
-    ['合约', String(lines.length), ''],
-    ['当前信号', String(signals.length), signals.length ? 'pos' : 'dim'],
+    ['合约', String(counts.lines), ''],
+    ['当前信号', String(counts.signals), counts.signals ? 'pos' : 'dim'],
     ['估算名义', `$${num(view.size_usdt).toLocaleString('en-US')}`, ''],
     ['提醒门槛', `≥ ${num(view.alert_net_pct)}%`, ''],
   ].map(([label, value, tone]) => `<div class="stat"><span>${label}</span><b class="${tone}">${esc(value)}</b></div>`).join('');
-  const shownPairs = filter === 'all' ? pairs : pairs.filter((p) => p.id === filter);
+  const shownPairs = filter === 'all' ? tradingPairs : tradingPairs.filter((p) => p.id === filter);
   const feeText = (p) => p.fee_min_pct == null ? '—' : num(p.fee_min_pct) === num(p.fee_max_pct) ? `${num(p.fee_min_pct)}%` : `${num(p.fee_min_pct)}% ~ ${num(p.fee_max_pct)}%`;
-  const pairRows = shownPairs.map((p) => `<li><b>${esc(`${venueLabel(p.a)} ↔ ${venueLabel(p.b)}`)}</b>：${p.markets} 个合约，往返手续费 ${esc(feeText(p))}，已攒历史 ${(p.history_minutes / 60).toFixed(1)} 小时${rhAutoTradable(p) ? '，<span class="pos">可自动交易</span>' : '，只监控（实盘没连这两家）'}${p.note ? ` <span class="muted">（${esc(p.note)}）</span>` : ''}</li>`).join('');
+  const pairRows = shownPairs.map((p) => `<li><b>${esc(`${venueLabel(p.a)} ↔ ${venueLabel(p.b)}`)}</b>：${p.markets} 个合约，往返手续费 ${esc(feeText(p))}，已攒历史 ${(p.history_minutes / 60).toFixed(1)} 小时${p.observe_only ? '，<span class="muted">只观察（挂单测算，不提醒、不自动交易）</span>' : rhAutoTradable(p) ? '，<span class="pos">可自动交易</span>' : '，只监控（实盘没连这两家）'}${p.note ? ` <span class="muted">（${esc(p.note)}）</span>` : ''}</li>`).join('');
   const notices = [];
   if (view.error) notices.push(`<div class="notice error">${esc(view.error)}</div>`);
-  if (pairRows) notices.push(`<div class="notice"><ul>${pairRows}</ul><span class="small muted">基差 = (左 − 右) / 均值。每个合约每个时段至少 ${view.min_minutes} 分钟样本才算出「正常基差」并开始提醒（窗口 ${view.window_days} 天）；在那之前只显示「收敛到 0」的估算，对股票类合约通常偏乐观。往返费按基础档上限算（HL 子交易所含 growth mode 折扣与 Entropy 返佣设置）。</span></div>`);
-  $('rh-notice').innerHTML = notices.join('');
-  const shown = $('rh-signal-only').checked ? signals : lines;
-  $('rh-rows').innerHTML = shown.map((line) => rhRow(line, view)).join('');
-  for (const tr of $('rh-rows').querySelectorAll('tr[data-rh-base]')) {
-    tr.addEventListener('click', () => {
-      const line = (state.rh?.lines || []).find((l) => l.base === tr.getAttribute('data-rh-base') && l.pair === tr.getAttribute('data-rh-pair'));
-      if (line) openRhInStrategy(line);
-    });
+  const shownWatch = filter === 'all' ? watchPairs : watchPairs.filter((p) => p.id === filter);
+  if (shownWatch.length && (showWatch || watchFilter)) {
+    const watchRows = shownWatch.map((p) => `<li>${esc(`${venueLabel(p.a)} ↔ ${venueLabel(p.b)}`)}：${p.markets} 个合约，往返手续费 ${esc(feeText(p))}，已攒历史 ${(p.history_minutes / 60).toFixed(1)} 小时${p.note ? ` <span class="muted">（${esc(p.note)}）</span>` : ''}</li>`).join('');
+    const total = shownWatch.reduce((n, p) => n + p.markets, 0);
+    notices.push(`<div class="notice"><details><summary><b>观察组</b> ${shownWatch.length} 组 · ${total} 个合约：这些场所还没有实盘账户，只攒价差历史（攒够一周后按历史统计信号次数和扣费后的净额，再决定要不要接），<b>不提醒、不交易</b>。每秒算一次。</summary><ul>${watchRows}</ul></details></div>`);
   }
-  $('rh-empty').textContent = shown.length ? '' : (lines.length ? '当前没有信号。' : '等待行情…');
+  if (pairRows) notices.push(`<div class="notice"><ul>${pairRows}</ul><span class="small muted">基差 = (左 − 右) / 均值。每个合约每个时段至少 ${view.min_minutes} 分钟样本才算出「正常基差」并开始提醒（窗口 ${view.window_days} 天）；在那之前只显示「收敛到 0」的估算，对股票类合约通常偏乐观。往返费按基础档上限算（HL 子交易所含 growth mode 折扣与 Entropy 返佣设置）。</span></div>`);
+  const makerHtml = rhMakerSummaryHtml(view.maker, filter, view.maker_fills);
+  if (makerHtml) notices.push(makerHtml);
+  setHtmlIfChanged($('rh-notice'), notices.join(''));
+  setHtmlIfChanged($('rh-rows'), shown.map((line) => rhRow(line, view)).join(''));
+  const matching = $('rh-signal-only').checked ? counts.signals : counts.lines;
+  $('rh-empty').textContent = shown.length
+    ? (shown.length < matching ? `只显示净收益最高的前 ${shown.length} 行（共 ${matching} 行）。要看其余的：选某一组，或把「显示行数」调大。` : '')
+    : (counts.lines ? '当前没有信号。' : '等待行情…');
+}
+
+// 内容没变就不动 DOM：每 3 秒整表重写会打断选中、滚动和悬停提示，也白白重排。
+function setHtmlIfChanged(node, html) {
+  if (!node || node.__html === html) return;
+  node.__html = html;
+  node.innerHTML = html;
+}
+
+// 价差表的点击（整张表只绑一次）：点「历史价差」去图表页，点行去策略页的下单界面。
+function onRhRowClick(event) {
+  const tr = event.target?.closest?.('tr[data-rh-base]');
+  if (!tr) return;
+  const lines = (state.rh?.lines || []).concat(state.rh?.watch?.lines || []);
+  const line = lines.find((l) => l.base === tr.getAttribute('data-rh-base') && l.pair === tr.getAttribute('data-rh-pair'));
+  if (!line) return;
+  if (event.target?.closest?.('[data-rh-chart]')) {
+    event.preventDefault();
+    openChartFor(line);
+    return;
+  }
+  // 只观察的组按挂单测算，不按吃单下单；观察组没有实盘账户。
+  if (line.observe_only || line.watch_only) return;
+  openRhInStrategy(line);
+}
+
+// 挂单测算的汇总：虚拟挂单被（严格穿价的）成交吃到之后，对面吃单对冲在各时刻能拿到的「回到正常」净收益。
+function rhMakerSummaryHtml(maker, filter, fills) {
+  if (!maker) return '';
+  const stats = (maker.stats || []).filter((s) => filter === 'all' || s.pair === filter);
+  // 统计只返回前 15 条：总笔数用服务端数好的（fills），没有就数返回的。
+  const head = `<b>挂单测算（只观察）</b>：现在虚拟挂着 ${maker.quoting} 个；最近记录 ${fills ?? stats.reduce((n, s) => n + s.fills, 0)} 笔虚拟成交${maker.since ? `（自 ${when(maker.since)}）` : ''}。`;
+  const explain = '<span class="small muted">挂单价 = Binance 自己这一侧的最优价；只有逐笔成交<b>严格穿过</b>挂单价才算成交（排队位置不知道，同价不算）；成交后在 0 / 0.3 / 1 / 5 秒按对面盘口吃单对冲，换算成「回到正常」净收益（吃单平仓）。报价时的净收益与之后实际能拿到的差就是逆向选择。同一合约同一方向 60 秒最多记一笔。</span>';
+  if (!stats.length) return `<div class="notice">${head}<br>${explain}</div>`;
+  const pctCell = (value) => (value == null ? '<span class="muted">—</span>' : `<span class="${cls(value)}">${pctRaw(value, 3)}</span>`);
+  const at = (s, horizon) => (s.median_net_pct || []).find(([h]) => h === horizon)?.[1] ?? null;
+  const rows = stats.slice(0, 15).map((s) => {
+    const legs = { long_a: s.pair.split(':')[0], long_b: s.pair.split(':')[1] };
+    const long = legs[s.direction];
+    const short = s.direction === 'long_a' ? legs.long_b : legs.long_a;
+    return `<tr><td><b>${esc(s.base)}</b> <span class="muted small">${esc(venueLabel(long))} 多 / ${esc(venueLabel(short))} 空</span></td><td class="num">${s.fills}</td><td class="num">${pctCell(s.median_quoted_net_pct)}</td><td class="num">${pctCell(at(s, 0))}</td><td class="num">${pctCell(at(s, 300))}</td><td class="num">${pctCell(at(s, 1000))}</td><td class="num">${pctCell(at(s, 5000))}</td><td class="num">${s.positive_share_1s == null ? '—' : `${num(s.positive_share_1s)}%`}</td><td class="small muted">${when(s.last_at)}</td></tr>`;
+  }).join('');
+  return `<div class="notice">${head}<br>${explain}<div class="table-wrap"><table class="small"><thead><tr><th>合约 / 方向</th><th class="num">笔数</th><th class="num">报价时</th><th class="num">成交时</th><th class="num">0.3 秒</th><th class="num">1 秒</th><th class="num">5 秒</th><th class="num">1 秒为正</th><th>最近</th></tr></thead><tbody>${rows}</tbody></table></div><span class="small muted">数字是中位数（%）。</span></div>`;
 }
 
 async function loadRhSpread() {
-  const result = await api('/api/rh-spread');
+  // 只认最后发出的那次：筛选刚改时，旧条件的响应可能晚到。
+  const seq = (state.rhSeq = (state.rhSeq || 0) + 1);
+  const result = await api(`/api/rh-spread?${rhQuery()}`);
+  if (seq !== state.rhSeq) return;
   if (!result.ok) throw new Error(result.body?.error || `HTTP ${result.status}`);
-  state.rh = result.body;
+  const view = result.body;
+  // 存着的组已经不在了（场所下线、配置变了）：退回「全部组」重取，不然一行都没有。
+  const pair = rhPairFilter();
+  if (pair !== 'all' && !(view.pairs || []).concat(view.watch?.pairs || []).some((p) => p.id === pair)) {
+    setRhPairFilter('all');
+    return;
+  }
+  state.rh = view;
   renderRhSpread();
   loadRhAuto().catch(() => {});
 }
@@ -2953,29 +4679,96 @@ async function loadRhSpread() {
 
 const RH_AUTO_FIELDS = [
   ['size_usdt', '单腿名义 (USDT)', 'number', '10', '每笔两腿各这么多名义'],
+  ['size_max_usdt', '动态单笔上限 (USDT)', 'number', '100', '按盘口放大单笔：信号那一刻按两边盘口逐档（每 100 USDT）算回到正常的净收益，在「单腿名义 ～ 这个上限」之间挑预估净赚 USDT 最多、且每档都过门槛的那一档。只给稳的组合放大：预估净收益不到基差日常波动（MAD）的照原名义（防 PRL 那种乱跳的币对）。放大后的单笔仍按盘口深度往下缩、全部闸门照旧；按比例的止盈跟着放大；补仓照原名义；放大后保证金不够时这个合约 10 分钟内按原名义做。最多 1000；留空 = 固定单笔'],
   ['leverage', '杠杆（整数）', 'number', '1', '两腿相同，逐仓'],
   ['min_net_pct', '触发门槛 (%)', 'number', '0.01', '「回到正常净收益」≥ 它才下单（已扣手续费与平仓穿价）'],
-  ['hold_sec', '信号保持 (秒)', 'number', '1', '连续达标这么久才下单，过滤一闪而过的挂单'],
-  ['take_profit_usdt', '止盈 (USDT)', 'number', '0.01', '含资金费的净盈利达到它就平仓（按盘口核对）；留空不设'],
+  ['hold_sec', '信号保持 (秒)', 'number', '0.1', '连续达标这么久才下单，过滤一闪而过的挂单；0 ～ 600，可填小数（如 0.5）；0 = 检测到信号就下'],
+  ['instant_multiple', '强信号不等保持 (门槛倍数)', 'number', '0.5', '扣掉滑点缓冲后的「回到正常净收益」≥ 门槛 × 它，就不等信号保持、立刻下单（历史分位、冷却、限额照旧；下单前仍按现拉盘口重算）；如 2；留空 = 一律等保持'],
+  ['slippage_buffer_pct', '滑点缓冲 (%)', 'number', '0.01', '「回到正常净收益」先扣掉它再和门槛比；实盘统计预估与实际平均差约 0.05%。0 = 不扣'],
+  ['max_fee_share_pct', '手续费占毛利上限 (%)', 'number', '5', '往返手续费超过预估毛利（回到正常净收益 + 往返费）这个比例的组合 / 合约不做；如 50；留空不过滤'],
+  ['fast_move_pct', '急行情不开仓 (%)', 'number', '0.01', '两条腿所在的两家里，任何一家中间价最近 5 秒的波动（最高 − 最低 ÷ 最低）达到它就不开仓 / 不补仓，等稳住（保持计时也清零）。价差常是一边先动、另一边报价滞后，等第二腿到的时候已经追上，第一腿裸着被行情带走；如 0.15；刚启动 / 重连没有 5 秒历史时放行；留空不过滤'],
+  ['depth_fit_pct', '按盘口深度定单笔 (占深度 %)', 'number', '5', '「单腿名义」当上限：盘口在限价内吃不下时往下缩，单笔不超过「第一腿限价内可吃深度」和「第二腿保本价内可吃深度」的这个比例（如 50；给下单到第二腿到达的两秒留余量）。只在吃不到时缩，不为凑利润而缩；缩完全部闸门照旧再过一遍；按 USDT 计的止盈 / 止损随单笔同比例缩小；留空 = 固定单笔'],
+  ['force_hedge_pct', '强制补腿：最差锁定价差 (%)', 'number', '0.05', '第一腿成交后，第二腿在保本价内没吃满（一点没吃到或只吃到一部分）时不回滚，把剩下的数量按「两腿锁定价差不低于 −这个数」的最差价追上（如 0.3 = 价差最差到 −0.3%）；追不上才回滚。它不消除亏损，只是把回滚兑现的亏损换成一笔起点就是负价差的对冲仓位——收敛到目标不一定赚钱、又没有止损，可能长期挂着，建议同时设超时退出；只对两腿都吃单的新开仓起作用；留空 = 关（照旧回滚）'],
+  ['depth_min_usdt', '按深度的最小单笔 (USDT)', 'number', '10', '按盘口深度缩到这个数以下就不下单（只在上一项开着时起作用）'],
+  ['take_profit_usdt', '止盈 (USDT)', 'number', '0.01', '含资金费的净盈利达到它就平仓（按盘口核对）；与下一项都填时取大的；留空不设'],
+  ['take_profit_pct', '止盈 (% 名义)', 'number', '0.01', '按单腿名义的比例止盈，如 0.05 = 800U 时 0.4U；留空不设'],
+  ['take_profit_book_min_usdt', '止盈盘口门槛 (USDT)', 'number', '0.01', '标记价到止盈后，按两边盘口平掉的整笔净额（含资金费、平仓手续费与穿价）为正且 ≥ 它就平，不再要求盘口也到止盈金额；0 = 为正即平；高于某笔的止盈金额时按止盈金额算；留空 = 盘口也要到止盈金额（以前的做法）。只作用于之后新开的仓；下单前照样重拉盘口复核，成交可能比预估差'],
+  ['recent_gate_pct', '相对近期偏离门槛 (%)', 'number', '0.01', '开仓 / 补仓时，这个方向的可成交价差要比近 12 小时的中位数至少高这么多才做。「回到正常」按 7 天中位算，价差整体换了水平之后要几天才跟上，这期间每个读数都像大偏离（实盘遇到过：开在近期中位上，价差继续走宽而亏损）；回测里 0.05 拦掉的合计为负；近期样本不够时放行；留空不过滤'],
+  ['history_gate_pct', '历史分位前 (%)', 'number', '5', '按「历史价差」页同口径：这个方向现在的价差要排在过去一段时间最大的前 X% 才开，避免开在半山腰；如 20；历史拉不到时不开；留空不用'],
+  ['history_days', '历史天数', 'number', '1', '历史分位用多少天的 K 线（1 小时线最多 48 天）'],
+  ['stop_loss_usdt', '止损 (USDT)', 'number', '0.1', '按盘口现在平掉的整笔净额（含资金费）亏到 −它就平仓；开「相对正常基差」时必填；留空不设'],
   ['liq_protection_pct', '爆仓保护 (%)', 'number', '1', '强平距离低于它两腿等比例减仓；留空不设'],
-  ['max_positions', '同时最多 (笔)', 'number', '1', '自动开的仓位同时最多几笔'],
-  ['daily_max_opens', '每日最多 (笔)', 'number', '1', '每个 UTC 日最多自动开几笔'],
+  ['auto_margin_pct', '自动加保证金 (%)', 'number', '0.5', '任一腿强平距离低于它就往这条腿补逐仓保证金，拉回 1.5 倍；要同时填上限，留空不设（须高于爆仓保护）'],
+  ['auto_margin_max_usdt', '加保证金上限 (USDT)', 'number', '1', '每笔仓位最多累计补这么多；留空不设'],
+  ['timeout_hours', '超时退出 (小时)', 'number', '0.5', '持仓超过这么多小时、按盘口平掉的亏损不超过右边的金额就平仓，释放名额；要同时填最多亏，留空不设'],
+  ['timeout_max_loss_usdt', '超时最多亏 (USDT)', 'number', '0.01', '超时后可接受的按盘口亏损（含资金费）；0 = 保本才平'],
+  ['add_min_improve_pct', '补仓门槛 (%)', 'number', '0.01', '同一合约、同方向的新信号，开仓价差比原仓位实际成交的价差至少好这么多才往上补；留空不补仓'],
+  ['add_max_times', '每笔最多补 (次)', 'number', '1', '每笔仓位最多补几次（发过单就算）'],
+  ['add_max_multiple', '补完总名义 ≤ 单笔 (倍)', 'number', '0.5', '补完后单腿名义最多是单笔名义的几倍；同时不超过单笔上限'],
+  ['max_positions', '同时最多 (笔)', 'number', '1', '自动开的仓位同时最多几笔（补仓不占名额）；0 = 不限（仍受账户级持仓上限 ARB_MAX_OPEN_POSITIONS 约束）'],
+  ['daily_max_opens', '每日最多 (笔)', 'number', '1', '每个 UTC 日最多自动开几笔（补仓也算）；0 = 不限'],
+  ['open_gap_sec', '开仓间隔 (秒)', 'number', '1', '两次自动开仓之间至少隔多少秒（全局，不分合约）；5 ～ 600，默认 60'],
 ];
+// 留空 = 不设的可选项。
+const RH_AUTO_OPTIONAL = new Set(['size_max_usdt', 'instant_multiple', 'recent_gate_pct', 'history_gate_pct', 'take_profit_usdt', 'take_profit_pct', 'take_profit_book_min_usdt', 'stop_loss_usdt', 'max_fee_share_pct', 'fast_move_pct', 'depth_fit_pct', 'force_hedge_pct', 'liq_protection_pct', 'auto_margin_pct', 'auto_margin_max_usdt', 'timeout_hours', 'timeout_max_loss_usdt', 'add_min_improve_pct']);
+
+// 信号保持：整秒且 ≥ 5 照旧只写 hold_sec；小数或不到 5 秒写 hold_ms（毫秒），hold_sec 填最接近的合法整秒，
+// 给旧版本读回、也是信号保持影子的「现行规则」对照。
+// 空值、非数字、负数、超过 600：不转成 0（那是最激进的「见信号就下」），两个字段都给 null，保存时报错 ——
+// 清空输入框不能悄悄变成 0 秒。
+function rhAutoHold(value) {
+  const text = String(value).trim();
+  const sec = Number(text);
+  if (text === '' || !Number.isFinite(sec) || sec < 0 || sec > 600) return { hold_sec: null, hold_ms: null };
+  const whole = Number.isInteger(sec) && sec >= 5;
+  return {
+    hold_sec: Math.min(600, Math.max(5, Math.round(sec))),
+    hold_ms: whole ? null : Math.round(sec * 1000),
+  };
+}
 
 function rhAutoForm(settings) {
   return {
     enabled: Boolean(settings.enabled),
     mode: settings.mode || 'paper',
     size_usdt: String(settings.size_usdt ?? '500'),
+    size_max_usdt: settings.size_max_usdt == null ? '' : String(settings.size_max_usdt),
     leverage: String(settings.leverage ?? '3'),
     min_net_pct: String(settings.min_net_pct ?? '0.05'),
-    hold_sec: String(settings.hold_sec ?? '10'),
+    hold_sec: String(settings.hold_ms != null ? settings.hold_ms / 1000 : (settings.hold_sec ?? '10')),
+    instant_multiple: settings.instant_multiple == null ? '' : String(settings.instant_multiple),
     back_to_normal: settings.back_to_normal !== false,
     take_profit_usdt: settings.take_profit_usdt == null ? '' : String(settings.take_profit_usdt),
+    take_profit_pct: settings.take_profit_pct == null ? '' : String(settings.take_profit_pct),
+    take_profit_book_min_usdt: settings.take_profit_book_min_usdt == null ? '' : String(settings.take_profit_book_min_usdt),
+    stop_loss_usdt: settings.stop_loss_usdt == null ? '' : String(settings.stop_loss_usdt),
+    slippage_buffer_pct: String(settings.slippage_buffer_pct ?? '0'),
+    max_fee_share_pct: settings.max_fee_share_pct == null ? '' : String(settings.max_fee_share_pct),
+    fast_move_pct: settings.fast_move_pct == null ? '' : String(settings.fast_move_pct),
+    depth_fit_pct: settings.depth_fit_pct == null ? '' : String(settings.depth_fit_pct),
+    force_hedge_pct: settings.force_hedge_pct == null ? '' : String(settings.force_hedge_pct),
+    depth_min_usdt: String(settings.depth_min_usdt ?? '50'),
+    relative_to_normal: Boolean(settings.relative_to_normal),
+    cheap_leg_first: settings.cheap_leg_first !== false,
+    history_gate_pct: settings.history_gate_pct == null ? '' : String(settings.history_gate_pct),
+    recent_gate_pct: settings.recent_gate_pct == null ? '' : String(settings.recent_gate_pct),
+    deduct_funding: settings.deduct_funding !== false,
+    history_interval: settings.history_interval || '1h',
+    history_days: String(settings.history_days ?? '24'),
     liq_protection_pct: settings.liq_protection_pct == null ? '' : String(settings.liq_protection_pct),
+    auto_margin_pct: settings.auto_margin_pct == null ? '' : String(settings.auto_margin_pct),
+    auto_margin_max_usdt: settings.auto_margin_max_usdt == null ? '' : String(settings.auto_margin_max_usdt),
+    timeout_hours: settings.timeout_hours == null ? '' : String(settings.timeout_hours),
+    timeout_max_loss_usdt: settings.timeout_max_loss_usdt == null ? '' : String(settings.timeout_max_loss_usdt),
+    add_min_improve_pct: settings.add_min_improve_pct == null ? '' : String(settings.add_min_improve_pct),
+    add_max_times: String(settings.add_max_times ?? '2'),
+    add_max_multiple: String(settings.add_max_multiple ?? '3'),
     max_positions: String(settings.max_positions ?? '1'),
     daily_max_opens: String(settings.daily_max_opens ?? '3'),
+    open_gap_sec: String(settings.open_gap_sec ?? '60'),
     symbols: (settings.symbols || []).join(','),
+    exclude_venues: (settings.exclude_venues || []).join(','),
+    exclude_symbols: (settings.exclude_symbols || []).join(','),
   };
 }
 
@@ -2986,15 +4779,43 @@ function rhAutoBody(form, enabled) {
     enabled,
     mode: form.mode,
     size_usdt: String(form.size_usdt).trim(),
+    size_max_usdt: optional(form.size_max_usdt),
     leverage: String(form.leverage).trim(),
     min_net_pct: String(form.min_net_pct).trim(),
-    hold_sec: Number(form.hold_sec),
+    ...rhAutoHold(form.hold_sec),
+    instant_multiple: optional(form.instant_multiple),
     back_to_normal: Boolean(form.back_to_normal),
     take_profit_usdt: optional(form.take_profit_usdt),
+    take_profit_pct: optional(form.take_profit_pct),
+    take_profit_book_min_usdt: optional(form.take_profit_book_min_usdt),
+    stop_loss_usdt: optional(form.stop_loss_usdt),
+    slippage_buffer_pct: String(form.slippage_buffer_pct).trim() || '0',
+    max_fee_share_pct: optional(form.max_fee_share_pct),
+    fast_move_pct: optional(form.fast_move_pct),
+    depth_fit_pct: optional(form.depth_fit_pct),
+    force_hedge_pct: optional(form.force_hedge_pct),
+    depth_min_usdt: String(form.depth_min_usdt).trim() || '50',
+    relative_to_normal: Boolean(form.relative_to_normal),
+    cheap_leg_first: Boolean(form.cheap_leg_first),
+    history_gate_pct: optional(form.history_gate_pct),
+    recent_gate_pct: optional(form.recent_gate_pct),
+    deduct_funding: Boolean(form.deduct_funding),
+    history_interval: form.history_interval || '1h',
+    history_days: String(form.history_days).trim() || '24',
     liq_protection_pct: optional(form.liq_protection_pct),
+    auto_margin_pct: optional(form.auto_margin_pct),
+    auto_margin_max_usdt: optional(form.auto_margin_max_usdt),
+    timeout_hours: optional(form.timeout_hours),
+    timeout_max_loss_usdt: optional(form.timeout_max_loss_usdt),
+    add_min_improve_pct: optional(form.add_min_improve_pct),
+    add_max_times: Number(form.add_max_times),
+    add_max_multiple: String(form.add_max_multiple).trim(),
     max_positions: Number(form.max_positions),
     daily_max_opens: Number(form.daily_max_opens),
+    open_gap_sec: Number(form.open_gap_sec ?? 60),
     symbols: String(form.symbols).split(/[,，\s]+/).map((s) => s.trim().toUpperCase()).filter(Boolean),
+    exclude_venues: String(form.exclude_venues ?? '').split(/[,，\s]+/).map((s) => s.trim().toLowerCase()).filter(Boolean),
+    exclude_symbols: String(form.exclude_symbols ?? '').split(/[,，\s]+/).map((s) => s.trim().toUpperCase()).filter(Boolean),
   };
 }
 
@@ -3014,6 +4835,11 @@ async function loadRhAuto() {
 async function saveRhAuto(enabled) {
   const a = state.rhAuto;
   const body = rhAutoBody(a.form, enabled);
+  if (body.hold_sec === null) {
+    a.message = { tone: 'error', text: '信号保持必须是 0 ～ 600 秒的数字（可小数，0 = 检测到信号就下单），不能留空。' };
+    renderRhAuto();
+    return;
+  }
   if (enabled && body.mode === 'live' && !(a.data?.settings?.enabled && a.data?.settings?.mode === 'live')) {
     const typed = window.prompt(`开启【实盘】自动交易：信号出现时机器人会用真实资金自动下单（每笔两腿各 ${body.size_usdt} USDT）。\n确认请输入 LIVE`);
     if ((typed || '').trim() !== 'LIVE') return;
@@ -3034,7 +4860,7 @@ async function saveRhAuto(enabled) {
   renderRhAuto();
 }
 
-const RH_AUTO_EVENT = { opened: '开仓', unwound: '回滚', rejected: '被拒', paused: '暂停', disabled: '关闭', settings: '设置' };
+const RH_AUTO_EVENT = { opened: '开仓', added: '补仓', unwound: '回滚', maker_unfilled: '挂单没成交', untraded: '第一腿没成交', rejected: '被拒', paused: '暂停', disabled: '关闭', settings: '设置' };
 
 function rhAutoHtml(a, cfg) {
   if (!cfg?.auth_configured) return '<h3>自动交易</h3><p class="muted small">看板没有配置 ARB_WEB_TOKEN，自动交易不可用。</p>';
@@ -3048,12 +4874,22 @@ function rhAutoHtml(a, cfg) {
   const badge = on
     ? `<span class="tag ${liveMode ? 'coral' : 'pc-pass'}">${liveMode ? '实盘自动交易中' : '纸面自动交易中'}</span>`
     : '<span class="tag">已关闭</span>';
-  const field = ([key, label, type, step, hint]) => `<label class="field" title="${esc(hint)}"><span>${esc(label)}</span><input type="${type}" step="${step}" data-rh-auto="${key}" value="${esc(f[key])}"${key === 'take_profit_usdt' || key === 'liq_protection_pct' ? ' placeholder="不设"' : ''} /></label>`;
+  const field = ([key, label, type, step, hint]) => `<label class="field" title="${esc(hint)}"><span>${esc(label)}</span><input type="${type}" step="${step}" data-rh-auto="${key}" value="${esc(f[key])}"${RH_AUTO_OPTIONAL.has(key) ? ` placeholder="${key === 'add_min_improve_pct' ? '不补仓' : '不设'}"` : ''} /></label>`;
   const maxSize = data.max_position_usdt;
   const warnings = [];
   if (f.mode === 'live' && !data.live_can_trade) warnings.push('实盘没连上或是只读模式：不能开启实盘自动交易。');
   if (f.mode === 'paper' && !data.paper_watch_sec) warnings.push('纸面规则没有在看板后台运行（ARB_WEB_PAPER_WATCH_SEC=0）：纸面自动仓位不会被自动平仓，只能在持仓页手动「执行一轮规则」。');
-  if (!f.back_to_normal && String(f.take_profit_usdt).trim() === '') warnings.push('至少开启一条退出规则（回到正常基差平仓 / 止盈），否则不能保存。');
+  const blank = (key) => String(f[key] ?? '').trim() === '';
+  if (!f.back_to_normal && blank('take_profit_usdt') && blank('take_profit_pct')) warnings.push('至少开启一条退出规则（回到正常基差平仓 / 止盈），否则不能保存。');
+  if (!blank('take_profit_book_min_usdt') && blank('take_profit_usdt') && blank('take_profit_pct')) warnings.push('填了止盈盘口门槛但没设止盈：门槛只在止盈按标记价达标后才用，否则不能保存。');
+  if (!blank('take_profit_book_min_usdt') && !(blank('take_profit_usdt') && blank('take_profit_pct'))) warnings.push(`已开止盈盘口门槛：标记价到止盈后，盘口算下来${num(f.take_profit_book_min_usdt) === 0 ? '为正' : ` ≥ ${f.take_profit_book_min_usdt} USDT`}就平。盘口预估到成交之间常有滑点（10-12 起规则平仓的成交比预估平均差约 0.08%，200U 仓位约 0.16U），门槛太低时实际可能是小亏。`);
+  if (f.relative_to_normal && (!f.back_to_normal || blank('stop_loss_usdt'))) warnings.push('「相对正常基差」必须同时勾选「回到正常基差就平仓」并填止损，否则不能保存。');
+  if (!blank('history_gate_pct')) warnings.push(`已开历史分位门槛：只在价差排在过去 ${f.history_days} 天（${f.history_interval} 线）最大的前 ${f.history_gate_pct}% 时开。K 线是成交价（Arcus 是预言机价），和实时可成交价差不完全一样；历史拉不到时不开。`);
+  if (f.relative_to_normal) warnings.push('已开「相对正常基差」：开仓可成交价差可以为负（两家长期有固定差价时也会做），赚的是回到正常水平那一段；正常水平本身会慢慢变，偏离继续拉大时只有止损兜底。');
+  const half = (a, b) => (String(f[a]).trim() === '') !== (String(f[b]).trim() === '');
+  if (half('auto_margin_pct', 'auto_margin_max_usdt')) warnings.push('自动加保证金要同时填触发线和上限，否则不能保存。');
+  if (half('timeout_hours', 'timeout_max_loss_usdt')) warnings.push('超时退出要同时填小时数和最多亏多少，否则不能保存。');
+  if (String(f.add_min_improve_pct).trim() !== '') warnings.push(`已开补仓：同一合约、同方向的新信号比原仓位实际成交价差好 ≥ ${f.add_min_improve_pct}% 就往上加 ${f.size_usdt} USDT，每笔最多 ${f.add_max_times} 次、总名义 ≤ 单笔 ${f.add_max_multiple} 倍。补仓是在还没回归的仓位上加码，基差继续走远时亏损也成倍放大。`);
   if (num(f.size_usdt) !== null && num(data.monitor_size_usdt) !== null && num(f.size_usdt) > num(data.monitor_size_usdt)) {
     warnings.push(`表格里的净收益按 ${num(data.monitor_size_usdt)} USDT 估算；你的单笔更大，吃得更深，实际价差会更差（下单前按你的金额重算，不够会被拒）。`);
   }
@@ -3096,16 +4932,22 @@ function rhAutoHtml(a, cfg) {
     <p class="small muted">金额是开仓当时的单腿名义，和上面「单腿名义」同一口径，价差另一腿金额相同。累计金额写在本地，开仓记录只留最近 300 笔，裁掉以后累计金额还在。这次更新之前的开仓，金额按 0。</p>
     <p class="small muted">按合约（最近 ${count(stats.recorded)} 笔记录）：${esc(symbolLine)}</p>
     ${dayLine ? `<p class="small muted">近 7 日开仓（UTC）：${esc(dayLine)}</p>` : ''}
-    <p class="small muted">所有你配了 API 的交易所两两组成的组都参与（实盘：两家都已连接）。任何一组的信号「回到正常净收益」达到门槛、且开仓可成交价差与收敛到 0 净收益都为正、连续保持够久后，按下面的参数自动下一笔价差单。每一笔都走和手动下单同一套检查：对账干净、按你的金额现拉盘口重算、单笔上限${maxSize ? `（${esc(String(maxSize))} USDT）` : ''}、持仓数上限、当日亏损、Telegram /pause 与熔断。同一合约已有仓位不再开；每次尝试后该合约冷却 10 分钟；执行中断（结果未知）或连续 ${data.max_failures} 次回滚会自动关闭。</p>
+    <p class="small muted">所有你配了 API 的交易所两两组成的组都参与（实盘：两家都已连接）。任何一组的信号「回到正常净收益」（扣掉滑点缓冲）达到门槛、手续费占比不超上限、且开仓可成交价差与收敛到 0 净收益都为正（开了「相对正常基差」则不要求这一条）、连续保持够久后，按下面的参数自动下一笔价差单。每一笔都走和手动下单同一套检查：对账干净、按你的金额现拉盘口重算、单笔上限${maxSize ? `（${esc(String(maxSize))} USDT）` : ''}、持仓数上限、当日亏损、Telegram /pause 与熔断。同一合约已有仓位不再新开（开了补仓时，同方向更好的信号会往那笔上补）；每次尝试后该合约冷却 10 分钟；执行中断（结果未知）或连续 ${data.max_failures} 次回滚会自动关闭。</p>
     <div class="rh-auto-grid">
       <label class="field"><span>账户</span><select data-rh-auto="mode">
         <option value="paper"${f.mode === 'paper' ? ' selected' : ''}>纸面（不碰真实资金）</option>
         <option value="live"${f.mode === 'live' ? ' selected' : ''}>实盘（真实资金）</option>
       </select></label>
       ${RH_AUTO_FIELDS.map(field).join('')}
+      <label class="field" title="历史分位用的 K 线周期"><span>历史 K 线周期</span><select data-rh-auto="history_interval">${CHART_INTERVALS.map((i) => `<option value="${i.name}"${f.history_interval === i.name ? ' selected' : ''}>${esc(i.label)}</option>`).join('')}</select></label>
       <label class="field" title="逗号分隔，如 NVDA,SPY；留空 = 全部合约"><span>只做这些合约</span><input type="text" data-rh-auto="symbols" value="${esc(f.symbols)}" placeholder="全部" /></label>
+      <label class="field" title="逗号分隔的交易所短名，如 bitget,lighter：两条腿里有它的组合不自动开仓、不补仓；已有仓位的止盈止损等规则照常。留空 = 不排除"><span>不自动交易的交易所</span><input type="text" data-rh-auto="exclude_venues" value="${esc(f.exclude_venues)}" placeholder="不排除" /></label>
+      <label class="field" title="逗号分隔的合约名，如 ANTHROPIC,OPENAI：所有组合都不自动开仓、不补仓；已有仓位的止盈止损等规则照常，提醒照推。留空 = 不排除"><span>不自动交易的合约</span><input type="text" data-rh-auto="exclude_symbols" value="${esc(f.exclude_symbols)}" placeholder="不排除" /></label>
     </div>
     <label class="small rh-auto-check"><input type="checkbox" data-rh-auto="back_to_normal"${f.back_to_normal ? ' checked' : ''} /> 回到同时段正常基差就平仓（按方向换算成「基差收敛平仓」目标，按盘口核对净收益为正才平）</label>
+    <label class="small rh-auto-check"><input type="checkbox" data-rh-auto="relative_to_normal"${f.relative_to_normal ? ' checked' : ''} /> 相对正常基差（不要求开仓价差为正、不算「收敛到 0」；只看回到正常水平扣成本后的净收益。必须同时开上一项并设止损）</label>
+    <label class="small rh-auto-check"><input type="checkbox" data-rh-auto="cheap_leg_first"${f.cheap_leg_first ? ' checked' : ''} /> 先下费率明显低的那条腿（如 Arcus ↔ RH 先下 RH：没成交什么都不花，成交了再去盘口厚的 Arcus 对冲；不勾 = 按预估滑点大的先下）</label>
+    <label class="small rh-auto-check"><input type="checkbox" data-rh-auto="deduct_funding"${f.deduct_funding ? ' checked' : ''} /> 预估收益扣持仓期资金费：按两家当前资金费率，持仓按「超时退出」的小时数算（没设按 24 小时），只扣要付的、不加能收的；拿不到费率时不扣</label>
     ${warnings.map((w) => `<div class="alert warn small">${esc(w)}</div>`).join('')}
     ${a.message ? `<div class="alert ${a.message.tone === 'error' ? 'error' : 'info'} small">${esc(a.message.text)}</div>` : ''}
     <div class="plan-actions">
@@ -3146,7 +4988,12 @@ function scheduleRh() {
   state.rhTimer = null;
   if (state.page !== 'rhspread') return;
   state.rhTimer = setInterval(() => {
-    if (!document.hidden && state.page === 'rhspread') loadRhSpread().catch(() => {});
+    // 上一次还没回来就不再发：连接慢时不让请求越堆越多。
+    if (document.hidden || state.page !== 'rhspread' || state.rhLoading) return;
+    state.rhLoading = true;
+    loadRhSpread().catch(() => {}).finally(() => {
+      state.rhLoading = false;
+    });
   }, RH_REFRESH_MS);
 }
 
@@ -3159,8 +5006,11 @@ function showPage(page) {
   for (const item of document.querySelectorAll('.nav-item')) {
     item.classList.toggle('active', item.getAttribute('data-page') === page);
   }
-  if (location.hash !== `#${page}`) history.replaceState(null, '', `#${page}`);
+  // 价差图在 zuudot 风格的 /trading?… 链接上（loadChart 会写回参数）；离开它就回到根路径，免得刷新又落回图表页。
+  const target = page === 'chart' && location.pathname === '/trading' ? `${location.pathname}${location.search}#chart` : `/#${page}`;
+  if (`${location.pathname}${location.search}${location.hash}` !== target) history.replaceState(null, '', target);
   scheduleRh();
+  scheduleChart();
   refresh();
 }
 
@@ -3180,6 +5030,9 @@ async function refresh() {
       await loadPairs();
     } else if (state.page === 'rhspread') {
       await loadRhSpread();
+    } else if (state.page === 'chart') {
+      // 价差图首次进入时拉一次；之后由 scheduleChart() 每分钟刷新，不跟着全局刷新打。
+      if (!state.chart.data && !state.chart.fund && !state.chart.loading) await loadChart();
     } else if (state.page === 'positions') {
       // 正在确认或执行平仓时不重画：会把确认输入框冲掉。
       if (state.pos.confirming || state.pos.busy) return;
@@ -3189,7 +5042,8 @@ async function refresh() {
       await loadScan();
     }
   } catch (error) {
-    const target = state.page === 'strategy' ? 'market-empty' : state.page === 'positions' ? 'pos-open' : state.page === 'rhspread' ? 'rh-notice' : 'notices';
+    const target = state.page === 'strategy' ? 'market-empty' : state.page === 'positions' ? 'pos-open' : state.page === 'rhspread' ? 'rh-notice' : state.page === 'chart' ? 'chart-notes' : 'notices';
+    $(target).__html = null;
     $(target).innerHTML = `<div class="notice error">取数失败：${esc(error.message)}</div>`;
   }
 }
@@ -3349,9 +5203,22 @@ function wire() {
   // 持仓页
   $('pos-monitor').addEventListener('click', runMonitor);
   $('pos-account-btn').addEventListener('click', () => loadAccount());
+  $('pos-collapse-all').addEventListener('click', () => {
+    setAllCollapsed(true);
+    renderPositions();
+  });
+  $('pos-expand-all').addEventListener('click', () => {
+    setAllCollapsed(false);
+    renderPositions();
+  });
 
   // RH 价差页
-  $('rh-signal-only').addEventListener('change', renderRhSpread);
+  $('rh-signal-only').addEventListener('change', reloadRhSpread);
+  $('rh-limit')?.addEventListener('change', (event) => setRhLimit(event.target.value));
+  $('rh-rows').addEventListener('click', onRhRowClick);
+  $('rh-watch')?.addEventListener('change', (event) => setRhShowWatch(event.target.checked));
+  // 价差图表
+  wireChart();
   $('rh-pair').addEventListener('change', (event) => setRhPairFilter(event.target.value));
 }
 
@@ -3369,7 +5236,14 @@ function wire() {
   }
   state.booting = false;
   // 顶栏的场所/合约计数来自机会榜；其它页也先拉一次，让顶栏有数。
-  const initial = location.hash.replace('#', '');
+  let initial = location.hash.replace('#', '');
+  // zuudot 风格的链接（/trading?symbol=…&exchange1=…&exchange2=…）直接打开价差图。
+  const fromUrl = location.pathname === '/trading' || initial === 'chart' ? chartParamsFromUrl(location.search) : null;
+  if (location.pathname === '/trading') initial = 'chart';
+  if (fromUrl) {
+    Object.assign(state.chart.form, fromUrl, { days: '', fee1: '', fee2: '' });
+    fillChartControls(state.chart.form);
+  }
   if (initial && initial !== 'opps') loadScan().catch(() => {});
   showPage(initial || 'opps');
   schedule();

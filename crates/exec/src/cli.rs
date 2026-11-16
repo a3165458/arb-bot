@@ -227,11 +227,24 @@ pub fn describe_rules(rules: &TaskRules) -> String {
     }
     if let Some(target) = rules.take_profit_usdt {
         parts.push(format!("含资金费净盈利 ≥ {target} USDT 止盈"));
+        match rules.take_profit_book_min_usdt {
+            Some(min) if min.is_zero() => parts.push("止盈触发后盘口为正即平".into()),
+            Some(min) => parts.push(format!("止盈触发后盘口 ≥ {min} USDT 即平")),
+            None => {}
+        }
     }
     if let Some((trigger, cap)) = rules.auto_margin() {
         parts.push(format!(
             "强平距离 < {trigger}% 补逐仓保证金（累计上限 {cap} USDT）"
         ));
+    }
+    if let Some((hours, loss)) = rules.timeout_exit() {
+        parts.push(format!(
+            "持仓超过 {hours} 小时、按盘口亏损 ≤ {loss} USDT 就平仓"
+        ));
+    }
+    if let Some(loss) = rules.stop_loss_usdt {
+        parts.push(format!("按盘口亏到 −{loss} USDT 止损"));
     }
     parts.join("，")
 }
@@ -260,7 +273,8 @@ pub fn limits_from(settings: &Settings) -> Limits {
     Limits {
         // 不设上限时用一个够大的数：单笔多大只剩盘口深度、保证金与强平距离在管。
         max_position_usdt: settings.max_position_usdt.map_or(Decimal::MAX, dec),
-        max_open_positions: 5,
+        // 账户级持仓数上限：ARB_MAX_OPEN_POSITIONS（默认 5，off = 不限）。
+        max_open_positions: settings.max_open_positions.unwrap_or(usize::MAX),
         max_daily_loss_usdt: dec(settings.max_daily_loss_usdt),
         max_slippage: Decimal::new(2, 3),
         max_entry_basis_pct: settings.max_entry_basis_pct.unwrap_or(Decimal::from(5u32)),
@@ -291,6 +305,24 @@ pub async fn fetch_books(
     .await
 }
 
+/// 同 [`fetch_books`]，但开仓核算（`desk::prepare`）用：速度优先，允许用本进程实时维护的盘口，
+/// 放不下 `size_usdt` 的改拉整本（见 [`fetch_books_fast_for`]）。
+pub async fn fetch_books_fast(
+    apis: &HashMap<Venue, Arc<dyn VenueApi>>,
+    opportunity: &Opportunity,
+    levels: u32,
+    size_usdt: Decimal,
+) -> Result<(arb_core::OrderBook, arb_core::OrderBook)> {
+    fetch_books_fast_for(
+        apis,
+        (opportunity.long, &opportunity.symbol),
+        (opportunity.short, &opportunity.symbol),
+        levels,
+        size_usdt,
+    )
+    .await
+}
+
 /// 盘口没拉到（限频、超时、网络、场所报错）。它说的是「这次没查成」，不是「这对腿不能做」——
 /// 调用方（比如后台预检）要能把它和闸门拒绝分开，所以给一个专门的类型，按类型判断而不是按文字。
 #[derive(Debug)]
@@ -307,32 +339,109 @@ impl std::fmt::Display for BookUnavailable {
 
 impl std::error::Error for BookUnavailable {}
 
+/// 两份盘口各自是什么时候到的（从同时发出请求起算，毫秒）。
+///
+/// 盘口接口都是 REST 现拉，没有各自的行情时间戳；两边到达的时刻差，是「这两份报价是不是同一时刻」
+/// 能拿到的最好代理。差太大（一边在限频队列里排队、另一边立刻回来）时，由它们算出来的价差
+/// 里混着一段时间的价格变动，不是任何一个时刻真能成交的价差。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BookTiming {
+    pub long_ms: u64,
+    pub short_ms: u64,
+}
+
+impl BookTiming {
+    /// 两份盘口到达时刻的差（毫秒）。
+    pub fn skew_ms(&self) -> u64 {
+        self.long_ms.abs_diff(self.short_ms)
+    }
+}
+
 /// 两条腿各自的盘口。每条腿用它自己场所上的合约名去拉（计价资产可能不同）。
 pub async fn fetch_books_for(
+    apis: &HashMap<Venue, Arc<dyn VenueApi>>,
+    long: (Venue, &arb_core::Symbol),
+    short: (Venue, &arb_core::Symbol),
+    levels: u32,
+) -> Result<(arb_core::OrderBook, arb_core::OrderBook)> {
+    let (long_book, short_book, _) = fetch_books_timed(apis, long, short, levels).await?;
+    Ok((long_book, short_book))
+}
+
+/// 同 [`fetch_books_for`]，但开仓核算用：每条腿走 [`VenueApi::fetch_depth_fast`]
+/// （Hyperliquid 可以用本进程实时维护的顶档代替一次 REST 往返；其它场所与 `fetch_depth` 相同）。
+///
+/// 快路径只给得出实时顶档（一档）。这笔 `size_usdt` 在这一侧放不下的，**改拉 REST 整本**，而不是让闸门按
+/// 「深度不够」拒绝：手动开仓、资金费开仓的名义常常比顶档大，页面预检（走 REST）会说通过。
+pub async fn fetch_books_fast_for(
+    apis: &HashMap<Venue, Arc<dyn VenueApi>>,
+    long: (Venue, &arb_core::Symbol),
+    short: (Venue, &arb_core::Symbol),
+    levels: u32,
+    size_usdt: Decimal,
+) -> Result<(arb_core::OrderBook, arb_core::OrderBook)> {
+    let (long_book, short_book, _) =
+        fetch_books_timed_with(apis, long, short, levels, Some(size_usdt)).await?;
+    Ok((long_book, short_book))
+}
+
+/// 同 [`fetch_books_for`]，并带回两份盘口各自的到达时间（见 [`BookTiming`]）。永远走 REST。
+pub async fn fetch_books_timed(
+    apis: &HashMap<Venue, Arc<dyn VenueApi>>,
+    long: (Venue, &arb_core::Symbol),
+    short: (Venue, &arb_core::Symbol),
+    levels: u32,
+) -> Result<(arb_core::OrderBook, arb_core::OrderBook, BookTiming)> {
+    fetch_books_timed_with(apis, long, short, levels, None).await
+}
+
+async fn fetch_books_timed_with(
     apis: &HashMap<Venue, Arc<dyn VenueApi>>,
     (long_venue, long_symbol): (Venue, &arb_core::Symbol),
     (short_venue, short_symbol): (Venue, &arb_core::Symbol),
     levels: u32,
-) -> Result<(arb_core::OrderBook, arb_core::OrderBook)> {
-    let fetch = |venue: Venue, symbol: &arb_core::Symbol| {
+    fast: Option<Decimal>,
+) -> Result<(arb_core::OrderBook, arb_core::OrderBook, BookTiming)> {
+    let started = std::time::Instant::now();
+    // `need`：这条腿要吃的那一侧（多腿买入吃卖盘、空腿卖出吃买盘）。
+    let fetch = |venue: Venue, symbol: &arb_core::Symbol, need: arb_core::Side| {
         let api = apis.get(&venue).cloned();
         let symbol = symbol.clone();
         async move {
             let api = api.ok_or_else(|| anyhow::anyhow!("{venue} 没有连接器"))?;
-            api.fetch_depth(&symbol, levels).await.map_err(|error| {
+            let depth = match fast {
+                Some(size_usdt) => match api.fetch_depth_fast(&symbol, levels).await {
+                    // 快路径的盘口（实时顶档）这一侧放不下这笔金额：改拉整本。
+                    Ok(book)
+                        if book
+                            .side(need)
+                            .iter()
+                            .map(|level| level.notional_usdt)
+                            .sum::<Decimal>()
+                            < size_usdt =>
+                    {
+                        api.fetch_depth(&symbol, levels).await
+                    }
+                    other => other,
+                },
+                None => api.fetch_depth(&symbol, levels).await,
+            };
+            let book = depth.map_err(|error| {
                 anyhow::Error::new(BookUnavailable {
                     venue,
                     detail: error.to_string(),
                 })
-            })
+            })?;
+            Ok::<_, anyhow::Error>((book, started.elapsed().as_millis() as u64))
         }
     };
     // 两个场所各拉各的，并发：串行时第二个盘口比第一个晚一整个往返，下单用的两份报价也就差了一段时间。
     let (long, short) = tokio::join!(
-        fetch(long_venue, long_symbol),
-        fetch(short_venue, short_symbol)
+        fetch(long_venue, long_symbol, arb_core::Side::Buy),
+        fetch(short_venue, short_symbol, arb_core::Side::Sell)
     );
-    Ok((long?, short?))
+    let ((long_book, long_ms), (short_book, short_ms)) = (long?, short?);
+    Ok((long_book, short_book, BookTiming { long_ms, short_ms }))
 }
 
 /// 资金费历史没拉到（限频、网络）。和盘口一样属于「没查成」，不代表能下也不代表不能下。
@@ -447,5 +556,121 @@ pub fn side_label(side: arb_core::Side) -> &'static str {
     match side {
         arb_core::Side::Buy => "买入",
         arb_core::Side::Sell => "卖出",
+    }
+}
+
+#[cfg(test)]
+mod fast_books_tests {
+    use super::*;
+    use arb_core::{ArbResult, Level, MarketSnapshot, OrderBook, Side, Symbol};
+    use async_trait::async_trait;
+    use rust_decimal_macros::dec;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 快路径只给一档（实时顶档），REST 给整本；各自数调用次数。
+    struct Api {
+        venue: Venue,
+        rest_calls: AtomicUsize,
+        fast_calls: AtomicUsize,
+    }
+
+    fn book(venue: Venue, symbol: &Symbol, levels: usize) -> OrderBook {
+        let side = |start: Decimal, step: Decimal| -> Vec<Level> {
+            (0..levels)
+                .map(|i| Level {
+                    price: start + step * Decimal::from(i as u64),
+                    notional_usdt: dec!(1000),
+                })
+                .collect()
+        };
+        OrderBook {
+            venue,
+            symbol: symbol.clone(),
+            bids: side(dec!(99), dec!(-0.01)),
+            asks: side(dec!(101), dec!(0.01)),
+        }
+    }
+
+    #[async_trait]
+    impl VenueApi for Api {
+        fn venue(&self) -> Venue {
+            self.venue
+        }
+        async fn fetch_all(&self) -> ArbResult<Vec<MarketSnapshot>> {
+            Ok(vec![])
+        }
+        async fn fetch_depth(&self, symbol: &Symbol, _: u32) -> ArbResult<OrderBook> {
+            self.rest_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(book(self.venue, symbol, 10))
+        }
+        async fn fetch_depth_fast(&self, symbol: &Symbol, _: u32) -> ArbResult<OrderBook> {
+            self.fast_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(book(self.venue, symbol, 1))
+        }
+    }
+
+    type Fixture = (HashMap<Venue, Arc<dyn VenueApi>>, Arc<Api>, Arc<Api>);
+
+    fn apis() -> Fixture {
+        let make = |venue| {
+            Arc::new(Api {
+                venue,
+                rest_calls: AtomicUsize::new(0),
+                fast_calls: AtomicUsize::new(0),
+            })
+        };
+        let (long, short) = (make(Venue::HyperliquidXyz), make(Venue::LighterRh));
+        let map = HashMap::from([
+            (
+                Venue::HyperliquidXyz,
+                Arc::clone(&long) as Arc<dyn VenueApi>,
+            ),
+            (Venue::LighterRh, Arc::clone(&short) as Arc<dyn VenueApi>),
+        ]);
+        (map, long, short)
+    }
+
+    #[tokio::test]
+    async fn the_fast_book_is_used_only_when_it_covers_the_size_otherwise_the_full_book_is_fetched()
+    {
+        let symbol = Symbol::perp("ANTH", "USDT");
+        let legs = |apis: &HashMap<Venue, Arc<dyn VenueApi>>, size| {
+            let apis = apis.clone();
+            let symbol = symbol.clone();
+            async move {
+                fetch_books_fast_for(
+                    &apis,
+                    (Venue::HyperliquidXyz, &symbol),
+                    (Venue::LighterRh, &symbol),
+                    20,
+                    size,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        // 顶档（1000 USDT）放得下 800：用快路径，不碰 REST。
+        let (map, long, _) = apis();
+        let (long_book, _) = legs(&map, dec!(800)).await;
+        assert_eq!(long_book.side(Side::Buy).len(), 1);
+        assert_eq!(long.fast_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(long.rest_calls.load(Ordering::SeqCst), 0);
+        // 放不下 5000：改拉整本（10 档），而不是让闸门按「深度不够」拒绝。
+        let (map, long, _) = apis();
+        let (long_book, _) = legs(&map, dec!(5000)).await;
+        assert_eq!(long_book.side(Side::Buy).len(), 10);
+        assert_eq!(long.rest_calls.load(Ordering::SeqCst), 1);
+        // 永远走 REST 的入口（页面预检、平仓核对、命令行）从不碰快路径。
+        let (map, long, _) = apis();
+        fetch_books_for(
+            &map,
+            (Venue::HyperliquidXyz, &symbol),
+            (Venue::LighterRh, &symbol),
+            20,
+        )
+        .await
+        .unwrap();
+        assert_eq!(long.fast_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(long.rest_calls.load(Ordering::SeqCst), 1);
     }
 }

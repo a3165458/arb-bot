@@ -13,12 +13,13 @@ pub mod scan;
 pub mod stability;
 
 pub use convergence::{BasisPoint, HalfLife, basis_series, half_life};
-pub use identity::{Cluster, Clustering};
+pub use identity::{Cluster, Clustering, PinnedPair};
 pub use leverage::{Health, LegRisk, PairRisk, pair_risk};
 pub use normalize::{to_apr, to_daily};
 pub use rank::{Opportunity, venue_fee};
 pub use sanity::{Suspicion, SuspicionMap};
 pub use scan::{
-    ExcludedReading, ScanReport, SymbolView, Totals, VenueReport, filter_by_base, rerank, scan,
+    ExcludedReading, RatesCache, ScanReport, SymbolView, Totals, VenueReport, filter_by_base,
+    rerank, scan, scan_into, scan_reusing, scan_reusing_pinned,
 };
 pub use stability::FundingStability;

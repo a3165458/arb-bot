@@ -28,6 +28,7 @@
     <button class="nav-item" type="button" data-page="strategy">策略</button>
     <button class="nav-item" type="button" data-page="positions">持仓</button>
     <button class="nav-item" type="button" data-page="rhspread">价差监控</button>
+    <button class="nav-item" type="button" data-page="chart">价差图表</button>
   </nav>
   <div class="header-right">
     <div class="chips" id="chips"></div>
@@ -226,11 +227,13 @@
   <section class="section-head">
     <span class="eyebrow coral">manage</span>
     <h2 id="pos-title">纸面持仓</h2>
-    <p id="pos-intro">台账里的双腿仓位，按当前行情评估每笔仓位的规则。配置了令牌时可以在这里平仓、手动跑一轮规则。</p>
+    <p id="pos-intro">台账里的双腿仓位，按当前行情评估每笔仓位的规则。配置了令牌时可以在这里平仓、补仓、手动跑一轮规则。</p>
   </section>
   <section class="controls card" id="pos-toolbar">
     <span class="small" id="pos-round"></span>
     <span class="grow"></span>
+    <button class="btn ghost hidden" id="pos-collapse-all" type="button">全部折叠</button>
+    <button class="btn ghost hidden" id="pos-expand-all" type="button">全部展开</button>
     <button class="btn ghost" id="pos-account-btn" type="button">刷新实盘账户</button>
     <button class="btn ghost" id="pos-monitor" type="button">执行一轮规则</button>
   </section>
@@ -238,15 +241,53 @@
   <div id="pos-account"></div>
   <div class="stats" id="pos-stats"></div>
   <div id="pos-open"></div>
+  <section class="card block hidden" id="trade-stats">
+    <div class="row-head">
+      <h3>交易统计</h3>
+      <span class="small muted" title="净盈亏 = 价格盈亏 − 手续费 + 资金费，与「最近结束」的已实现净额同一口径；按结束时间归入时间段。没成交过的不计，已隐藏的照样计。">按结束时间 · 含隐藏 · 不含没成交的</span>
+      <span class="grow"></span>
+      <div class="seg" id="trade-stats-seg" role="group" aria-label="统计时间段"></div>
+    </div>
+    <div class="stats" id="trade-stats-tiles"></div>
+    <p class="small muted" id="trade-stats-foot"></p>
+    <details class="trade-stats-more" open>
+      <summary>按交易所</summary>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>交易所</th><th class="num" title="这家所有有成交的订单的成交名义（开仓、补仓、减仓、平仓、回滚）；开仓侧按开仓时间、平仓侧按结束时间归入时间段；在交易所里手动平掉的平仓侧按开仓名义估算">成交额</th><th class="num">占比</th><th class="num" title="挂单（post-only）成交的部分">其中挂单</th><th class="num" title="有成交的订单数">订单</th><th class="num" title="这段时间在这家有成交的仓位笔数">仓位</th><th class="num" title="各笔订单回报的手续费合计与折合费率；与上面「手续费」（按交易所成交记录核出的已结束仓位）口径不同，可能有出入">手续费 / 费率</th></tr></thead>
+          <tbody id="trade-stats-venues"></tbody>
+        </table>
+      </div>
+    </details>
+    <details class="trade-stats-more">
+      <summary>按合约</summary>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>合约</th><th class="num">结束</th><th class="num">盈 / 亏</th><th class="num" title="价格盈亏 − 手续费 + 资金费">净盈亏</th><th class="num">手续费</th><th class="num" title="两腿成交名义合计（开仓侧按开仓时间、平仓侧按结束时间归入时间段）">成交额</th></tr></thead>
+          <tbody id="trade-stats-symbols"></tbody>
+        </table>
+      </div>
+    </details>
+    <details class="trade-stats-more">
+      <summary>按日（UTC 日，最近 14 天）</summary>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>日期（UTC）</th><th class="num">结束</th><th class="num">盈 / 亏</th><th class="num">净盈亏</th><th class="num">手续费</th><th class="num">资金费</th><th class="num">新开</th><th class="num">成交额</th></tr></thead>
+          <tbody id="trade-stats-daily"></tbody>
+        </table>
+      </div>
+    </details>
+  </section>
   <section class="card block" id="pos-closed-wrap">
-    <div class="row-head"><h3>最近结束</h3></div>
+    <div class="row-head"><h3>最近结束</h3><span class="grow"></span><div class="closed-tools" id="pos-closed-tools"></div></div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>仓位</th><th>合约</th><th>两腿</th><th>状态</th><th>开仓</th><th>结束</th><th class="num" title="已实现盈亏 = 价格盈亏 − 手续费 + 持仓期间实际收付的资金费。看板自己平仓的按逐笔成交记，交易所里手动平仓的按交易所成交记录核算（数量逐腿对上才记）。">已实现盈亏</th><th>备注</th></tr></thead>
+        <thead><tr><th>仓位</th><th>合约</th><th>两腿</th><th>状态</th><th>开仓</th><th>结束</th><th class="num" title="已实现盈亏 = 价格盈亏 − 手续费 + 持仓期间实际收付的资金费。看板自己平仓的按逐笔成交记，交易所里手动平仓的按交易所成交记录核算（数量逐腿对上才记）。">已实现盈亏</th><th>备注</th><th></th></tr></thead>
         <tbody id="pos-closed"></tbody>
       </table>
     </div>
     <p class="empty" id="pos-closed-empty"></p>
+    <div class="pager hidden" id="pos-closed-pager"></div>
   </section>
 </main>
 
@@ -265,6 +306,8 @@
     <span class="grow"></span>
     <label class="small">组 <select id="rh-pair"></select></label>
     <label class="small"><input type="checkbox" id="rh-signal-only" /> 只看信号</label>
+    <label class="small" title="只取净收益最高的前 N 行：整份有两千多行，每 3 秒重画一次会很卡">显示行数 <select id="rh-limit"><option value="50">前 50</option><option value="100">前 100</option><option value="300">前 300</option><option value="0">全部</option></select></label>
+    <label class="small" title="还没有实盘账户的场所（Lighter 主网、Gate、Bitget、Ondo、PopDEX）和链上几家的价差：只攒历史，不提醒、不交易"><input type="checkbox" id="rh-watch" /> 显示观察组</label>
   </section>
   <div class="stats" id="rh-stats"></div>
   <section class="card block rh-auto" id="rh-auto"></section>
@@ -291,6 +334,61 @@
   </div>
 </main>
 
+<!-- 价差图表（参照 zuudot trading 页）：两家 K 线 + 价差 + 参考线，下面是两家资金费率与净资金费结算柱 -->
+<main class="page hidden" id="page-chart">
+  <section class="card zc-head">
+    <div class="zc-sym">
+      <b id="chart-title">—</b>
+      <span class="mono small muted" id="chart-insts"></span>
+    </div>
+    <div class="zc-funding" id="chart-funding-strip"><span class="muted small">资金费 —</span></div>
+  </section>
+  <section class="card zc-card">
+    <div class="zc-bar">
+      <label class="small">合约 <input type="text" id="chart-symbol" size="9" spellcheck="false" /></label>
+      <label class="small">交易所 1 <select id="chart-a"></select></label>
+      <label class="small">比例 <input type="number" id="chart-ratio1" value="1" step="any" min="0" class="zc-num" /></label>
+      <label class="small">交易所 2 <select id="chart-b"></select></label>
+      <label class="small">比例 <input type="number" id="chart-ratio2" value="1" step="any" min="0" class="zc-num" /></label>
+      <button type="button" class="btn primary small" id="chart-load">加载</button>
+      <span class="grow"></span>
+      <span class="zc-dir"><span id="chart-dir"></span> <button type="button" class="btn ghost small" id="chart-swap" title="多空互换">切换</button></span>
+    </div>
+    <div class="zc-tools">
+      <span class="muted small">历史范围</span>
+      <span class="seg zc-seg" id="chart-range"></span>
+      <span class="muted small">数据间隔</span>
+      <span class="seg zc-seg" id="chart-interval"></span>
+      <span class="grow"></span>
+      <span class="seg zc-seg" id="chart-kline" title="K 线展示方式"><button type="button" data-kline="line">收盘线</button><button type="button" data-kline="candle">K 线蜡烛</button></span>
+      <span class="seg zc-seg" id="chart-unit" title="价差单位"><button type="button" data-unit="pct">%</button><button type="button" data-unit="diff">价格差</button></span>
+      <details class="zc-menu">
+        <summary class="btn ghost small">设置</summary>
+        <div class="zc-menu-body">
+          <p class="small muted">开 / 关仓参考线：关 = 价差的 SMA，开 = 关 + 2 × (两腿手续费) + 最小利润（与 zuudot 同一公式）。手续费留空 = 扫描到的吃单费率。</p>
+          <label class="small">SMA 周期（分钟） <input type="number" id="chart-sma" step="any" min="1" class="zc-num" /></label>
+          <label class="small"><span id="chart-fee1-label">交易所 1 手续费 %</span> <input type="number" id="chart-fee1" step="any" min="0" class="zc-num" /></label>
+          <label class="small"><span id="chart-fee2-label">交易所 2 手续费 %</span> <input type="number" id="chart-fee2" step="any" min="0" class="zc-num" /></label>
+          <label class="small">最小利润 % <input type="number" id="chart-min-profit" step="any" min="0" class="zc-num" /></label>
+        </div>
+      </details>
+      <button type="button" class="btn ghost small" id="chart-share" title="复制当前图的链接（zuudot 同款参数）">分享</button>
+    </div>
+    <div class="small muted zc-status" id="chart-status"></div>
+    <div class="zc-chart-wrap">
+      <div class="zc-legend" id="chart-legend"></div>
+      <div class="zc-legend" id="chart-funding-legend"></div>
+      <div id="chart-main" class="chart-box zc-chart"></div>
+    </div>
+    <div class="zc-fsum small" id="chart-funding-summary"></div>
+  </section>
+  <section class="card">
+    <div id="chart-notes"></div>
+    <div class="stats" id="chart-stats"></div>
+    <p class="small muted">价差 = (空腿收盘 − 多腿收盘) / 两者均值，用的是 K 线成交价（Arcus 是预言机价），<b>不是盘口可成交价差</b>：不含买卖价差、深度和手续费，真正下单仍按现拉盘口核算。时间均为 UTC。</p>
+  </section>
+</main>
+
 <footer>
   <p>
     排名里的穿价只用一档。点开某一行会再拉多档深度，按 1000 USDT 估算滑点；
@@ -303,6 +401,7 @@
   </p>
 </footer>
 
+<script src="/vendor/lightweight-charts.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

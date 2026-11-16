@@ -135,6 +135,7 @@ impl Cli {
             take_profit_usdt: self.take_profit,
             auto_margin_pct: self.auto_margin,
             auto_margin_max_usdt: self.auto_margin_max,
+            ..TaskRules::default()
         }
     }
 }
@@ -427,6 +428,8 @@ async fn open(
             leverage: Some(leverage),
             rules: rules.clone(),
             quoted_at: None,
+            positions_checked: false,
+            force_hedge: None,
         };
         let outcome = executor
             .open(&execution_plan, strategy, basis, &position_id, &setup)
@@ -522,6 +525,7 @@ async fn watch(
             let ctx = arb_exec::desk::RoundCtx {
                 funding: &arb_exec::desk::PaperFunding,
                 retries: &retries,
+                exit_confirm_gap: arb_exec::desk::EXIT_CONFIRM_GAP,
             };
             for mut position in positions {
                 monitor_one(&executor, &mut position, &snapshots, by_venue, &ctx).await;

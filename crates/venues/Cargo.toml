@@ -15,3 +15,6 @@ rust_decimal = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = { workspace = true }

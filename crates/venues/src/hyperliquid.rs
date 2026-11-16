@@ -354,6 +354,48 @@ pub struct HyperliquidApi {
     dex: Dex,
     /// Entropy 自返佣（只对 io 生效），见 [`taker_fee_for`]。
     rebate: Decimal,
+    /// `meta`（币名对照）的缓存：拉盘口前要先用它把 `某合约` 查成 `xyz:SNDK`，不缓存就是每个盘口多一趟往返。
+    meta_cache: TtlCache<Meta>,
+}
+
+/// `meta` 缓存多久。币名对照几乎不变；新上市的币不在缓存里时会立刻现拉一份（见 [`resolve_coin`]），
+/// 所以这里只决定「已经有的币」多久重新核对一次。
+const META_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// 带过期时间的单值缓存。
+struct TtlCache<T> {
+    ttl: std::time::Duration,
+    slot: std::sync::Mutex<Option<(std::time::Instant, std::sync::Arc<T>)>>,
+}
+
+impl<T> TtlCache<T> {
+    fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            slot: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// 没过期的值。锁中毒当没有（回退成现拉，不会拿到坏数据）。
+    fn get(&self) -> Option<std::sync::Arc<T>> {
+        let slot = self.slot.lock().ok()?;
+        let (at, value) = slot.as_ref()?;
+        (at.elapsed() < self.ttl).then(|| std::sync::Arc::clone(value))
+    }
+
+    fn put(&self, value: T) -> std::sync::Arc<T> {
+        let value = std::sync::Arc::new(value);
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = Some((std::time::Instant::now(), std::sync::Arc::clone(&value)));
+        }
+        value
+    }
+
+    fn clear(&self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = None;
+        }
+    }
 }
 
 impl HyperliquidApi {
@@ -363,6 +405,7 @@ impl HyperliquidApi {
             client,
             dex: MAIN_DEX,
             rebate: Decimal::ZERO,
+            meta_cache: TtlCache::new(META_CACHE_TTL),
         }
     }
 
@@ -372,6 +415,7 @@ impl HyperliquidApi {
             client,
             dex: XYZ_DEX,
             rebate: Decimal::ZERO,
+            meta_cache: TtlCache::new(META_CACHE_TTL),
         }
     }
 
@@ -386,6 +430,7 @@ impl HyperliquidApi {
             client,
             dex: IO_DEX,
             rebate,
+            meta_cache: TtlCache::new(META_CACHE_TTL),
         }
     }
 
@@ -517,21 +562,43 @@ impl VenueApi for HyperliquidApi {
             Some(book) => book,
             None => {
                 // Symbol 会大写化，但 API 只认 kPEPE 等原始拼写；仅在查不到时回查元数据。
-                let meta: Meta = self.info(&self.dex.body("meta")).await?;
-                let coin = depth_coin(self.dex, &meta, symbol)?;
+                let coin = self.coin_for(symbol).await?;
                 if self.dex.name.is_none() && coin == symbol.base {
                     return Err(ArbError::venue(
                         venue.as_str(),
                         format!("{symbol} 没有盘口"),
                     ));
                 }
-                self.fetch_l2(coin)
-                    .await?
-                    .ok_or_else(|| ArbError::venue(venue.as_str(), format!("{symbol} 没有盘口")))?
+                match self.fetch_l2(&coin).await? {
+                    Some(book) => book,
+                    None => {
+                        // 缓存里的对照可能已经过时（下架了）：丢掉，下一次重新核对。
+                        self.meta_cache.clear();
+                        return Err(ArbError::venue(
+                            venue.as_str(),
+                            format!("{symbol} 没有盘口"),
+                        ));
+                    }
+                }
             }
         };
         parse_depth(self.dex, response, symbol)
     }
+    /// 开仓前的深度核算：行情 WebSocket（`bbo`，不用 `l2Book`）已经在本进程里维护着顶档，可信就直接用，
+    /// 省掉 `meta` + `l2Book` 两个串行的 REST 往返（可信条件见 [`crate::live_book`]）。**只有一档**：
+    /// 这笔金额顶档放不下，闸门就按「深度不够」拒绝，不会拿猜的深度凑数。不可信就是普通的
+    /// [`Self::fetch_depth`]（同样的计价资产 / dex 边界检查）。
+    async fn fetch_depth_fast(&self, symbol: &Symbol, levels: u32) -> ArbResult<OrderBook> {
+        if symbol.quote == QUOTE
+            && !self.dex.is_usdc_quoted(&symbol.base)
+            && !symbol.base.contains([':', '@', '/'])
+            && let Some(book) = self.live_depth(symbol)
+        {
+            return Ok(book);
+        }
+        self.fetch_depth(symbol, levels).await
+    }
+
     fn supports_candles(&self) -> bool {
         true
     }
@@ -619,9 +686,38 @@ impl HyperliquidApi {
     /// `Symbol::perp` 会大写化并去掉前缀、套用别名，而 API 只认 `kPEPE`、`xyz:GOLD`
     /// 这类原始拼写，所以按本 dex 的 `meta` 反查。
     async fn candle_coin(&self, symbol: &Symbol) -> ArbResult<String> {
-        let meta: Meta = self.info(&self.dex.body("meta")).await?;
-        Ok(depth_coin(self.dex, &meta, symbol)?.to_string())
+        self.coin_for(symbol).await
     }
+
+    /// 同 [`Self::candle_coin`]：盘口与 K 线共用的币名反查，走 `meta` 缓存。
+    async fn coin_for(&self, symbol: &Symbol) -> ArbResult<String> {
+        resolve_coin(self.dex, &self.meta_cache, symbol, || async {
+            let body = self.dex.body("meta");
+            self.info::<Meta>(&body).await
+        })
+        .await
+    }
+}
+
+/// 用缓存的 `meta` 反查币名；缓存没有、已过期、或里面查不到这个币（可能是刚上市）时现拉一份再查。
+/// 现拉后仍然查不到才报错 —— 所以缓存只会省掉往返，不会让新上市的币「暂时不存在」。
+async fn resolve_coin<F, Fut>(
+    dex: Dex,
+    cache: &TtlCache<Meta>,
+    symbol: &Symbol,
+    fetch: F,
+) -> ArbResult<String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ArbResult<Meta>>,
+{
+    if let Some(meta) = cache.get()
+        && let Ok(coin) = depth_coin(dex, &meta, symbol)
+    {
+        return Ok(coin.to_string());
+    }
+    let meta = cache.put(fetch().await?);
+    depth_coin(dex, &meta, symbol).map(str::to_string)
 }
 
 fn depth_coin<'a>(dex: Dex, meta: &'a Meta, symbol: &Symbol) -> ArbResult<&'a str> {
@@ -640,6 +736,34 @@ fn depth_coin<'a>(dex: Dex, meta: &'a Meta, symbol: &Symbol) -> ArbResult<&'a st
                 format!("{} 没有可交易的 {symbol}", dex.venue),
             )
         })
+}
+
+/// 实时顶档可信的前提：行情连接的心跳最多可以多旧（心跳每 2 秒一次，6 秒收不到任何消息监控就判死重连；
+/// 见 [`crate::live_book`]）。
+const LIVE_BOOK_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(6);
+
+impl HyperliquidApi {
+    /// 从 [`crate::live_book`] 取这个合约的盘口，转成与 REST 解析同一形状；不可信或不完整都是 `None`。
+    fn live_depth(&self, symbol: &Symbol) -> Option<OrderBook> {
+        let (raw_bids, raw_asks) =
+            crate::live_book::fresh(self.dex.venue, &symbol.base, LIVE_BOOK_MAX_AGE)?;
+        let levels = |raw: Vec<(Decimal, Decimal)>| -> Option<Vec<Level>> {
+            raw.into_iter()
+                .map(|(price, size)| {
+                    price.checked_mul(size).map(|notional_usdt| Level {
+                        price,
+                        notional_usdt,
+                    })
+                })
+                .collect()
+        };
+        Some(OrderBook {
+            venue: self.dex.venue,
+            symbol: symbol.clone(),
+            bids: levels(raw_bids)?,
+            asks: levels(raw_asks)?,
+        })
+    }
 }
 
 fn parse_depth(dex: Dex, response: L2Book, symbol: &Symbol) -> ArbResult<OrderBook> {
@@ -1268,6 +1392,87 @@ mod tests {
         assert_eq!(book.bids[0].notional_usdt, dec("999.88114"));
     }
 
+    #[tokio::test]
+    async fn the_meta_lookup_is_cached_but_a_new_listing_is_still_found() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tsla_only = || load_dex(&[XYZ_TSLA]).0;
+        let both = || load_dex(&[XYZ_TSLA, XYZ_GOLD]).0;
+        let cache = TtlCache::new(std::time::Duration::from_secs(600));
+        let fetches = AtomicUsize::new(0);
+        // 第一次拉到的 meta 里只有 TSLA；之后「上市」了 GOLD。
+        let fetch = || {
+            let n = fetches.fetch_add(1, Ordering::SeqCst);
+            let meta = if n == 0 { tsla_only() } else { both() };
+            async move { Ok(meta) }
+        };
+        let tsla = Symbol::perp("TSLA", "USDT");
+        let gold = Symbol::perp("XAU", "USDT");
+
+        assert_eq!(
+            resolve_coin(XYZ_DEX, &cache, &tsla, &fetch).await.unwrap(),
+            "xyz:TSLA"
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        // 缓存里有：不再请求。
+        assert_eq!(
+            resolve_coin(XYZ_DEX, &cache, &tsla, &fetch).await.unwrap(),
+            "xyz:TSLA"
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), 1, "命中缓存不该再拉 meta");
+        // 缓存里没有这个币：现拉一份，找到了。
+        assert_eq!(
+            resolve_coin(XYZ_DEX, &cache, &gold, &fetch).await.unwrap(),
+            "xyz:GOLD"
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        // 现拉后仍然没有：报错，不是返回缓存里的别的币。
+        let missing = Symbol::perp("NOPE", "USDT");
+        assert!(
+            resolve_coin(XYZ_DEX, &cache, &missing, &fetch)
+                .await
+                .is_err()
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn an_expired_or_cleared_meta_cache_is_fetched_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fetches = AtomicUsize::new(0);
+        let fetch = || {
+            fetches.fetch_add(1, Ordering::SeqCst);
+            let meta = load_dex(&[XYZ_TSLA]).0;
+            async move { Ok(meta) }
+        };
+        let tsla = Symbol::perp("TSLA", "USDT");
+
+        // ttl 为 0：永远算过期。
+        let expired = TtlCache::new(std::time::Duration::ZERO);
+        resolve_coin(XYZ_DEX, &expired, &tsla, &fetch)
+            .await
+            .unwrap();
+        resolve_coin(XYZ_DEX, &expired, &tsla, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+
+        let cache = TtlCache::new(std::time::Duration::from_secs(600));
+        resolve_coin(XYZ_DEX, &cache, &tsla, &fetch).await.unwrap();
+        cache.clear();
+        resolve_coin(XYZ_DEX, &cache, &tsla, &fetch).await.unwrap();
+        assert_eq!(fetches.load(Ordering::SeqCst), 4);
+
+        // 请求失败原样报错，缓存不被污染。
+        let broken = TtlCache::new(std::time::Duration::from_secs(600));
+        let failing = || async { Err::<Meta, _>(ArbError::venue("hyperliquid-xyz", "boom")) };
+        assert!(
+            resolve_coin(XYZ_DEX, &broken, &tsla, &failing)
+                .await
+                .is_err()
+        );
+        assert!(broken.get().is_none());
+    }
+
     #[test]
     fn hip3_requests_carry_the_dex_and_main_does_not() {
         assert_eq!(
@@ -1279,5 +1484,53 @@ mod tests {
             json!({ "type": "perpsAtOpenInterestCap" })
         );
         assert!(!XYZ_DEX.is_usdc_quoted("HYPE"), "USDC 计价例外只属于主 dex");
+    }
+
+    /// 指向没人监听的本地端口的客户端：真去联网就立刻报错，证明走的是实时盘口缓存。
+    fn offline_client() -> Client {
+        Client::builder()
+            .timeout(std::time::Duration::from_millis(300))
+            .no_proxy()
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    // 测试之间靠这把锁串行（实时顶档缓存是进程内全局的）；每个测试各有线程和运行时，不会死锁。
+    #[allow(clippy::await_holding_lock)]
+    async fn depth_comes_from_the_live_top_when_it_is_trusted_and_from_rest_otherwise() {
+        let _guard = crate::live_book::test_lock();
+        use rust_decimal_macros::dec;
+        let api = HyperliquidApi::xyz(offline_client());
+        let symbol = Symbol::perp("LIVEDEPTH", QUOTE);
+        // 没有顶档：退回 REST（测试里连不上 = 报错，说明确实去联网了）。
+        assert!(api.fetch_depth_fast(&symbol, 20).await.is_err());
+        // 有顶档但连接没有心跳：不可信，同样退回 REST。
+        crate::live_book::set_top(
+            Venue::HyperliquidXyz,
+            "LIVEDEPTH",
+            Some((dec!(100), dec!(4))),
+            Some((dec!(100.5), dec!(3))),
+            None,
+        );
+        assert!(api.fetch_depth_fast(&symbol, 20).await.is_err());
+        // 连接有心跳：不联网也拿得到，只有一档，数量换算成名义。
+        crate::live_book::heartbeat(Venue::HyperliquidXyz, std::time::Instant::now());
+        let book = api.fetch_depth_fast(&symbol, 20).await.unwrap();
+        assert_eq!(book.venue, Venue::HyperliquidXyz);
+        assert_eq!((book.bids.len(), book.asks.len()), (1, 1));
+        assert_eq!(book.bids[0].price, dec!(100));
+        assert_eq!(book.bids[0].notional_usdt, dec!(400));
+        assert_eq!(book.asks[0].notional_usdt, dec!(301.5));
+        // 普通的 fetch_depth（平仓核对、预检、页面）不吃这份缓存：照旧去 REST（测试里连不上 = 报错）。
+        assert!(api.fetch_depth(&symbol, 20).await.is_err());
+        // USDC 计价的币永远不吃这份缓存的快路径（主 dex 的 HYPE / PURR）：边界检查先于缓存。
+        let main = HyperliquidApi::main(offline_client());
+        assert!(
+            main.fetch_depth_fast(&Symbol::perp("HYPE", QUOTE), 20)
+                .await
+                .is_err()
+        );
+        crate::live_book::remove_venue(Venue::HyperliquidXyz);
     }
 }

@@ -27,6 +27,53 @@ pub struct VenueReport {
     pub rates: usize,
     pub error: Option<String>,
     pub elapsed_ms: u64,
+    /// 这一轮没有现拉、沿用了 [`RatesCache`] 里多久以前的读数（毫秒）；现拉的为 `None`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reused_age_ms: Option<u64>,
+}
+
+/// 各场所最近一次**成功**取到的原始读数（[`scan_into`] / [`scan_reusing`] 写入）。
+///
+/// 给只需要现拉一两家的扫描用：实盘下单前的现扫只现拉两腿场所，其余场所的读数只用来分簇
+/// （同一资产，参考价相差 5% 以内）和可信度筛查（资金费日化离群 8σ 且 ≥ 0.5%），沿用看板一分钟内
+/// 那轮的就够了 —— 而现拉九家要等最慢的那家（2026-10-25 东京：Bitget 150~200ms、MEXC 100~160ms，
+/// 两腿常用的几家 10~80ms）。
+#[derive(Default)]
+pub struct RatesCache {
+    inner: std::sync::Mutex<HashMap<Venue, (Instant, Vec<MarketSnapshot>)>>,
+}
+
+impl RatesCache {
+    fn put(&self, venue: Venue, rates: &[MarketSnapshot]) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(venue, (Instant::now(), rates.to_vec()));
+    }
+
+    /// `venue` 不超过 `max_age` 的读数，和它有多旧。
+    fn get(&self, venue: Venue, max_age: Duration) -> Option<(Duration, Vec<MarketSnapshot>)> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&venue)
+            .map(|(at, rates)| (at.elapsed(), rates))
+            .filter(|(age, _)| *age <= max_age)
+            .map(|(age, rates)| (age, rates.clone()))
+    }
+}
+
+/// 读数从哪来：全部现拉（[`scan`]）、全部现拉并记进缓存（[`scan_into`]）、或者只现拉 `fresh` 这几家、
+/// 其余沿用缓存里不超过 `max_age` 的（[`scan_reusing`]，缓存里没有或太旧的照样现拉）。
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Fresh,
+    Record(&'a RatesCache),
+    Reuse {
+        cache: &'a RatesCache,
+        fresh: &'a [Venue],
+        max_age: Duration,
+    },
 }
 
 /// 被排除在配对之外的读数。
@@ -147,12 +194,121 @@ fn note_venue_result(venue: Venue, error: Option<String>) {
 /// 单家场所失败不影响其它家：套利要的是「所有能配对的场所」，一家挂了不该让
 /// 整轮扫描失败，但必须在 [`VenueReport`] 里留痕。
 pub async fn scan(apis: &[Arc<dyn VenueApi>], settings: &Settings) -> ScanReport {
+    scan_from(apis, settings, Source::Fresh).await
+}
+
+/// 同 [`scan`]，并把每家成功取到的读数记进 `cache`（看板的后台全量扫描用）。
+pub async fn scan_into(
+    apis: &[Arc<dyn VenueApi>],
+    settings: &Settings,
+    cache: &RatesCache,
+) -> ScanReport {
+    scan_from(apis, settings, Source::Record(cache)).await
+}
+
+/// 同 [`scan`]，但只现拉 `fresh` 这几家（下单的两条腿）；其余场所沿用 `cache` 里不超过 `max_age` 的读数，
+/// 缓存里没有或太旧的照样现拉。现拉到的也记进缓存。分簇、筛查、排名与 [`scan`] 完全相同。
+pub async fn scan_reusing(
+    apis: &[Arc<dyn VenueApi>],
+    settings: &Settings,
+    cache: &RatesCache,
+    fresh: &[Venue],
+    max_age: Duration,
+) -> ScanReport {
+    scan_reusing_pinned(apis, settings, cache, fresh, max_age, None).await
+}
+
+/// 同 [`scan_reusing`]，给已在台账里配成一对的两条腿补仓用：分簇把这两腿分进了不同的簇
+/// （别家的报价把簇均值拉偏了）、而两腿彼此的参考价仍在容差以内时，另加一个只含这两腿的簇，
+/// 见 [`identity::pin_pair`]。其余分簇、筛查、排名与 [`scan`] 完全相同。
+pub async fn scan_reusing_pinned(
+    apis: &[Arc<dyn VenueApi>],
+    settings: &Settings,
+    cache: &RatesCache,
+    fresh: &[Venue],
+    max_age: Duration,
+    pin: Option<&identity::PinnedPair>,
+) -> ScanReport {
+    scan_from_pinned(
+        apis,
+        settings,
+        Source::Reuse {
+            cache,
+            fresh,
+            max_age,
+        },
+        pin,
+    )
+    .await
+}
+
+async fn scan_from(
+    apis: &[Arc<dyn VenueApi>],
+    settings: &Settings,
+    source: Source<'_>,
+) -> ScanReport {
+    scan_from_pinned(apis, settings, source, None).await
+}
+
+async fn scan_from_pinned(
+    apis: &[Arc<dyn VenueApi>],
+    settings: &Settings,
+    source: Source<'_>,
+    pin: Option<&identity::PinnedPair>,
+) -> ScanReport {
     // 单家场所一轮取数的总时限：连接器内部串行发好几个请求（OKX 六个），每个都可能用满
     // HTTP 超时，一家卡住不能把整轮拖成各请求超时之和。
     let deadline = Duration::from_secs((settings.http_timeout_sec * 2).max(10));
-    let (rates, venues) = fetch_all(apis, deadline).await;
+    let (rates, venues) = fetch_all(apis, deadline, source).await;
 
-    let clustering = identity::cluster(rates, settings.min_venues);
+    let pinned_raw: Vec<MarketSnapshot> = pin
+        .map(|pin| {
+            rates
+                .iter()
+                .filter(|rate| rate.symbol.base.eq_ignore_ascii_case(&pin.base))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut clustering = identity::cluster(rates, settings.min_venues);
+    // 没成对的原因记成这条腿「身份无法核实」：补仓的报错据此说清楚两腿差了多少。
+    let mut pin_refused: Option<ExcludedReading> = None;
+    if let Some(pin) = pin {
+        match identity::pin_pair(&mut clustering, &pinned_raw, pin) {
+            identity::Pinned::AlreadyTogether => {}
+            identity::Pinned::Added => info!(
+                base = %pin.base,
+                long = %pin.long,
+                short = %pin.short,
+                "两腿被分簇拆开，但彼此相差在容差以内：按台账里的这一对单独成簇（只用于补仓）"
+            ),
+            identity::Pinned::Refused(reason) => {
+                // 记在被拆出去的那条腿上（不在任何同名簇里的那条）；都在就记空腿。
+                let in_cluster = |venue: Venue| {
+                    clustering.clusters.iter().any(|cluster| {
+                        cluster.symbol.base.eq_ignore_ascii_case(&pin.base)
+                            && cluster.rates.iter().any(|rate| rate.venue == venue)
+                    })
+                };
+                let venue = if in_cluster(pin.short) && !in_cluster(pin.long) {
+                    pin.long
+                } else {
+                    pin.short
+                };
+                let symbol = pinned_raw
+                    .iter()
+                    .find(|rate| rate.venue == venue)
+                    .map(|rate| rate.symbol.clone())
+                    .unwrap_or_else(|| Symbol::perp(&pin.base, "USDT"));
+                warn!(base = %pin.base, long = %pin.long, short = %pin.short, %reason, "补仓两腿没能按台账成对");
+                pin_refused = Some(ExcludedReading {
+                    venue,
+                    symbol,
+                    reason: format!("补仓两腿没能成对：{reason}"),
+                });
+            }
+        }
+    }
 
     let mut unverified: Vec<ExcludedReading> = clustering
         .unverified
@@ -163,6 +319,7 @@ pub async fn scan(apis: &[Arc<dyn VenueApi>], settings: &Settings) -> ScanReport
             reason: row.reason.to_string(),
         })
         .collect();
+    unverified.extend(pin_refused);
     sort_excluded(&mut unverified);
 
     let config = rank_config(settings);
@@ -356,12 +513,34 @@ fn recount(report: &mut ScanReport) {
 async fn fetch_all(
     apis: &[Arc<dyn VenueApi>],
     deadline: Duration,
+    source: Source<'_>,
 ) -> (Vec<MarketSnapshot>, Vec<VenueReport>) {
     use arb_core::ArbError;
     use arb_venues::http::{cool_down, cooling, default_cooldown, looks_rate_limited};
 
+    let mut rates = Vec::new();
+    let mut venues = Vec::new();
     let mut set: JoinSet<(Venue, Result<Vec<MarketSnapshot>, ArbError>, u64)> = JoinSet::new();
     for api in apis {
+        if let Source::Reuse {
+            cache,
+            fresh,
+            max_age,
+        } = source
+            && !fresh.contains(&api.venue())
+            && let Some((age, cached)) = cache.get(api.venue(), max_age)
+        {
+            venues.push(VenueReport {
+                venue: api.venue(),
+                ok: true,
+                rates: cached.len(),
+                error: None,
+                elapsed_ms: 0,
+                reused_age_ms: Some(age.as_millis() as u64),
+            });
+            rates.extend(cached);
+            continue;
+        }
         let api = Arc::clone(api);
         set.spawn(async move {
             let started = Instant::now();
@@ -390,18 +569,24 @@ async fn fetch_all(
         });
     }
 
-    let mut rates = Vec::new();
-    let mut venues = Vec::new();
+    let record = match source {
+        Source::Fresh => None,
+        Source::Record(cache) | Source::Reuse { cache, .. } => Some(cache),
+    };
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok((venue, Ok(fetched), elapsed_ms)) => {
                 note_venue_result(venue, None);
+                if let Some(cache) = record {
+                    cache.put(venue, &fetched);
+                }
                 venues.push(VenueReport {
                     venue,
                     ok: true,
                     rates: fetched.len(),
                     error: None,
                     elapsed_ms,
+                    reused_age_ms: None,
                 });
                 rates.extend(fetched);
             }
@@ -413,6 +598,7 @@ async fn fetch_all(
                     rates: 0,
                     error: Some(error.to_string()),
                     elapsed_ms,
+                    reused_age_ms: None,
                 });
             }
             // 连接器内部 panic：不能让它带走整轮扫描，但也必须留痕。
@@ -452,4 +638,156 @@ pub fn filter_by_base(report: &mut ScanReport, bases: &[String]) {
             .any(|base| row.symbol.base.eq_ignore_ascii_case(base))
     });
     recount(report);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use arb_core::ArbResult;
+    use rust_decimal_macros::dec;
+
+    /// 每次取数都数一下、报一个可以分簇的读数（标记价 = `price`）。
+    struct Counting {
+        venue: Venue,
+        price: std::sync::Mutex<Decimal>,
+        calls: AtomicUsize,
+    }
+
+    impl Counting {
+        fn new(venue: Venue, price: Decimal) -> Arc<Self> {
+            Arc::new(Self {
+                venue,
+                price: std::sync::Mutex::new(price),
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VenueApi for Counting {
+        fn venue(&self) -> Venue {
+            self.venue
+        }
+        async fn fetch_all(&self) -> ArbResult<Vec<MarketSnapshot>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let price = *self.price.lock().unwrap();
+            Ok(vec![MarketSnapshot {
+                venue: self.venue,
+                symbol: Symbol::perp("NVDA", "USDT"),
+                period_rate: dec!(0.0001),
+                interval_h: 8,
+                interval_assumed: false,
+                next_funding_at: Utc::now(),
+                next_funding_estimated: false,
+                taker_fee: None,
+                mark_price: Some(price),
+                index_price: Some(price),
+                best_bid: Some(price),
+                best_ask: Some(price),
+                bid_size_usdt: None,
+                ask_size_usdt: None,
+                open_interest_usdt: None,
+                quote_volume_24h: None,
+                max_leverage: None,
+                maintenance_margin: None,
+                oi_capped: false,
+            }])
+        }
+    }
+
+    fn mark(report: &ScanReport, venue: Venue) -> Option<Decimal> {
+        report
+            .symbols
+            .iter()
+            .flat_map(|view| view.rates.iter())
+            .find(|rate| rate.venue == venue)
+            .and_then(|rate| rate.mark_price)
+    }
+
+    #[tokio::test]
+    async fn reusing_scan_fetches_only_the_legs_and_takes_the_rest_from_the_cache() {
+        let settings = Settings::from_env().unwrap();
+        let (a, b, c) = (
+            Counting::new(Venue::Lighter, dec!(100)),
+            Counting::new(Venue::HyperliquidXyz, dec!(100.1)),
+            Counting::new(Venue::Bitget, dec!(100.2)),
+        );
+        let apis: Vec<Arc<dyn VenueApi>> = vec![a.clone(), b.clone(), c.clone()];
+        let cache = RatesCache::default();
+
+        // 缓存是空的：三家都现拉，并记进缓存。
+        let first = scan_reusing(
+            &apis,
+            &settings,
+            &cache,
+            &[Venue::Lighter],
+            Duration::from_secs(90),
+        )
+        .await;
+        assert_eq!((a.calls(), b.calls(), c.calls()), (1, 1, 1));
+        assert_eq!(first.totals.venues_ok, 3);
+
+        // 之后：只现拉两条腿，第三家沿用缓存（它的新价看不到，两腿的新价看得到）。
+        *a.price.lock().unwrap() = dec!(101);
+        *b.price.lock().unwrap() = dec!(101.1);
+        *c.price.lock().unwrap() = dec!(101.2);
+        let legs = [Venue::Lighter, Venue::HyperliquidXyz];
+        let report = scan_reusing(&apis, &settings, &cache, &legs, Duration::from_secs(90)).await;
+        assert_eq!((a.calls(), b.calls(), c.calls()), (2, 2, 1));
+        assert_eq!(mark(&report, Venue::Lighter), Some(dec!(101)));
+        assert_eq!(mark(&report, Venue::HyperliquidXyz), Some(dec!(101.1)));
+        assert_eq!(
+            mark(&report, Venue::Bitget),
+            Some(dec!(100.2)),
+            "旁证沿用缓存"
+        );
+        let reused = report
+            .venues
+            .iter()
+            .find(|venue| venue.venue == Venue::Bitget)
+            .unwrap();
+        assert!(reused.ok && reused.reused_age_ms.is_some());
+        assert!(
+            report
+                .venues
+                .iter()
+                .filter(|venue| legs.contains(&venue.venue))
+                .all(|venue| venue.reused_age_ms.is_none())
+        );
+        assert_eq!(report.totals.venues_ok, 3);
+
+        // 缓存太旧：照样现拉。
+        let stale = scan_reusing(&apis, &settings, &cache, &legs, Duration::ZERO).await;
+        assert_eq!(c.calls(), 2);
+        assert_eq!(mark(&stale, Venue::Bitget), Some(dec!(101.2)));
+    }
+
+    #[tokio::test]
+    async fn plain_scan_never_reads_the_cache_and_scan_into_fills_it() {
+        let settings = Settings::from_env().unwrap();
+        let (a, c) = (
+            Counting::new(Venue::Lighter, dec!(100)),
+            Counting::new(Venue::Bitget, dec!(100.2)),
+        );
+        let apis: Vec<Arc<dyn VenueApi>> = vec![a.clone(), c.clone()];
+        let cache = RatesCache::default();
+        scan_into(&apis, &settings, &cache).await;
+        scan(&apis, &settings).await;
+        assert_eq!((a.calls(), c.calls()), (2, 2), "scan 总是全部现拉");
+        // scan_into 记下的读数能被 scan_reusing 用上。
+        scan_reusing(
+            &apis,
+            &settings,
+            &cache,
+            &[Venue::Lighter],
+            Duration::from_secs(90),
+        )
+        .await;
+        assert_eq!((a.calls(), c.calls()), (3, 2));
+    }
 }

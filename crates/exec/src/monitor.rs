@@ -6,7 +6,7 @@
 //! | --- | --- | --- |
 //! | 数量失衡 | 两腿标的数量偏差 > `size_mismatch_pct` | 整笔平仓 |
 //! | 基差收敛 | 标记价基差 ≤ `basis_exit_pct`，且按盘口平仓为正 | 整笔平仓 |
-//! | 止盈 | **含资金费的净盈利** ≥ `take_profit_usdt`，且按盘口平仓后仍达标 | 整笔平仓 |
+//! | 止盈 | **含资金费的净盈利** ≥ `take_profit_usdt`，且按盘口平仓后仍达标（盘口门槛默认就是止盈金额，可用 `take_profit_book_min_usdt` 降低，0 = 为正就平；下单前还要隔一会儿重拉盘口复核）。另外看板逐秒盯盘口：标记价还没到、但两边盘口整笔平掉（含资金费）已到止盈，也会现拉盘口核对两次后平（`desk::book_trigger_exit`） | 整笔平仓 |
 //! | 费差自动平仓 | 最近几小时**平均**毛费差年化 < `min_funding_apr` | 整笔平仓 |
 //! | 自动加保证金 | 任一腿强平距离 < `auto_margin_pct`（要同时设累计上限） | 往这条腿补保证金，距离拉回 1.5 倍 |
 //! | 爆仓保护 | 任一腿强平距离 < `liq_protection_pct` | 两腿等比例减仓，距离拉回 1.5 倍 |
@@ -21,8 +21,8 @@
 //! # 基差收敛平仓：标记价只触发，盘口说了算
 //!
 //! 「标记价基差 ≤ 目标」只是**触发**。标记价不在买卖盘中间，平仓却要在空腿的卖盘买回、
-//! 在多腿的买盘卖出（2026-09-30 NEAR：标记价基差已收敛到 0.09%，按盘口平仓的价差却是
-//! 0.196%，比开仓时还宽，这笔亏了 1.29 USDT）。所以触发后由调用方现拉两边盘口，按持仓
+//! 在多腿的买盘卖出（实盘遇到过：标记价基差已收敛到 0.09%，按盘口平仓的价差却是
+//! 0.196%，比开仓时还宽，这笔亏了）。所以触发后由调用方现拉两边盘口，按持仓
 //! 数量算出「现在平掉整笔」的预估盈亏（[`ExitQuote`]，含已付和将付的手续费）；为正才平，
 //! 不为正、或者盘口拿不到，就继续持有并写明原因 —— 绝不退回按标记价平仓。
 
@@ -45,13 +45,99 @@ pub struct ExitQuote {
     pub short_price: Decimal,
     /// 按这两个价平仓的成交价差（%）：(空腿买回价 − 多腿卖出价) / 中间价 × 100。
     pub exit_basis_pct: Decimal,
-    /// 预估平仓手续费（每条腿按它开仓时实际付的费率）。
+    /// 预估平仓手续费（按开仓时实际付的费率，挂单开仓的按吃单费率，见 [`ExitFees`]）。
     pub exit_fee_usdt: Decimal,
     /// 现在平掉整笔的预估已实现盈亏：两腿价格盈亏 + 已减仓部分的盈亏 − 全部手续费。
     /// 不含资金费（台账不记资金费流水）。
     pub net_usdt: Decimal,
     /// 占多腿入场名义的百分比。
     pub net_pct: Decimal,
+    /// 平仓成本里买卖价差与吃深度各占多少（USDT）。任何一条腿的盘口缺另一侧、算不出中间价时为 `None`。
+    pub cost: Option<ExitCostParts>,
+    /// 估的是两腿各多少比例的数量（整笔 = 1，见 [`exit_quote_part`]）。
+    #[serde(skip)]
+    pub fraction: Decimal,
+    /// 这笔数量要吃到的最差一档：多腿卖出的最低买价、空腿买回的最高卖价。平仓限价保护按它定限价
+    /// （见 [`crate::desk`] 的 `exit_guard`）。
+    #[serde(skip)]
+    pub long_worst_price: Decimal,
+    #[serde(skip)]
+    pub short_worst_price: Decimal,
+}
+
+/// 现在平掉整笔的成本里，来自**盘口**的两项（USDT，正 = 成本，两条腿合计）。和标记价比较的那一项要标记价，
+/// 见 [`ExitQuote::gap`]。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ExitCostParts {
+    /// 多腿所在盘口的中间价、空腿所在盘口的中间价。
+    pub long_mid: Decimal,
+    pub short_mid: Decimal,
+    /// 吃单要穿的买卖价差：中间价到最优价。多腿卖在买一、空腿买在卖一。
+    pub spread_usdt: Decimal,
+    /// 这个数量吃穿多档的深度：最优价到整笔均价。
+    pub depth_usdt: Decimal,
+}
+
+/// 「标记价口径的净额」与「按盘口现在平掉的净额」之间的差额拆成四项（USDT，正 = 盘口口径比标记价口径少赚的）。
+/// 四项加起来**正好**是这个差额（见 [`ExitQuote::gap`]）。
+///
+/// 止盈先按标记价触发、再按盘口核对：两边常差一两个 USDT。这四项说清楚钱花在哪 ——
+/// 买卖价差和手续费几乎和平仓量成正比，分批平不会省；只有吃深度那一项分批才可能省。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ExitGap {
+    /// 标记价 vs 盘口中间价：正 = 标记价比盘口中间价好看（盘口上平不到标记价）。
+    pub mark_vs_mid_usdt: Decimal,
+    /// 买卖价差：中间价到最优价。
+    pub spread_usdt: Decimal,
+    /// 吃深度：最优价到整笔均价。
+    pub depth_usdt: Decimal,
+    /// 平仓手续费。
+    pub fee_usdt: Decimal,
+}
+
+impl ExitGap {
+    pub fn total(&self) -> Decimal {
+        self.mark_vs_mid_usdt + self.spread_usdt + self.depth_usdt + self.fee_usdt
+    }
+
+    /// 给日志和原因文本的一句话。
+    pub fn describe(&self) -> String {
+        let r = |value: Decimal| value.round_dp(3).normalize();
+        format!(
+            "标记价与盘口的差额 {} USDT = 标记价 vs 盘口中间价 {} + 买卖价差 {} + 吃深度 {} + 平仓手续费 {}",
+            r(self.total()),
+            r(self.mark_vs_mid_usdt),
+            r(self.spread_usdt),
+            r(self.depth_usdt),
+            r(self.fee_usdt)
+        )
+    }
+}
+
+impl ExitQuote {
+    /// 把「标记价口径净额 − 盘口口径净额」拆成四项。`long_mark` / `short_mark` 是评估这笔仓位用的两条腿标记价。
+    /// 盘口的中间价算不出来（`cost` 为 `None`）、或腿不完整时为 `None`。
+    pub fn gap(
+        &self,
+        position: &PairPosition,
+        long_mark: Decimal,
+        short_mark: Decimal,
+    ) -> Option<ExitGap> {
+        let cost = self.cost?;
+        let (long_qty, short_qty) = (
+            position.long.as_ref()?.quantity()? * self.fraction,
+            position.short.as_ref()?.quantity()? * self.fraction,
+        );
+        Some(ExitGap {
+            // 多腿：标记价卖出 vs 中间价卖出；空腿：中间价买回 vs 标记价买回。
+            mark_vs_mid_usdt: ((long_mark - cost.long_mid) * long_qty
+                + (cost.short_mid - short_mark) * short_qty)
+                .round_dp(8),
+            spread_usdt: cost.spread_usdt,
+            depth_usdt: cost.depth_usdt,
+            fee_usdt: self.exit_fee_usdt,
+        })
+    }
 }
 
 /// 平仓前的盘口核对结果。
@@ -65,8 +151,8 @@ pub enum ExitCheck {
     Quoted(ExitQuote),
 }
 
-/// 按数量吃一侧盘口的均价。深度不够这个数量时为 `None`。
-fn walk_quantity(levels: &[arb_core::Level], quantity: Decimal) -> Option<Decimal> {
+/// 按数量吃一侧盘口：（均价, 要吃到的最差一档的价）。深度不够这个数量时为 `None`。
+fn walk_quantity(levels: &[arb_core::Level], quantity: Decimal) -> Option<(Decimal, Decimal)> {
     if quantity <= Decimal::ZERO {
         return None;
     }
@@ -76,10 +162,22 @@ fn walk_quantity(levels: &[arb_core::Level], quantity: Decimal) -> Option<Decima
         cost += take * level.price;
         left -= take;
         if left <= Decimal::ZERO {
-            return Some(cost / quantity);
+            return Some((cost / quantity, level.price));
         }
     }
     None
+}
+
+/// 平仓按什么费率估手续费。每条腿按它开仓时实际付的费率；开仓费率是 0 的腿（挂单开仓）改按所在场所账户的
+/// **吃单**费率（[`crate::Broker::fee_per_side`]），`None`（纸面、没接入）时仍按 0。
+///
+/// 币安挂单开仓的腿开仓费率是 0，平仓却是吃单 0.04%：按 0 估、实际多付的就是这笔平仓手续费，
+/// 止盈核对因此偏乐观。但不能一律换成券商的吃单费率：Hyperliquid HIP-3（xyz、io）券商报的是 0.09%，
+/// 没算增长模式的减免，实际成交只收约 0.0086% —— 一律按它估会把这两家的平仓费高估十倍、该平的不平。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ExitFees {
+    pub long: Option<Decimal>,
+    pub short: Option<Decimal>,
 }
 
 /// 按两边现拉的盘口，估算现在平掉这笔双腿持仓的结果。
@@ -87,7 +185,23 @@ pub fn exit_quote(
     position: &PairPosition,
     long_book: &arb_core::OrderBook,
     short_book: &arb_core::OrderBook,
+    fees: ExitFees,
 ) -> Result<ExitQuote, String> {
+    exit_quote_part(position, long_book, short_book, fees, Decimal::ONE)
+}
+
+/// 同 [`exit_quote`]，但只平两腿各 `fraction`（0 < fraction ≤ 1）的数量：已实现盈亏、已付手续费按同一比例摊进来，
+/// 所以各个比例的 `net_usdt / fraction` 可以直接比较（分批平仓的影子测算用它，与整笔平仓同一套算法）。
+pub fn exit_quote_part(
+    position: &PairPosition,
+    long_book: &arb_core::OrderBook,
+    short_book: &arb_core::OrderBook,
+    fees: ExitFees,
+    fraction: Decimal,
+) -> Result<ExitQuote, String> {
+    if fraction <= Decimal::ZERO || fraction > Decimal::ONE {
+        return Err(format!("平仓比例 {fraction} 必须在 (0, 1] 之间"));
+    }
     let (Some(long_leg), Some(short_leg)) = (position.long.as_ref(), position.short.as_ref())
     else {
         return Err("不是完整的双腿持仓".into());
@@ -95,49 +209,83 @@ pub fn exit_quote(
     let (Some(long_qty), Some(short_qty)) = (long_leg.quantity(), short_leg.quantity()) else {
         return Err("入场价非正，算不出数量".into());
     };
-    let long_price = walk_quantity(&long_book.bids, long_qty).ok_or_else(|| {
+    let (long_qty, short_qty) = (long_qty * fraction, short_qty * fraction);
+    let (long_price, long_worst) = walk_quantity(&long_book.bids, long_qty).ok_or_else(|| {
         format!(
             "{} 买盘不够卖出这条腿的 {} 个",
             long_leg.venue,
             long_qty.round_dp(4)
         )
     })?;
-    let short_price = walk_quantity(&short_book.asks, short_qty).ok_or_else(|| {
-        format!(
-            "{} 卖盘不够买回这条腿的 {} 个",
-            short_leg.venue,
-            short_qty.round_dp(4)
-        )
-    })?;
-    // 平仓费率按这条腿开仓时实际付的（账户真实费率）；减过仓的腿会略偏高，偏保守。
-    let fee_rate = |leg: &LegFill| {
-        if leg.notional_usdt > Decimal::ZERO {
+    let (short_price, short_worst) =
+        walk_quantity(&short_book.asks, short_qty).ok_or_else(|| {
+            format!(
+                "{} 卖盘不够买回这条腿的 {} 个",
+                short_leg.venue,
+                short_qty.round_dp(4)
+            )
+        })?;
+    // 平仓费率按这条腿开仓时实际付的；挂单开仓（费率 0）的按场所账户的吃单费率（见 [`ExitFees`]）。
+    // 腿上的手续费是累计的（开仓 + 补仓 + 减仓 / 部分平仓），名义却在减仓后变小：减过仓、部分平过的仓位，
+    // 「手续费 ÷ 名义」会被放大（减掉一半就翻倍还多），这时不超过吃单费率。不直接改用吃单费率：
+    // Hyperliquid HIP-3 券商报 0.09%，实际只收约 0.0086%。
+    let shrunk = position.trims > 0 || position.exits > 0;
+    let fee_rate = |leg: &LegFill, taker: Option<Decimal>| {
+        let entry = if leg.notional_usdt > Decimal::ZERO {
             leg.fee_usdt / leg.notional_usdt
         } else {
             Decimal::ZERO
+        };
+        match (entry > Decimal::ZERO, taker) {
+            (true, Some(taker)) if shrunk => entry.min(taker),
+            (true, _) => entry,
+            (false, taker) => taker.unwrap_or(Decimal::ZERO),
         }
     };
-    let exit_fee_usdt =
-        fee_rate(long_leg) * long_qty * long_price + fee_rate(short_leg) * short_qty * short_price;
+    let exit_fee_usdt = fee_rate(long_leg, fees.long) * long_qty * long_price
+        + fee_rate(short_leg, fees.short) * short_qty * short_price;
     let price_pnl = (long_price - long_leg.average_price) * long_qty
         + (short_leg.average_price - short_price) * short_qty;
-    let net_usdt = price_pnl + position.realized_pnl_usdt
-        - position.realized_fee_usdt
-        - long_leg.fee_usdt
-        - short_leg.fee_usdt
+    let net_usdt = price_pnl
+        + (position.realized_pnl_usdt
+            - position.realized_fee_usdt
+            - long_leg.fee_usdt
+            - short_leg.fee_usdt)
+            * fraction
         - exit_fee_usdt;
     let mid = (long_price + short_price) / Decimal::TWO;
+    // 成本拆分：中间价需要买卖两侧都有、且不交叉。
+    let book_mid = |book: &arb_core::OrderBook| {
+        let (bid, ask) = (book.best_bid()?, book.best_ask()?);
+        (bid > Decimal::ZERO && bid < ask).then(|| (bid, ask, (bid + ask) / Decimal::TWO))
+    };
+    let cost = book_mid(long_book).zip(book_mid(short_book)).map(
+        |((long_bid, _, long_mid), (_, short_ask, short_mid))| ExitCostParts {
+            long_mid,
+            short_mid,
+            spread_usdt: ((long_mid - long_bid) * long_qty + (short_ask - short_mid) * short_qty)
+                .round_dp(8),
+            depth_usdt: ((long_bid - long_price) * long_qty
+                + (short_price - short_ask) * short_qty)
+                .round_dp(8),
+        },
+    );
+    let notional = long_leg.notional_usdt * fraction;
     Ok(ExitQuote {
         long_price: long_price.round_dp(8),
         short_price: short_price.round_dp(8),
         exit_basis_pct: ((short_price - long_price) / mid * Decimal::ONE_HUNDRED).round_dp(4),
         exit_fee_usdt: exit_fee_usdt.round_dp(8),
         net_usdt: net_usdt.round_dp(8),
-        net_pct: if long_leg.notional_usdt > Decimal::ZERO {
-            (net_usdt / long_leg.notional_usdt * Decimal::ONE_HUNDRED).round_dp(4)
+        net_pct: if notional > Decimal::ZERO {
+            (net_usdt / notional * Decimal::ONE_HUNDRED).round_dp(4)
         } else {
             Decimal::ZERO
         },
+        cost,
+        fraction,
+        long_worst_price: long_worst,
+        short_worst_price: short_worst,
     })
 }
 
@@ -155,6 +303,15 @@ fn held_net_usdt(position: &PairPosition, pnl: &PairPnl) -> Option<Decimal> {
     pnl.price_pnl_usdt.map(|price| {
         price + position.realized_pnl_usdt - position.realized_fee_usdt - pnl.fees_usdt
     })
+}
+
+/// 止盈盘口门槛的说法：0 是「为正即平」，其余写金额。
+fn book_min_text(min: Decimal) -> String {
+    if min.is_zero() {
+        "（盘口门槛：为正即平）".to_string()
+    } else {
+        format!("（盘口门槛 {} USDT）", min.normalize())
+    }
 }
 
 /// 止盈规则这一轮会不会触发（按标记价估算，含资金费）。触发了调用方才去拉盘口核对。
@@ -322,6 +479,22 @@ fn validate_rules_inner(
     {
         return Err(format!("止盈目标 {target} USDT 必须为正"));
     }
+    match (rules.take_profit_usdt, rules.take_profit_book_min_usdt) {
+        (None, Some(_)) => {
+            return Err("设了止盈的盘口门槛，但没设止盈：门槛只在止盈按标记价达标后才用".into());
+        }
+        (_, Some(min)) if min < Decimal::ZERO => {
+            return Err(format!(
+                "止盈的盘口门槛 {min} USDT 不能为负（0 = 盘口为正就平）"
+            ));
+        }
+        (Some(target), Some(min)) if min > target => {
+            return Err(format!(
+                "止盈的盘口门槛 {min} USDT 不能高于止盈金额 {target} USDT（它是用来放宽盘口核对的）"
+            ));
+        }
+        _ => {}
+    }
     match (rules.auto_margin_pct, rules.auto_margin_max_usdt) {
         (Some(_), None) => {
             return Err(
@@ -335,6 +508,30 @@ fn validate_rules_inner(
             return Err(format!("自动加保证金的累计上限 {max} USDT 必须为正"));
         }
         _ => {}
+    }
+    match (rules.timeout_hours, rules.timeout_max_loss_usdt) {
+        (Some(_), None) => {
+            return Err("超时退出必须同时设置可接受的最大亏损（USDT，0 = 保本才平）".into());
+        }
+        (None, Some(_)) => return Err("设了超时退出的可接受亏损，但没设持仓多少小时".into()),
+        (Some(hours), Some(loss)) => {
+            if hours <= Decimal::ZERO || hours > MAX_TIMEOUT_HOURS {
+                return Err(format!(
+                    "超时退出的持仓时长 {hours} 小时必须在 0 ~ {MAX_TIMEOUT_HOURS} 之间（不含 0）"
+                ));
+            }
+            if loss < Decimal::ZERO {
+                return Err(format!(
+                    "超时退出可接受的亏损 {loss} USDT 不能为负：填 0 表示保本才平"
+                ));
+            }
+        }
+        (None, None) => {}
+    }
+    if let Some(loss) = rules.stop_loss_usdt
+        && loss <= Decimal::ZERO
+    {
+        return Err(format!("止损 {loss} USDT 必须为正（亏到 −它就平仓）"));
     }
     if let (Some(auto), Some(protection)) = (rules.auto_margin_pct, rules.liq_protection_pct)
         && auto <= protection
@@ -402,16 +599,29 @@ pub struct Observation {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TakeProfitHold {
     pub target_usdt: Decimal,
+    /// 盘口核对实际用的门槛（没设盘口门槛时等于止盈金额）。
+    pub book_min_usdt: Decimal,
     /// 按标记价、含资金费的净额（触发依据）。
     pub mark_net_usdt: Decimal,
     /// 按盘口现在平掉整笔、含资金费的预估净额。盘口用不了时为 `None`。
     pub book_net_usdt: Option<Decimal>,
     pub funding_usdt: Decimal,
+    /// 标记价口径与盘口口径之间的差额拆成哪几项（盘口用不了、算不出中间价时为 `None`）。
+    pub gap: Option<ExitGap>,
     /// 人看的原因（与 `skipped` 里那条相同）。
     pub reason: String,
 }
 
 impl Observation {
+    /// 按盘口现在整笔平掉的预估净额，含已结算资金费（页面与 Telegram 的「净收益」口径）。
+    /// 没拉到盘口 / 用不了 / 资金费未知为 `None`。
+    pub fn book_net_with_funding_usdt(&self) -> Option<Decimal> {
+        self.exit
+            .as_ref()
+            .zip(self.funding_usdt)
+            .map(|(exit, funding)| exit.net_usdt + funding)
+    }
+
     /// 填上资金费流水，并算出含资金费的净额：价格盈亏 + 已减仓部分的已实现盈亏 + 资金费 − 已付手续费。
     /// 评估与展示共用这一处，口径不会漂开。资金费或标记价缺失时净额是 `None`。
     pub fn set_funding(&mut self, position: &PairPosition, funding_usdt: Option<Decimal>) {
@@ -547,6 +757,11 @@ pub struct Evaluation {
     /// 止盈按标记价达标、但盘口核对没通过（或盘口用不了）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub take_profit_hold: Option<TakeProfitHold>,
+    /// `action` 是「靠一次盘口快照判断出来的获利平仓」（止盈、基差收敛）：调用方下单前要隔一小会儿
+    /// 重拉盘口、再评估一遍，仍然成立才平（见 [`crate::desk`] 的平仓复核）。保护性退出（止损、数量失衡、
+    /// 超时、费差转负、爆仓保护）不在其内：它们不是在等一个好价，复核不过就拖着，风险比滑点大。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub needs_confirm: bool,
 }
 
 fn leg_status(
@@ -642,6 +857,35 @@ pub struct Inputs<'a> {
     /// 两条腿在交易所的实际保证金状态（补过保证金后台账里的开仓时保证金早不对了）。
     pub long_state: Option<&'a crate::broker::VenueLegState>,
     pub short_state: Option<&'a crate::broker::VenueLegState>,
+    /// 止盈的盘口核对额外要多出的金额（USDT）：美股开盘头一小时盘口乱跳、平仓滑点大（见 [`exit_buffer_usdt`]），
+    /// 这段时间按盘口要多赚这么多才平。0 = 不加。调用方按当前时刻给（纯函数里不读时钟）。
+    pub tp_buffer_usdt: Decimal,
+}
+
+/// 「按标记价到了止盈、盘口为正即平」的盘口门槛最低这么多（USDT）：门槛设成 0（为正即平）时，盘口预估 0 附近就平，
+/// 平仓滑点一吃就是亏的（实盘遇到过：预估约 0、实际为负）。门槛设得比它高的照旧用设的。
+pub const TP_BOOK_FLOOR_USDT: Decimal = Decimal::from_parts(1, 0, 0, false, 1);
+
+/// 美股开盘头一小时（纽约时间工作日 9:30–10:30，夏令时自动跟着变）止盈要多出的金额（USDT）。实盘平仓样本里
+/// 这一小时实际成交比盘口预估差得明显更多，其余时段差得少。
+pub const OPENING_EXIT_BUFFER_USDT: Decimal = Decimal::from_parts(3, 0, 0, false, 1);
+
+/// 现在是不是美股开盘头一小时（纽约时间周一到周五 9:30–10:30；不认节假日）。
+pub fn us_opening_hour(now: chrono::DateTime<chrono::Utc>) -> bool {
+    use chrono::{Datelike, Timelike};
+    let local = arb_core::new_york::local(now);
+    let minute = local.hour() * 60 + local.minute();
+    !matches!(local.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun)
+        && (9 * 60 + 30..10 * 60 + 30).contains(&minute)
+}
+
+/// 这一刻止盈要多出的盘口余量（见 [`Inputs::tp_buffer_usdt`]）。
+pub fn exit_buffer_usdt(now: chrono::DateTime<chrono::Utc>) -> Decimal {
+    if us_opening_hour(now) {
+        OPENING_EXIT_BUFFER_USDT
+    } else {
+        Decimal::ZERO
+    }
 }
 
 fn closing(observation: Observation, skipped: Vec<String>, reason: String) -> Option<Evaluation> {
@@ -651,6 +895,23 @@ fn closing(observation: Observation, skipped: Vec<String>, reason: String) -> Op
         fallback: None,
         skipped,
         take_profit_hold: None,
+        needs_confirm: false,
+    })
+}
+
+/// 获利平仓（止盈、基差收敛）：和 [`closing`] 一样，但要求调用方下单前复核盘口。
+///
+/// 这两条规则都是「盘口快照上的净额达标就平」。快照上的价差带噪声，每轮取一次、达标就触发，
+/// 等于在噪声的上沿开枪：实盘观察到，实际成交的平仓价差几乎总是比触发时
+/// 预估的差。
+fn closing_profit(
+    observation: Observation,
+    skipped: Vec<String>,
+    reason: String,
+) -> Option<Evaluation> {
+    closing(observation, skipped, reason).map(|evaluation| Evaluation {
+        needs_confirm: true,
+        ..evaluation
     })
 }
 
@@ -667,6 +928,7 @@ pub fn evaluate_full(
         funding_usdt,
         long_state,
         short_state,
+        tp_buffer_usdt,
     } = inputs;
     if position.status != PositionStatus::Open {
         return None;
@@ -730,6 +992,7 @@ pub fn evaluate_full(
             fallback: None,
             skipped,
             take_profit_hold: None,
+            needs_confirm: false,
         });
     }
 
@@ -763,7 +1026,7 @@ pub fn evaluate_full(
                             quote.net_usdt.round_dp(4),
                             quote.net_pct
                         );
-                        return closing(observation, skipped, reason);
+                        return closing_profit(observation, skipped, reason);
                     }
                     ExitCheck::Quoted(quote) => skipped.push(format!(
                         "{triggered}，但按盘口现在平仓价差 {}%，整笔预估 {} USDT（含手续费）不为正，继续持有",
@@ -797,26 +1060,62 @@ pub fn evaluate_full(
                     estimate.round_dp(4),
                     funding.round_dp(4)
                 );
+                // 盘口核对的门槛：默认就是止盈金额；设了盘口门槛时用它（0 = 为正就平）。
+                let book_min = rules
+                    .take_profit_book_min()
+                    .unwrap_or(target)
+                    .max(TP_BOOK_FLOOR_USDT.min(target))
+                    + tp_buffer_usdt;
+                let lowered = book_min != target;
                 match &exit {
                     ExitCheck::Quoted(quote) => {
                         let net = quote.net_usdt + funding;
-                        if net >= target {
+                        if net >= book_min && net > Decimal::ZERO {
                             let reason = format!(
-                                "{triggered}；按盘口现在平仓预估净赚 {} USDT（含平仓手续费与穿价），兑现",
-                                net.round_dp(4)
+                                "{triggered}；按盘口现在平仓预估净赚 {} USDT（含平仓手续费与穿价）{}，兑现",
+                                net.round_dp(4),
+                                if lowered {
+                                    book_min_text(book_min)
+                                } else {
+                                    String::new()
+                                }
                             );
-                            return closing(observation, skipped, reason);
+                            return closing_profit(observation, skipped, reason);
                         }
+                        let gap = observation
+                            .long
+                            .mark_price
+                            .zip(observation.short.mark_price)
+                            .and_then(|(long_mark, short_mark)| {
+                                quote.gap(position, long_mark, short_mark)
+                            });
                         let reason = format!(
-                            "{triggered}，但按盘口现在平仓预估只剩 {} USDT（含平仓手续费与穿价），不到止盈，继续持有",
-                            net.round_dp(4)
+                            "{triggered}，但按盘口现在平仓预估只剩 {} USDT（含平仓手续费与穿价），{}，继续持有{}",
+                            net.round_dp(4),
+                            if lowered && book_min.is_zero() {
+                                "不为正（盘口门槛：为正即平）".to_string()
+                            } else if !tp_buffer_usdt.is_zero() {
+                                format!(
+                                    "不到盘口门槛 {} USDT（美股开盘头一小时多要 {} USDT 的平仓滑点余量）",
+                                    book_min.normalize(),
+                                    tp_buffer_usdt.normalize()
+                                )
+                            } else if lowered {
+                                format!("不到盘口门槛 {} USDT", book_min.normalize())
+                            } else {
+                                "不到止盈".to_string()
+                            },
+                            gap.map(|gap| format!("；{}", gap.describe()))
+                                .unwrap_or_default()
                         );
                         skipped.push(reason.clone());
                         take_profit_hold = Some(TakeProfitHold {
                             target_usdt: target,
+                            book_min_usdt: book_min,
                             mark_net_usdt: estimate,
                             book_net_usdt: Some(net.round_dp(8)),
                             funding_usdt: funding,
+                            gap,
                             reason,
                         });
                     }
@@ -825,9 +1124,11 @@ pub fn evaluate_full(
                         skipped.push(reason.clone());
                         take_profit_hold = Some(TakeProfitHold {
                             target_usdt: target,
+                            book_min_usdt: book_min,
                             mark_net_usdt: estimate,
                             book_net_usdt: None,
                             funding_usdt: funding,
+                            gap: None,
                             reason,
                         });
                     }
@@ -893,6 +1194,69 @@ pub fn evaluate_full(
         }
     }
 
+    // 止损：按盘口现在平掉亏到 −止损就整笔平仓。资金费查不到按 0（宁可早止损）；盘口拿不到不按标记价平。
+    if let Some(limit) = rules.stop_loss_usdt {
+        match &exit {
+            ExitCheck::Quoted(quote) => {
+                let funding = observation.funding_usdt.unwrap_or(Decimal::ZERO);
+                let net = quote.net_usdt + funding;
+                if net <= -limit {
+                    let reason = format!(
+                        "止损：按盘口现在平仓预估 {} USDT（含资金费 {} USDT 与平仓手续费、穿价），亏损达到止损 {} USDT，整笔平仓",
+                        net.round_dp(4),
+                        funding.round_dp(4),
+                        limit.normalize()
+                    );
+                    return closing(observation, skipped, reason);
+                }
+            }
+            ExitCheck::Unavailable(why) => {
+                skipped.push(format!("止损：{why}，本轮核对不了（不按标记价平仓）"))
+            }
+            ExitCheck::NotFetched => {}
+        }
+    }
+
+    // 超时退出：拿不准会不会回归的仓位，到点后只要按盘口平掉的亏损在可接受范围内就走，释放名额。
+    // 和止盈一样按两边盘口核对（不按标记价），资金费不知道就不评估。
+    if let Some((hours, max_loss)) = rules.timeout_exit()
+        && timeout_triggered(position, chrono::Utc::now())
+    {
+        let triggered = format!(
+            "已持仓 {} 小时（超时退出设为 {} 小时）",
+            held_hours(position, chrono::Utc::now()).round_dp(1),
+            hours.normalize()
+        );
+        match (&exit, observation.funding_usdt) {
+            (ExitCheck::Quoted(quote), Some(funding)) => {
+                let net = quote.net_usdt + funding;
+                if net >= -max_loss {
+                    let reason = format!(
+                        "{triggered}；按盘口现在平仓预估 {} USDT（含资金费 {} USDT 与平仓手续费），亏损在可接受的 {} USDT 以内，超时退出",
+                        net.round_dp(4),
+                        funding.round_dp(4),
+                        max_loss.normalize()
+                    );
+                    return closing(observation, skipped, reason);
+                }
+                skipped.push(format!(
+                    "{triggered}，但按盘口现在平仓预估 {} USDT（含资金费），亏损超过可接受的 {} USDT，继续持有",
+                    net.round_dp(4),
+                    max_loss.normalize()
+                ));
+            }
+            (ExitCheck::Quoted(_), None) => skipped.push(format!(
+                "{triggered}，但资金费流水没查到，算不出整笔净额，先不按超时平仓"
+            )),
+            (ExitCheck::Unavailable(why), _) => {
+                skipped.push(format!("{triggered}，但{why}，不按标记价平仓，继续持有"))
+            }
+            (ExitCheck::NotFetched, _) => skipped.push(format!(
+                "{triggered}；平不平要按两边盘口核对，由后台监控执行"
+            )),
+        }
+    }
+
     if position.margin_mode.is_cross() {
         if rules.auto_margin().is_some() {
             skipped.push("全仓不执行逐仓追加保证金".into());
@@ -914,6 +1278,7 @@ pub fn evaluate_full(
                             fallback: None,
                             skipped,
                             take_profit_hold,
+                            needs_confirm: false,
                         });
                     }
                     None => skipped.push(format!(
@@ -930,6 +1295,7 @@ pub fn evaluate_full(
             fallback: None,
             skipped,
             take_profit_hold,
+            needs_confirm: false,
         });
     }
     let mut trim_action = Action::Hold;
@@ -989,11 +1355,50 @@ pub fn evaluate_full(
         fallback,
         skipped,
         take_profit_hold,
+        needs_confirm: false,
     })
 }
 
 /// 一次补保证金的最小金额（USDT）：再小的补法每一轮都要打一次交易所，不值。
 pub const MIN_TOP_UP_USDT: Decimal = Decimal::ONE;
+
+/// 超时退出的持仓时长上限（小时）：30 天。再长就不是「超时」了，多半是填错了单位。
+pub const MAX_TIMEOUT_HOURS: Decimal = Decimal::from_parts(720, 0, 0, false, 0);
+
+/// 持仓了多少小时（不足一小时按小数）。
+fn held_hours(position: &PairPosition, now: chrono::DateTime<chrono::Utc>) -> Decimal {
+    Decimal::from((now - position.opened_at).num_seconds().max(0)) / Decimal::from(3600)
+}
+
+/// 超时退出这一轮会不会触发（只看持仓时长）。触发了调用方才去拉盘口核对。
+/// 止损这一轮要不要拉盘口核对：设了止损、按标记价（含已知资金费）已经亏到止损线的 80%。
+/// 留 20% 的余量是因为盘口平仓还要多付穿价，标记价看着没到、盘口其实已经到了。
+pub fn stop_loss_watch(
+    position: &PairPosition,
+    long: &MarketSnapshot,
+    short: &MarketSnapshot,
+    funding_usdt: Option<Decimal>,
+) -> bool {
+    let Some(limit) = position.rules.stop_loss_usdt else {
+        return false;
+    };
+    let (Some(long_leg), Some(short_leg)) = (position.long.as_ref(), position.short.as_ref())
+    else {
+        return false;
+    };
+    let mark = |snapshot: &MarketSnapshot| snapshot.mark_price.or(snapshot.index_price);
+    let pnl = pair_pnl(long_leg, short_leg, long, short, mark(long), mark(short));
+    held_net_usdt(position, &pnl).is_none_or(|net| {
+        net + funding_usdt.unwrap_or(Decimal::ZERO) <= -limit * Decimal::new(8, 1)
+    })
+}
+
+pub fn timeout_triggered(position: &PairPosition, now: chrono::DateTime<chrono::Utc>) -> bool {
+    position
+        .rules
+        .timeout_exit()
+        .is_some_and(|(hours, _)| held_hours(position, now) >= hours)
+}
 
 /// 自动加保证金：挑强平距离最近的那条腿，算出把距离拉回触发线 1.5 倍要补多少，按剩余上限夹住。
 ///
@@ -1172,6 +1577,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned: None,
         }
     }
 
@@ -1226,6 +1632,10 @@ mod tests {
             exit_fee_usdt: Decimal::ZERO,
             net_usdt: net,
             net_pct: net / dec!(10),
+            cost: None,
+            fraction: Decimal::ONE,
+            long_worst_price: dec!(100),
+            short_worst_price: dec!(100.05),
         }
     }
 
@@ -1345,6 +1755,7 @@ mod tests {
             &position,
             &book(Venue::LighterRh, dec!(4.9612594059), dec!(4.9650)),
             &book(Venue::Arcus, dec!(4.9660), dec!(4.971)),
+            ExitFees::default(),
         )
         .unwrap();
         assert!(
@@ -1365,6 +1776,105 @@ mod tests {
         let evaluation =
             evaluate_with_exit(&position, &long, &short, ExitCheck::Quoted(quote), None).unwrap();
         assert_eq!(evaluation.action, Action::Hold);
+    }
+
+    /// 标记价口径与盘口口径的差额拆成四项，加起来正好等于两个净额之差；每一项的符号都对得上它的来历。
+    #[test]
+    fn the_gap_between_the_mark_and_the_book_splits_into_four_parts_that_add_up() {
+        let level = |price: Decimal, notional: Decimal| arb_core::Level {
+            price,
+            notional_usdt: notional,
+        };
+        let book =
+            |venue, bids: Vec<arb_core::Level>, asks: Vec<arb_core::Level>| arb_core::OrderBook {
+                venue,
+                symbol: Symbol::perp("NEAR", "USDT"),
+                bids,
+                asks,
+            };
+        let mut position = position(TaskRules::default(), dec!(1000));
+        position.symbol = Symbol::perp("NEAR", "USDT");
+        position.strategy = Strategy::Spread;
+        position.long = Some(LegFill {
+            venue: Venue::LighterRh,
+            notional_usdt: dec!(1000.464932),
+            average_price: dec!(4.9204),
+            fee_usdt: Decimal::ZERO,
+            ..leg(Venue::LighterRh, Side::Buy, dec!(1000), dec!(3))
+        });
+        position.short = Some(LegFill {
+            venue: Venue::Arcus,
+            notional_usdt: dec!(1001.626673088),
+            average_price: dec!(4.926),
+            fee_usdt: dec!(0.225375889),
+            ..leg(Venue::Arcus, Side::Sell, dec!(1000), dec!(3))
+        });
+        // 第一档不够整笔（约 203 个）：多腿卖盘第一档只有 300 USDT，空腿买回的卖盘第一档也只有 300 USDT，
+        // 后面各有一档更差的 —— 「吃深度」这一项必须为正。
+        let long_book = book(
+            Venue::LighterRh,
+            vec![
+                level(dec!(4.9612), dec!(300)),
+                level(dec!(4.9500), dec!(50000)),
+            ],
+            vec![level(dec!(4.9650), dec!(50000))],
+        );
+        let short_book = book(
+            Venue::Arcus,
+            vec![level(dec!(4.9660), dec!(50000))],
+            vec![
+                level(dec!(4.9710), dec!(300)),
+                level(dec!(4.9800), dec!(50000)),
+            ],
+        );
+        let quote = exit_quote(&position, &long_book, &short_book, ExitFees::default()).unwrap();
+        let (long_mark, short_mark) = (dec!(4.9640), dec!(4.9685));
+        let gap = quote
+            .gap(&position, long_mark, short_mark)
+            .expect("两本盘口都有买卖两侧");
+        // 标记价口径的净额（不含资金费）= 价格盈亏按标记价 + 已实现 − 已付手续费。
+        let (long_leg, short_leg) = (
+            position.long.as_ref().unwrap(),
+            position.short.as_ref().unwrap(),
+        );
+        let (long_qty, short_qty) = (long_leg.quantity().unwrap(), short_leg.quantity().unwrap());
+        let mark_net = (long_mark - long_leg.average_price) * long_qty
+            + (short_leg.average_price - short_mark) * short_qty
+            + position.realized_pnl_usdt
+            - position.realized_fee_usdt
+            - long_leg.fee_usdt
+            - short_leg.fee_usdt;
+        assert!(
+            (gap.total() - (mark_net - quote.net_usdt)).abs() < dec!(0.000001),
+            "四项 {} 应等于净额之差 {}",
+            gap.total(),
+            mark_net - quote.net_usdt
+        );
+        assert!(
+            gap.spread_usdt > Decimal::ZERO,
+            "穿买卖价差是成本：{}",
+            gap.spread_usdt
+        );
+        assert!(
+            gap.depth_usdt > Decimal::ZERO,
+            "第一档不够整笔，吃深度是成本：{}",
+            gap.depth_usdt
+        );
+        assert_eq!(gap.fee_usdt, quote.exit_fee_usdt);
+        assert!(gap.fee_usdt > Decimal::ZERO);
+        // 多腿：标记价 4.9640 比这本盘口的中间价 (4.9612 + 4.9650) / 2 = 4.9631 高 0.0009，卖出时多算了；
+        // 空腿：标记价 4.9685 正好等于 (4.9660 + 4.9710) / 2。所以这一项为正，只来自多腿。
+        assert!(
+            gap.mark_vs_mid_usdt > Decimal::ZERO,
+            "{}",
+            gap.mark_vs_mid_usdt
+        );
+        assert!(gap.describe().contains("买卖价差") && gap.describe().contains("吃深度"));
+        // 任何一条腿的盘口缺另一侧，中间价算不出：不给拆分，但净额照常。
+        let one_sided = book(Venue::LighterRh, long_book.bids.clone(), vec![]);
+        let partial = exit_quote(&position, &one_sided, &short_book, ExitFees::default()).unwrap();
+        assert!(partial.cost.is_none() && partial.gap(&position, long_mark, short_mark).is_none());
+        assert_eq!(partial.net_usdt, quote.net_usdt);
     }
 
     #[test]
@@ -1388,8 +1898,152 @@ mod tests {
                 notional_usdt: dec!(50000),
             }],
         };
-        let error = exit_quote(&position, &thin, &deep).unwrap_err();
+        let error = exit_quote(&position, &thin, &deep, ExitFees::default()).unwrap_err();
         assert!(error.contains("买盘不够"), "{error}");
+    }
+
+    fn deep_book(
+        venue: Venue,
+        bids: Vec<(Decimal, Decimal)>,
+        asks: Vec<(Decimal, Decimal)>,
+    ) -> arb_core::OrderBook {
+        let levels = |side: Vec<(Decimal, Decimal)>| {
+            side.into_iter()
+                .map(|(price, notional_usdt)| arb_core::Level {
+                    price,
+                    notional_usdt,
+                })
+                .collect()
+        };
+        arb_core::OrderBook {
+            venue,
+            symbol: Symbol::perp("BTC", "USDT"),
+            bids: levels(bids),
+            asks: levels(asks),
+        }
+    }
+
+    /// 平仓手续费按开仓时实际付的费率估；挂单开仓（开仓费率 0，如币安）的腿按场所账户的吃单费率 ——
+    /// 不能一律按券商的吃单费率：Hyperliquid HIP-3 券商报 0.09%，实际成交只收约 0.0086%。
+    #[test]
+    fn the_exit_fee_uses_the_entry_rate_and_the_taker_rate_only_after_a_maker_entry() {
+        let mut position = position(TaskRules::default(), dec!(1000));
+        position.long.as_mut().unwrap().fee_usdt = Decimal::ZERO;
+        position.short.as_mut().unwrap().fee_usdt = dec!(0.086);
+        let long_book = deep_book(Venue::Lighter, vec![(dec!(100.2), dec!(100000))], vec![]);
+        let short_book = deep_book(
+            Venue::Hyperliquid,
+            vec![],
+            vec![(dec!(100.1), dec!(100000))],
+        );
+        let taker = ExitFees {
+            long: Some(dec!(0.0004)),
+            short: Some(dec!(0.0009)),
+        };
+        let quote = exit_quote(&position, &long_book, &short_book, taker).unwrap();
+        // 多腿挂单开仓：10 个 × 100.2 × 0.04%；空腿按开仓的 0.0086%（不按券商报的 0.09%）：10 个 × 100.1 × 0.0086%。
+        assert_eq!(quote.exit_fee_usdt, dec!(0.4008) + dec!(0.0860860));
+        // 价格盈亏 (100.2 − 100) × 10 + (100 − 100.1) × 10 = 1；开仓手续费 0.086。
+        assert_eq!(quote.net_usdt, dec!(1) - dec!(0.086) - quote.exit_fee_usdt);
+        // 吃单费率不知道（纸面）：挂单开仓的腿按 0。
+        let unknown = exit_quote(&position, &long_book, &short_book, ExitFees::default()).unwrap();
+        assert_eq!(unknown.exit_fee_usdt, dec!(0.0860860));
+    }
+
+    /// 减过仓的腿：手续费累计、名义变小，「手续费 ÷ 名义」被放大，平仓费率不超过吃单费率；
+    /// 吃单费率更高（HIP-3 报价偏高）时仍按开仓的。
+    #[test]
+    fn a_trimmed_legs_exit_fee_rate_is_capped_at_the_taker_rate() {
+        let mut position = position(TaskRules::default(), dec!(1000));
+        // 多腿：开仓 0.04% 付 0.4，减掉一半后名义 500、累计手续费 0.6 → 反推 0.12%。
+        position.long.as_mut().unwrap().fee_usdt = dec!(0.6);
+        position.long.as_mut().unwrap().notional_usdt = dec!(500);
+        position.short.as_mut().unwrap().fee_usdt = dec!(0.086);
+        position.short.as_mut().unwrap().notional_usdt = dec!(500);
+        position.trims = 1;
+        let long_book = deep_book(Venue::Lighter, vec![(dec!(100), dec!(100000))], vec![]);
+        let short_book = deep_book(Venue::Hyperliquid, vec![], vec![(dec!(100), dec!(100000))]);
+        let taker = ExitFees {
+            long: Some(dec!(0.0004)),
+            short: Some(dec!(0.0009)),
+        };
+        let quote = exit_quote(&position, &long_book, &short_book, taker).unwrap();
+        // 多腿按吃单 0.04%：5 个 × 100 × 0.04% = 0.2；空腿反推 0.0172% 低于报的 0.09%，按反推的：5 × 100 × 0.0172% = 0.086。
+        assert_eq!(quote.exit_fee_usdt, dec!(0.2) + dec!(0.086));
+        position.trims = 0;
+        let untrimmed = exit_quote(&position, &long_book, &short_book, taker).unwrap();
+        assert_eq!(
+            untrimmed.exit_fee_usdt,
+            dec!(0.6) + dec!(0.086),
+            "没减过仓照旧按反推的"
+        );
+    }
+
+    /// 只平一部分：第一档够这一部分就不吃深度；已实现盈亏、已付手续费按同一比例摊进来，
+    /// 所以 `net_usdt / fraction` 能和整笔直接比；差额拆分也按这一部分的数量算。
+    #[test]
+    fn a_partial_exit_quote_prorates_what_was_already_booked_and_walks_only_its_own_quantity() {
+        let mut position = position(TaskRules::default(), dec!(1000));
+        // 减过仓：已实现 1、已结算手续费 0.7（两条腿开仓都是 0 费率，平仓费率也给 0，只看摊销）。
+        position.realized_pnl_usdt = dec!(1);
+        position.realized_fee_usdt = dec!(0.7);
+        // 多腿买盘第一档只有 300 USDT（约 3 个），后面一档差很多；空腿卖盘很深。
+        let long_book = deep_book(
+            Venue::Lighter,
+            vec![(dec!(100.2), dec!(300)), (dec!(99), dec!(100000))],
+            vec![(dec!(100.3), dec!(100000))],
+        );
+        let short_book = deep_book(
+            Venue::Hyperliquid,
+            vec![(dec!(100.0), dec!(100000))],
+            vec![(dec!(100.1), dec!(100000))],
+        );
+        let fees = ExitFees {
+            long: Some(Decimal::ZERO),
+            short: Some(Decimal::ZERO),
+        };
+        let whole = exit_quote(&position, &long_book, &short_book, fees).unwrap();
+        let part = exit_quote_part(&position, &long_book, &short_book, fees, dec!(0.2)).unwrap();
+        assert_eq!(part.fraction, dec!(0.2));
+        assert_eq!(part.long_price, dec!(100.2));
+        // 最差一档（平仓限价保护按它定限价）：这一部分只吃第一档；整笔要吃到 99。
+        assert_eq!(
+            (part.long_worst_price, part.short_worst_price),
+            (dec!(100.2), dec!(100.1))
+        );
+        assert_eq!(
+            (whole.long_worst_price, whole.short_worst_price),
+            (dec!(99), dec!(100.1))
+        );
+        assert!(
+            whole.long_price > whole.long_worst_price,
+            "均价比最差一档好"
+        );
+        // 2 个：价格盈亏 (100.2 − 100) × 2 + (100 − 100.1) × 2 = 0.2；摊进来的 (1 − 0.7) × 0.2 = 0.06。
+        assert_eq!(part.net_usdt, dec!(0.26));
+        assert_eq!(part.net_pct, dec!(0.13));
+        assert!(
+            whole.net_usdt < Decimal::ZERO,
+            "整笔要吃到 99 那一档：{}",
+            whole.net_usdt
+        );
+        assert!(part.net_usdt / part.fraction > whole.net_usdt);
+        let (part_cost, whole_cost) = (part.cost.unwrap(), whole.cost.unwrap());
+        assert_eq!(part_cost.depth_usdt, Decimal::ZERO);
+        assert!(whole_cost.depth_usdt > Decimal::ZERO);
+        let (part_gap, whole_gap) = (
+            part.gap(&position, dec!(100.25), dec!(100.05)).unwrap(),
+            whole.gap(&position, dec!(100.25), dec!(100.05)).unwrap(),
+        );
+        assert_eq!(
+            part_gap.mark_vs_mid_usdt * dec!(5),
+            whole_gap.mark_vs_mid_usdt
+        );
+        assert_eq!(part_gap.spread_usdt * dec!(5), whole_gap.spread_usdt);
+        for bad in [Decimal::ZERO, dec!(-0.1), dec!(1.01)] {
+            let error = exit_quote_part(&position, &long_book, &short_book, fees, bad).unwrap_err();
+            assert!(error.contains("平仓比例"), "{error}");
+        }
     }
 
     /// 2026-09-30 LIT：在交易所补了保证金，台账里记的还是开仓时的。评估要按交易所实际的算。
@@ -1808,6 +2462,58 @@ mod tests {
         }
     }
 
+    /// 美股开盘头一小时：止盈按盘口要多出 0.3 USDT 才平（这一小时平仓滑点平均 0.22）。
+    #[test]
+    fn take_profit_needs_an_extra_margin_in_the_first_hour_after_the_us_open() {
+        use chrono::TimeZone;
+        // 2026-11-10 周二 冬令时：14:30 UTC 开盘。
+        let open = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 10, 14, 45, 0)
+            .unwrap();
+        assert_eq!(exit_buffer_usdt(open), OPENING_EXIT_BUFFER_USDT);
+        assert!(
+            exit_buffer_usdt(
+                chrono::Utc
+                    .with_ymd_and_hms(2026, 11, 10, 15, 31, 0)
+                    .unwrap()
+            )
+            .is_zero()
+        );
+        assert!(
+            exit_buffer_usdt(
+                chrono::Utc
+                    .with_ymd_and_hms(2026, 11, 14, 14, 45, 0)
+                    .unwrap()
+            )
+            .is_zero(),
+            "周六不算"
+        );
+        let (position, long, short) = profitable_pair(take_profit(dec!(11)));
+        let run = |book: Decimal, buffer: Decimal| {
+            evaluate_full(
+                &position,
+                &long,
+                &short,
+                Inputs {
+                    tp_buffer_usdt: buffer,
+                    ..with_funding(Some(dec!(2)), ExitCheck::Quoted(quote(book)))
+                },
+            )
+            .unwrap()
+            .action
+        };
+        // 盘口 9.2 + 资金费 2 = 11.2：平时到止盈 11 就平；开盘头一小时要 11.3，不平。
+        assert!(matches!(
+            run(dec!(9.2), Decimal::ZERO),
+            Action::Close { .. }
+        ));
+        assert_eq!(run(dec!(9.2), OPENING_EXIT_BUFFER_USDT), Action::Hold);
+        assert!(matches!(
+            run(dec!(9.4), OPENING_EXIT_BUFFER_USDT),
+            Action::Close { .. }
+        ));
+    }
+
     /// 净盈利必须把资金费算进去：价格净 9.05 本身不到 11，加上收到的 2.00 资金费才到。
     #[test]
     fn take_profit_counts_funding_and_is_confirmed_against_the_book() {
@@ -1914,6 +2620,108 @@ mod tests {
         assert!(below.observation.exit.is_some(), "盘口估算仍然留给页面");
     }
 
+    /// 盘口门槛：标记价照样要到止盈金额才触发；触发后盘口净额（含资金费）为正且 ≥ 门槛就平，
+    /// 不再要求盘口也到止盈金额。门槛 0 = 为正就平，等于 0 或为负都不平。
+    #[test]
+    fn take_profit_book_threshold_relaxes_only_the_book_check() {
+        let rules = |min: Decimal| TaskRules {
+            take_profit_book_min_usdt: Some(min),
+            ..take_profit(dec!(11))
+        };
+        let funding = Some(dec!(2));
+        let run = |rules: TaskRules, book: Decimal, funding: Option<Decimal>| {
+            let (position, long, short) = profitable_pair(rules);
+            evaluate_full(
+                &position,
+                &long,
+                &short,
+                with_funding(funding, ExitCheck::Quoted(quote(book))),
+            )
+            .unwrap()
+        };
+
+        // 盘口 −1.5 + 资金费 2 = 0.5：不设门槛不到 11 不平；门槛 0（为正即平）按最低 0.1 算（11-10）：0.5 平。
+        assert_eq!(
+            run(take_profit(dec!(11)), dec!(-1.5), funding).action,
+            Action::Hold
+        );
+        let positive = run(rules(Decimal::ZERO), dec!(-1.5), funding);
+        let Action::Close { reason } = &positive.action else {
+            panic!("门槛 0、盘口 0.5 应当平：{:?}", positive.action);
+        };
+        assert!(
+            reason.contains("盘口门槛 0.1") && reason.contains("0.5"),
+            "{reason}"
+        );
+        assert!(positive.needs_confirm, "照样要过下单前的盘口复核");
+        // 盘口 0.05：为正但不到最低门槛 0.1，不平（平仓滑点一吃就是亏的）。
+        assert_eq!(
+            run(rules(Decimal::ZERO), dec!(-1.95), funding).action,
+            Action::Hold
+        );
+
+        // 正好为 0、为负：不平，记下被挡下，文案说清楚是盘口门槛。
+        for book in [dec!(-2), dec!(-3)] {
+            let held = run(rules(Decimal::ZERO), book, funding);
+            assert_eq!(held.action, Action::Hold, "盘口 {book} + 2 不为正");
+            let hold = held.take_profit_hold.expect("被盘口挡下要记录");
+            assert_eq!(
+                (hold.target_usdt, hold.book_min_usdt),
+                (dec!(11), TP_BOOK_FLOOR_USDT)
+            );
+            assert!(hold.reason.contains("不到盘口门槛 0.1"), "{}", hold.reason);
+        }
+
+        // 门槛 1：0.5 不够，1.5 够。
+        let short_of = run(rules(dec!(1)), dec!(-1.5), funding);
+        assert_eq!(short_of.action, Action::Hold);
+        assert!(
+            short_of
+                .skipped
+                .iter()
+                .any(|note| note.contains("不到盘口门槛 1 USDT"))
+        );
+        assert!(matches!(
+            run(rules(dec!(1)), dec!(-0.5), funding).action,
+            Action::Close { .. }
+        ));
+
+        // 标记价没到止盈（资金费只有 1：9.05 + 1 < 11）：门槛再低也不触发。
+        let not_triggered = run(rules(Decimal::ZERO), dec!(5), Some(dec!(1)));
+        assert_eq!(not_triggered.action, Action::Hold);
+        assert!(not_triggered.take_profit_hold.is_none());
+
+        // 资金费查不到：照样不评估。
+        assert_eq!(
+            run(rules(Decimal::ZERO), dec!(5), None).action,
+            Action::Hold
+        );
+    }
+
+    #[test]
+    fn take_profit_book_threshold_is_validated_against_the_target() {
+        let with = |target: Option<Decimal>, min: Decimal| TaskRules {
+            take_profit_usdt: target,
+            take_profit_book_min_usdt: Some(min),
+            ..TaskRules::default()
+        };
+        assert!(validate_rules(&with(Some(dec!(1)), Decimal::ZERO), None).is_ok());
+        assert!(validate_rules(&with(Some(dec!(1)), dec!(1)), None).is_ok());
+        assert!(validate_rules(&with(Some(dec!(1)), dec!(1.01)), None).is_err());
+        assert!(validate_rules(&with(Some(dec!(1)), dec!(-0.1)), None).is_err());
+        assert!(validate_rules(&with(None, Decimal::ZERO), None).is_err());
+        // 按深度缩小单笔时同比例缩小。
+        let scaled = with(Some(dec!(1)), dec!(0.2)).scaled(dec!(0.5));
+        assert_eq!(
+            (scaled.take_profit_usdt, scaled.take_profit_book_min_usdt),
+            (Some(dec!(0.5)), Some(dec!(0.1)))
+        );
+        // 旧台账没有这个字段：读回来是 None，行为与以前相同。
+        let old: TaskRules = serde_json::from_str(r#"{"take_profit_usdt":"0.6"}"#).unwrap();
+        assert_eq!(old.take_profit_book_min_usdt, None);
+        assert_eq!(old.take_profit_book_min(), Some(dec!(0.6)));
+    }
+
     /// 资金费流水查不到就不评估：不拿 0 冒充，也不触发。已经收到的资金费是真钱，付出去的也是 ——
     /// 不知道是哪一边时，不能凭价格盈亏就宣布「已经赚到了」。
     #[test]
@@ -1935,6 +2743,187 @@ mod tests {
                 .any(|note| note.contains("资金费流水没查到"))
         );
         assert_eq!(evaluation.observation.net_with_funding_usdt, None);
+    }
+
+    /// 止损：按盘口（含资金费）亏到 −止损就整笔平仓；没到继续持有；资金费查不到按 0（宁可早止损）；
+    /// 盘口拿不到不按标记价平。标记价已经亏到止损线 80% 就去拉盘口。
+    #[test]
+    fn stop_loss_closes_on_the_book_loss_and_never_on_the_mark_price() {
+        let rules = TaskRules {
+            stop_loss_usdt: Some(dec!(2)),
+            ..TaskRules::default()
+        };
+        assert!(validate_rules(&rules, None).is_ok());
+        assert!(
+            validate_rules(
+                &TaskRules {
+                    stop_loss_usdt: Some(Decimal::ZERO),
+                    ..TaskRules::default()
+                },
+                None
+            )
+            .unwrap_err()
+            .contains("止损")
+        );
+        let (position, long, short) = profitable_pair(rules);
+        let run = |funding, exit| {
+            evaluate_full(&position, &long, &short, with_funding(funding, exit)).unwrap()
+        };
+        // 盘口 −1.9 + 资金费 −0.2 = −2.1：止损。
+        let Action::Close { reason } =
+            run(Some(dec!(-0.2)), ExitCheck::Quoted(quote(dec!(-1.9)))).action
+        else {
+            panic!("应当止损");
+        };
+        assert!(
+            reason.contains("止损") && reason.contains("-2.1"),
+            "{reason}"
+        );
+        // 资金费查不到：按 0 算，盘口 −2.0 已到线 → 止损（不因为查不到就放过）。
+        assert!(matches!(
+            run(None, ExitCheck::Quoted(quote(dec!(-2)))).action,
+            Action::Close { .. }
+        ));
+        // 没到：继续持有。
+        assert_eq!(
+            run(Some(Decimal::ZERO), ExitCheck::Quoted(quote(dec!(-1.5)))).action,
+            Action::Hold
+        );
+        // 盘口拿不到：不按标记价平，并说明。
+        let blind = run(
+            Some(Decimal::ZERO),
+            ExitCheck::Unavailable("盘口深度不够".into()),
+        );
+        assert_eq!(blind.action, Action::Hold);
+        assert!(
+            blind
+                .skipped
+                .iter()
+                .any(|n| n.contains("止损") && n.contains("盘口深度不够"))
+        );
+        // 这笔按标记价是赚的：不需要拉盘口。
+        assert!(!stop_loss_watch(
+            &position,
+            &long,
+            &short,
+            Some(Decimal::ZERO)
+        ));
+        // 资金费付了很多、标记价净额掉到 −1.6（止损 2 的 80%）以下：要拉盘口核对。
+        assert!(stop_loss_watch(&position, &long, &short, Some(dec!(-100))));
+    }
+
+    fn timeout(hours: Decimal, max_loss: Decimal) -> TaskRules {
+        TaskRules {
+            timeout_hours: Some(hours),
+            timeout_max_loss_usdt: Some(max_loss),
+            ..TaskRules::default()
+        }
+    }
+
+    /// 2026-10-09 的套牢单：标记价看着赚，按盘口平掉要亏。超时后只要按盘口的亏损在可接受范围内就走，
+    /// 超出就继续持有；判断一律按盘口（不按标记价），资金费不知道就不评估。
+    #[test]
+    fn a_timed_out_position_exits_only_when_the_book_loss_is_acceptable() {
+        let (mut position, long, short) = profitable_pair(timeout(dec!(4), dec!(0.5)));
+        position.opened_at = chrono::Utc::now() - chrono::Duration::hours(5);
+        assert!(timeout_triggered(&position, chrono::Utc::now()));
+        let run = |position: &PairPosition, funding, exit| {
+            evaluate_full(position, &long, &short, with_funding(funding, exit)).unwrap()
+        };
+
+        // 按盘口 −0.4 + 资金费 −0.05 = −0.45，亏损不到 0.5：超时退出。
+        let closed = run(
+            &position,
+            Some(dec!(-0.05)),
+            ExitCheck::Quoted(quote(dec!(-0.4))),
+        );
+        let Action::Close { reason } = closed.action else {
+            panic!("应当超时退出：{:?}", closed.action);
+        };
+        assert!(
+            reason.contains("超时退出") && reason.contains("-0.45"),
+            "{reason}"
+        );
+
+        // 按盘口 −0.9：标记价是赚的也不平，说明原因。
+        let held = run(
+            &position,
+            Some(Decimal::ZERO),
+            ExitCheck::Quoted(quote(dec!(-0.9))),
+        );
+        assert_eq!(held.action, Action::Hold);
+        assert!(held.observation.net_with_funding_usdt.unwrap() > Decimal::ZERO);
+        assert!(
+            held.skipped
+                .iter()
+                .any(|note| note.contains("亏损超过可接受的 0.5"))
+        );
+
+        // 资金费不知道：不评估；盘口没拉到：不按标记价平。
+        let unknown = run(&position, None, ExitCheck::Quoted(quote(dec!(1))));
+        assert_eq!(unknown.action, Action::Hold);
+        assert!(
+            unknown
+                .skipped
+                .iter()
+                .any(|note| note.contains("资金费流水没查到"))
+        );
+        let blind = run(
+            &position,
+            Some(Decimal::ZERO),
+            ExitCheck::Unavailable("arcus 卖盘不够".into()),
+        );
+        assert_eq!(blind.action, Action::Hold);
+        assert!(
+            blind
+                .skipped
+                .iter()
+                .any(|note| note.contains("arcus 卖盘不够"))
+        );
+
+        // 保本才平（X = 0）：−0.01 也不平。
+        let mut break_even = position.clone();
+        break_even.rules = timeout(dec!(4), Decimal::ZERO);
+        let held = run(
+            &break_even,
+            Some(Decimal::ZERO),
+            ExitCheck::Quoted(quote(dec!(-0.01))),
+        );
+        assert_eq!(held.action, Action::Hold);
+
+        // 还没到时间：这条规则不出声。
+        position.opened_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert!(!timeout_triggered(&position, chrono::Utc::now()));
+        let early = run(
+            &position,
+            Some(Decimal::ZERO),
+            ExitCheck::Quoted(quote(dec!(-0.1))),
+        );
+        assert_eq!(early.action, Action::Hold);
+        assert!(!early.skipped.iter().any(|note| note.contains("超时")));
+    }
+
+    #[test]
+    fn the_timeout_rule_needs_both_numbers_in_range() {
+        assert!(validate_rules(&timeout(dec!(4), dec!(0.5)), None).is_ok());
+        assert!(validate_rules(&timeout(dec!(4), Decimal::ZERO), None).is_ok());
+        let only_hours = TaskRules {
+            timeout_hours: Some(dec!(4)),
+            ..TaskRules::default()
+        };
+        assert!(
+            validate_rules(&only_hours, None)
+                .unwrap_err()
+                .contains("可接受的最大亏损")
+        );
+        let only_loss = TaskRules {
+            timeout_max_loss_usdt: Some(dec!(1)),
+            ..TaskRules::default()
+        };
+        assert!(validate_rules(&only_loss, None).is_err());
+        assert!(validate_rules(&timeout(Decimal::ZERO, dec!(1)), None).is_err());
+        assert!(validate_rules(&timeout(dec!(721), dec!(1)), None).is_err());
+        assert!(validate_rules(&timeout(dec!(4), dec!(-1)), None).is_err());
     }
 
     /// 资金费为负（付出去的）同样要扣：价格净 9.05、付了 3 → 6.05，到不了 8。

@@ -18,7 +18,7 @@ arb-core = { workspace = true }
 arb-scanner = { workspace = true }
 arb-venues = { workspace = true }
 tokio = { workspace = true }
-futures-util = { workspace = true }
+futures-util = { workspace = true, features = ["sink", "std"] }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -37,6 +37,9 @@ libloading = "0.8"
 sha2 = "0.10"
 hmac = "0.12"
 base64 = "0.22"
+# Lighter 账户成交推送（第一腿早一点拿到成交）。与 web 的行情 WebSocket 同一版本、同一套 rustls。
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
+dotenvy = { workspace = true }
 rust_decimal_macros = { workspace = true }

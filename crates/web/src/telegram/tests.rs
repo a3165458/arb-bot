@@ -46,6 +46,38 @@ struct StubBackend {
     muted_minutes: Mutex<Option<u64>>,
     live: bool,
     query_gate: Option<Arc<tokio::sync::Notify>>,
+    previews: AtomicUsize,
+    /// 真正下单的次数（`order_execute`）。
+    executions: AtomicUsize,
+    /// 设了就让下单卡在这里，直到被放行。
+    order_gate: Option<Arc<tokio::sync::Notify>>,
+    /// 设了就让下一单在执行中途 panic 一次。
+    panic_once: AtomicBool,
+}
+
+/// 桩计划：只有 `prompt` / `button` / `summary` 对机器人有意义。
+fn stub_plan(ticket: &str) -> order::Plan {
+    order::Plan {
+        intent: order::Intent {
+            pair: "arcus:lighter-rh".into(),
+            base: "TSLA".into(),
+            direction: "long_a",
+        },
+        long: arb_core::Venue::Arcus,
+        short: arb_core::Venue::LighterRh,
+        action: order::Action::Open {
+            rules: arb_exec::TaskRules::default(),
+        },
+        mode: crate::trade::Mode::Live,
+        size: Decimal::from(800),
+        leverage: Decimal::from(3),
+        relative_to_normal: false,
+        max_total: Decimal::from(2400),
+        entry_pct: Decimal::new(4, 1),
+        prompt: format!("[confirm {ticket}]"),
+        button: "✅ 确认实盘开仓 TSLA 800U".into(),
+        summary: format!("[summary {ticket}]"),
+    }
 }
 
 impl StubBackend {
@@ -102,6 +134,28 @@ impl Backend for StubBackend {
     }
     fn unmute(&self) {
         *self.muted_minutes.lock().unwrap() = None;
+    }
+    fn order_preview(&self, ticket: String) -> Fut<Result<order::Plan, String>> {
+        self.previews.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if ticket.starts_with("good") {
+                Ok(stub_plan(&ticket))
+            } else {
+                Err("这一刻不满足开仓硬条件".into())
+            }
+        })
+    }
+    fn order_execute(&self, plan: order::Plan) -> Fut<String> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        let gate = self.order_gate.clone();
+        let panic = self.panic_once.swap(false, Ordering::SeqCst);
+        Box::pin(async move {
+            assert!(!panic, "测试：执行中途 panic");
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            format!("[executed {}]", plan.summary)
+        })
     }
 }
 
@@ -311,11 +365,26 @@ fn position_replies_show_the_mode_and_do_not_fabricate_missing_pnl() {
             ledger: "test".into(),
             broken_lines: 0,
             closed: vec![],
+            closed_total: 0,
+            dismissed_count: 0,
+            failed_count: 0,
+            closed_page: 1,
+            closed_per_page: crate::strategy::MAX_CLOSED_POSITIONS,
+            stats: crate::stats::trade_stats(
+                &arb_exec::Replayed {
+                    orders: Default::default(),
+                    positions: Default::default(),
+                },
+                now,
+            ),
             open: vec![crate::strategy::PositionView {
                 position,
                 evaluation: None,
                 quotes_missing: true,
                 funding: None,
+                breakdown: None,
+                traded: None,
+                dismissed: false,
             }],
         };
         let text = render_positions(&view, now);
@@ -491,6 +560,15 @@ fn the_menu_never_offers_trading_actions() {
         );
     }
     assert!(names.contains(&"pause") && names.contains(&"resume"));
+    // 主菜单按钮也没有下单入口：下单只挂在价差提醒下面。
+    for paused in [false, true] {
+        assert!(
+            menu_keyboard(paused)
+                .iter()
+                .flatten()
+                .all(|button| !button.data.contains(':'))
+        );
+    }
 }
 
 #[tokio::test]
@@ -661,4 +739,191 @@ async fn the_http_client_speaks_telegrams_shapes_handles_conflicts_and_never_lea
             "{text}"
         );
     }
+}
+
+/// 最后一条回复里「确认」按钮的票据。
+fn confirm_ticket(api: &MockApi) -> String {
+    let sent = api.sent.lock().unwrap();
+    let (_, _, keyboard) = sent.last().expect("应该回了确认消息");
+    keyboard
+        .iter()
+        .flatten()
+        .find_map(|button| button.data.strip_prefix("ok:"))
+        .expect("确认消息上要有「确认」按钮")
+        .to_string()
+}
+
+fn last_text(api: &MockApi) -> String {
+    api.sent.lock().unwrap().last().unwrap().1.clone()
+}
+
+async fn wait_for_text(api: &MockApi, needle: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !api
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, text, _)| text.contains(needle))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("等不到「{needle}」"));
+}
+
+#[tokio::test]
+async fn an_alert_button_takes_two_taps_and_each_confirmation_executes_once() {
+    let (bot, api, backend) = setup(StubBackend::live());
+    bot.handle(callback(ADMIN, ADMIN, "o:good-1")).await;
+    assert_eq!(last_text(&api), "[confirm good-1]");
+    assert_eq!(
+        backend.executions.load(Ordering::SeqCst),
+        0,
+        "第一下绝不下单"
+    );
+    let ticket = confirm_ticket(&api);
+    {
+        let sent = api.sent.lock().unwrap();
+        let rows = &sent.last().unwrap().2;
+        assert_eq!(rows[0][0].label, "✅ 确认实盘开仓 TSLA 800U");
+        assert_eq!(rows[1][0].data, format!("no:{ticket}"));
+    }
+    bot.handle(callback(ADMIN, ADMIN, &format!("ok:{ticket}")))
+        .await;
+    assert!(last_text(&api).contains("正在下单：[summary good-1]"));
+    wait_for_text(&api, "[executed [summary good-1]]").await;
+    assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
+    // 同一个确认再点（双击、重发）：作废了，不再下。
+    bot.handle(callback(ADMIN, ADMIN, &format!("ok:{ticket}")))
+        .await;
+    assert!(last_text(&api).contains("过期或用过了"));
+    assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
+    // 每次点都是新的票据，按钮上的转圈都停了。
+    assert_eq!(api.answered.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn cancelled_unknown_and_refused_orders_never_execute() {
+    let (bot, api, backend) = setup(StubBackend::live());
+    bot.handle(callback(ADMIN, ADMIN, "o:good-2")).await;
+    let ticket = confirm_ticket(&api);
+    bot.handle(callback(ADMIN, ADMIN, &format!("no:{ticket}")))
+        .await;
+    assert_eq!(last_text(&api), "已取消，没下单。");
+    bot.handle(callback(ADMIN, ADMIN, &format!("ok:{ticket}")))
+        .await;
+    assert!(last_text(&api).contains("过期或用过了"));
+    bot.handle(callback(ADMIN, ADMIN, "ok:000000000000")).await;
+    assert!(last_text(&api).contains("过期或用过了"));
+    // 预览不过：说原因，只给菜单，不给「确认」。
+    bot.handle(callback(ADMIN, ADMIN, "o:bad")).await;
+    assert_eq!(last_text(&api), "没法下单：这一刻不满足开仓硬条件");
+    let sent = api.sent.lock().unwrap();
+    assert!(
+        sent.last()
+            .unwrap()
+            .2
+            .iter()
+            .flatten()
+            .all(|button| !button.data.starts_with("ok:"))
+    );
+    assert_eq!(backend.executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn order_buttons_from_anyone_but_the_admins_private_chat_are_ignored() {
+    let (bot, api, backend) = setup(StubBackend::live());
+    bot.handle(callback(ADMIN, 999, "o:good-3")).await;
+    bot.handle(callback(-100_123, ADMIN, "o:good-3")).await;
+    assert!(api.sent.lock().unwrap().is_empty());
+    assert_eq!(backend.previews.load(Ordering::SeqCst), 0);
+    // 别人拿到了确认票据也没用。
+    bot.handle(callback(ADMIN, ADMIN, "o:good-3")).await;
+    let ticket = confirm_ticket(&api);
+    bot.handle(callback(ADMIN, 999, &format!("ok:{ticket}")))
+        .await;
+    assert_eq!(backend.executions.load(Ordering::SeqCst), 0);
+    // 票据还在，管理员自己点照常有效。
+    bot.handle(callback(ADMIN, ADMIN, &format!("ok:{ticket}")))
+        .await;
+    wait_for_text(&api, "[executed").await;
+    assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_executing_order_blocks_a_second_one_but_not_pause() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let (bot, api, backend) = setup(StubBackend {
+        order_gate: Some(Arc::clone(&gate)),
+        ..StubBackend::live()
+    });
+    bot.handle(callback(ADMIN, ADMIN, "o:good-a")).await;
+    let first = confirm_ticket(&api);
+    bot.handle(callback(ADMIN, ADMIN, "o:good-b")).await;
+    let second = confirm_ticket(&api);
+    bot.handle(callback(ADMIN, ADMIN, &format!("ok:{first}")))
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while backend.executions.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // 下单卡在交易所那边时：第二单不下，/pause 照样立刻生效。
+    bot.handle(callback(ADMIN, ADMIN, &format!("ok:{second}")))
+        .await;
+    assert!(last_text(&api).contains("已有一单正在执行"));
+    bot.handle(message(ADMIN, "private", Some(ADMIN), "/pause"))
+        .await;
+    assert!(backend.paused.load(Ordering::SeqCst));
+    assert!(last_text(&api).contains("已暂停开新仓"));
+    gate.notify_one();
+    wait_for_text(&api, "[executed [summary good-a]]").await;
+    assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
+    // 结果消息带的菜单反映暂停后的状态。
+    let sent = api.sent.lock().unwrap();
+    let (_, _, keyboard) = sent.last().unwrap();
+    assert!(
+        keyboard
+            .iter()
+            .flatten()
+            .any(|button| button.data == "resume")
+    );
+}
+
+#[tokio::test]
+async fn a_panicking_order_does_not_leave_the_next_one_blocked() {
+    let (bot, api, backend) = setup(StubBackend {
+        panic_once: AtomicBool::new(true),
+        ..StubBackend::live()
+    });
+    bot.handle(callback(ADMIN, ADMIN, "o:good-p")).await;
+    let ticket = confirm_ticket(&api);
+    bot.handle(callback(ADMIN, ADMIN, &format!("ok:{ticket}")))
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while backend.executions.load(Ordering::SeqCst) < 1 || bot.ordering.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("panic 之后标志要复位");
+    bot.handle(callback(ADMIN, ADMIN, "o:good-q")).await;
+    let ticket = confirm_ticket(&api);
+    bot.handle(callback(ADMIN, ADMIN, &format!("ok:{ticket}")))
+        .await;
+    assert!(last_text(&api).contains("正在下单：[summary good-q]"));
+    wait_for_text(&api, "[executed [summary good-q]]").await;
+}
+
+#[test]
+fn net_profit_line_is_the_order_book_figure_and_never_falls_back_to_mark_price() {
+    let shown = book_net_line(Some(rust_decimal::Decimal::new(-48, 2)));
+    assert!(shown.contains("净收益（按盘口现在平仓"), "{shown}");
+    assert!(shown.contains("0.48"), "{shown}");
+    let missing = book_net_line(None);
+    assert!(missing.contains("未核对"), "{missing}");
 }

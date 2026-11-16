@@ -402,6 +402,41 @@ fn build_book(
 
 /// 端点限定 USDT 保证金，type 再限定线性；不要把 USDC_USDT 的标的币误当保证金币。
 /// 下架/暂停与杠杆标的不参与配对；只排明确的倍数后缀，不误伤 JUP、SYRUP、UP。
+/// 价差监控的市场列表用：一个在交易的 USDT 线性永续。过滤与命名和扫描（[`GateApi::fetch_all`]）同一套，
+/// 身份分簇按（场所, 标的）对得上。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearPerp {
+    /// 合约名（行情订阅用）：`NVDA_USDT`。
+    pub name: String,
+    pub base: String,
+    /// 每张的标的数量（WebSocket 盘口的量是张数）。缺失或非正为 `None`。
+    pub multiplier: Option<Decimal>,
+    pub taker_fee: Option<Decimal>,
+}
+
+/// 从 `/futures/usdt/contracts` 的响应里挑出在交易的 USDT 线性永续。
+pub fn linear_perps(contracts: &serde_json::Value) -> ArbResult<Vec<LinearPerp>> {
+    let rows: Vec<Contract> = serde_json::from_value(contracts.clone())
+        .map_err(|error| ArbError::venue(VENUE.as_str(), format!("contracts 格式不对：{error}")))?;
+    Ok(rows
+        .iter()
+        .filter(|item| is_linear_perp(item))
+        .filter_map(|item| {
+            let base = item.name.strip_suffix("_USDT")?;
+            Some(LinearPerp {
+                name: item.name.clone(),
+                base: Symbol::perp(base, "USDT").base,
+                multiplier: item
+                    .quanto_multiplier
+                    .as_deref()
+                    .and_then(parse_decimal)
+                    .filter(|value| *value > Decimal::ZERO),
+                taker_fee: item.taker_fee_rate.as_deref().and_then(parse_decimal),
+            })
+        })
+        .collect())
+}
+
 fn is_linear_perp(item: &Contract) -> bool {
     item.contract_direction == "direct"
         && item.status.as_deref() == Some("trading")

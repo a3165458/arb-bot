@@ -143,6 +143,9 @@ struct Contract {
     /// （实测 797/797），作为兜底来源。
     fund_interval: Option<String>,
     taker_fee_rate: Option<String>,
+    /// 最大杠杆（字符串）。
+    #[serde(default)]
+    max_lever: Option<String>,
     symbol_type: Option<String>,
     quote_coin: Option<String>,
     support_margin_coins: Option<Vec<String>>,
@@ -456,6 +459,10 @@ fn parse_row(
         .zip(mark_price)
         .and_then(|(size, price)| size.checked_mul(price));
 
+    let max_leverage = contract
+        .and_then(|config| config.max_lever.as_deref())
+        .and_then(parse_decimal)
+        .filter(|max| *max >= Decimal::ONE);
     Some(MarketSnapshot {
         venue: VENUE,
         symbol: Symbol::perp(base, QUOTE),
@@ -477,10 +484,19 @@ fn parse_row(
         ask_size_usdt,
         open_interest_usdt,
         quote_volume_24h: ticker.quote_volume.as_deref().and_then(parse_decimal),
-        max_leverage: None,
-        maintenance_margin: None,
+        max_leverage,
+        maintenance_margin: max_leverage.map(conservative_mmr),
         oi_capped: false,
     })
+}
+
+/// 维持保证金率的**上界**：`1 / 最大杠杆`。公开合约列表不给维持保证金率，要按合约逐个查分档接口
+/// （`query-position-lever`，扫描一轮八百多个合约查不起）；交易所的维持保证金率总低于最大杠杆对应的初始
+/// 保证金率（某次实盘：最大 100 倍、第一档维持 0.005 < 0.01）。用上界算出的强平距离只会偏近
+/// （3 倍下 32.3% 对实际 32.8%），开仓前的风控偏严、不偏松。没有它时「自动加保证金」等规则算不出强平距离，
+/// Bitget 的每一笔开仓都会被拒。
+fn conservative_mmr(max_leverage: Decimal) -> Decimal {
+    Decimal::ONE / max_leverage
 }
 
 /// 基础币量乘该侧价格才是 USDT 名义；没有有效价格就不能换算量。
@@ -536,7 +552,7 @@ fn parse_interval(raw: &str) -> Option<u32> {
 /// `usdt-futures` 实测只有永续（`symbolType` 全为 `perpetual`、`quoteCoin` 全为
 /// `USDT`），但过滤必须留着：交割合约的符号带 `_`（如 `BTCUSDT_250926`），
 /// 混进来会与永续配对，而两者的资金费机制不同。
-fn linear_perp_base(symbol: &str) -> Option<&str> {
+pub fn linear_perp_base(symbol: &str) -> Option<&str> {
     let base = symbol.strip_suffix(QUOTE)?;
     (!base.is_empty() && !symbol.contains('_')).then_some(base)
 }
@@ -749,6 +765,31 @@ mod tests {
                 "结算时刻不可用必须整行丢弃，不能拿当前时间顶上"
             );
         }
+    }
+
+    #[test]
+    fn a_conservative_maintenance_margin_comes_from_the_max_leverage() {
+        // 某次实盘：最大 100 倍，第一档维持保证金率 0.005；用 1/100 作上界（强平距离只会偏近）。
+        let mut nvda = contract(CONTRACT_ONE);
+        nvda.max_lever = Some("100".into());
+        let row = parse_row(
+            "ONE",
+            &ticker(TICKER_ONE),
+            Some(&rate(RATE_ONE)),
+            Some(&nvda),
+        )
+        .unwrap();
+        assert_eq!(row.max_leverage, Some(arb_core::Decimal::from(100)));
+        assert_eq!(row.maintenance_margin, Some(arb_core::Decimal::new(1, 2)));
+        // 没给最大杠杆：两样都不知道（不猜）。
+        let row = parse_row(
+            "ONE",
+            &ticker(TICKER_ONE),
+            Some(&rate(RATE_ONE)),
+            Some(&contract(CONTRACT_ONE)),
+        )
+        .unwrap();
+        assert_eq!((row.max_leverage, row.maintenance_margin), (None, None));
     }
 
     #[test]

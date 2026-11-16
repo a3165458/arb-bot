@@ -53,6 +53,83 @@ impl ClientOrderId {
     pub fn for_exit(position_id: &str, leg: Side, n: u32) -> Self {
         Self(format!("{position_id}-{}-exit{n}", side_tag(leg)))
     }
+
+    /// 第 `n` 次补仓（往已有仓位上加码）的开仓单。方向与开仓相同：买 = 多腿。
+    pub fn for_add(position_id: &str, leg: Side, n: u32) -> Self {
+        Self(format!("{position_id}-{}-add{n}", side_tag(leg)))
+    }
+
+    /// 第 `n` 次补仓没补齐时，把一条腿多出来的部分退掉的 reduce-only 单。方向与平仓相同：卖 = 多腿。
+    pub fn for_undo(position_id: &str, leg: Side, n: u32) -> Self {
+        Self(format!("{position_id}-{}-undo{n}", side_tag(leg)))
+    }
+
+    /// [`Self::for_leg`] / [`Self::for_trim`] / [`Self::for_exit`] 的反向：这张单是不是
+    /// `position_id` 这笔仓位的，下单方向与角色是什么。别的仓位、外部订单（`venue:oid:…`）
+    /// 或认不出的格式返回 `None`。
+    pub fn parse_for(&self, position_id: &str) -> Option<(Side, OrderRole)> {
+        let rest = self.0.strip_prefix(position_id)?.strip_prefix('-')?;
+        let (side, tail) = rest.split_once('-')?;
+        let side = match side {
+            "buy" => Side::Buy,
+            "sell" => Side::Sell,
+            _ => return None,
+        };
+        let number = |raw: &str| {
+            (!raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| raw.parse::<u32>().ok())
+                .flatten()
+        };
+        let role = if let Some(n) = tail.strip_prefix("trim") {
+            OrderRole::Trim { n: number(n)? }
+        } else if let Some(n) = tail.strip_prefix("add") {
+            OrderRole::Add { n: number(n)? }
+        } else if let Some(n) = tail.strip_prefix("undo") {
+            OrderRole::Undo { n: number(n)? }
+        } else if let Some(n) = tail.strip_prefix("exit") {
+            OrderRole::Exit { n: number(n)? }
+        } else {
+            OrderRole::Entry {
+                attempt: number(tail)?,
+            }
+        };
+        Some((side, role))
+    }
+}
+
+/// 一张单在它那笔仓位里的角色（见 [`ClientOrderId::parse_for`]）。
+///
+/// 方向与腿的对应：开仓、补仓单买 = 多腿；减仓、平仓（含回滚）、补仓回退单是反向，卖 = 多腿。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OrderRole {
+    /// 开仓，第 `attempt` 次提交。
+    Entry { attempt: u32 },
+    /// 第 `n` 次减仓。
+    Trim { n: u32 },
+    /// 第 `n` 次退出（平仓 / 回滚）。
+    Exit { n: u32 },
+    /// 第 `n` 次补仓。
+    Add { n: u32 },
+    /// 第 `n` 次补仓没补齐时退掉多出来的部分。
+    Undo { n: u32 },
+}
+
+impl OrderRole {
+    /// 这张单作用在哪条腿上：`true` = 多腿。
+    pub fn is_long_leg(self, side: Side) -> bool {
+        match self {
+            OrderRole::Entry { .. } | OrderRole::Add { .. } => side == Side::Buy,
+            OrderRole::Trim { .. } | OrderRole::Exit { .. } | OrderRole::Undo { .. } => {
+                side == Side::Sell
+            }
+        }
+    }
+
+    /// 是不是加仓（开仓或补仓）的单：它的成交并进腿的开仓均价。
+    pub fn is_entry(self) -> bool {
+        matches!(self, OrderRole::Entry { .. } | OrderRole::Add { .. })
+    }
 }
 
 fn side_tag(side: Side) -> &'static str {
@@ -134,6 +211,12 @@ pub struct NewOrder {
     /// 开仓杠杆；真实券商必须在提交订单前配置成功。
     #[serde(default)]
     pub leverage: Option<Decimal>,
+    /// 只挂单（交易所的 post-only，币安是 `GTX`）：会立刻吃单成交就被交易所拒绝，不留记录；
+    /// 挂得住的单子留在簿上等人来吃，**不是** IOC。默认 `false` = 与以前完全一样（IOC 限价）。
+    /// 不支持只挂单的券商（[`crate::Broker::supports_post_only`]）收到它必须拒绝，不能悄悄按 IOC 发出去。
+    /// 旧台账里没有这个字段，读出来是 `false`；`false` 时不写出，台账行与以前逐字节相同。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub post_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +285,10 @@ pub struct OrderState {
     pub average_price: Option<Decimal>,
     pub fee_usdt: Decimal,
     pub reject_reason: Option<String>,
+    /// `fee_usdt` 是估算的，不是交易所实际收的（Hyperliquid 按下单回包先记成交、读节点还查不到成交明细时）。
+    /// 后台按交易所成交记录改正（[`crate::desk::correct_estimated_fees`]）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fee_estimated: bool,
 }
 
 impl OrderState {
@@ -214,6 +301,7 @@ impl OrderState {
             average_price: None,
             fee_usdt: Decimal::ZERO,
             reject_reason: None,
+            fee_estimated: false,
         }
     }
 
@@ -296,10 +384,19 @@ impl LegFill {
         // 名义 ÷ 均价，舍到 12 位小数：十进制除不尽时会留一条尾巴（2026-09-30 LIT 的
         // `751.99000000000000000000000001`），对账会判成不一致、平仓单的数量也不再是步长的
         // 整数倍。真实成交数量都是步长的整数倍，12 位小数的舍入伤不到它。
+        //
+        // 均价本身被舍过（旧台账里合并多笔成交的腿是 12 位小数）时，反推的数量带的尾巴更大：
+        // 某次实盘 两笔成交 44 + 23，均价 2.980343283582，反推 67.000000000002，Bitget 因此
+        // 15 次拒掉 reduce-only 平仓。所以再试一次 8 位小数：离它不到十亿分之一就是同一个数。
+        // 真实数量最多 8 位小数；9 位以上的数（不会是交易所步长）差得出这个容差，不会被吞掉。
         (self.average_price > Decimal::ZERO).then(|| {
-            (self.notional_usdt / self.average_price)
-                .round_dp(12)
-                .normalize()
+            let quantity = (self.notional_usdt / self.average_price).round_dp(12);
+            let coarse = quantity.round_dp(8);
+            if (quantity - coarse).abs() <= quantity.abs() / Decimal::from(1_000_000_000_i64) {
+                coarse.normalize()
+            } else {
+                quantity.normalize()
+            }
         })
     }
 }
@@ -332,6 +429,11 @@ pub struct TaskRules {
     /// 盘口拿不到或核对后不到就继续持有；资金费流水查不到时**不评估**（不拿 0 冒充）。
     #[serde(default)]
     pub take_profit_usdt: Option<Decimal>,
+    /// 止盈的盘口核对门槛（USDT，≥ 0，不超过止盈金额）：标记价达到止盈后，按两边盘口平掉的整笔净额
+    /// （含资金费、平仓手续费与穿价）**为正且 ≥ 它**就平。`0` = 盘口算下来为正就平；不设 = 盘口也要达到止盈金额
+    /// （与以前相同）。只在设了止盈时有意义；获利平仓照样要过下单前的盘口复核。旧台账没有这个字段。
+    #[serde(default)]
+    pub take_profit_book_min_usdt: Option<Decimal>,
     /// 自动加保证金：任一腿强平距离（%）低于它，就往这条腿的逐仓保证金里补钱，
     /// 把距离拉回它的 1.5 倍。**必须同时设置 [`auto_margin_max_usdt`](Self::auto_margin_max_usdt)**。
     #[serde(default)]
@@ -340,6 +442,19 @@ pub struct TaskRules {
     /// 补不了（上限用完、账户可用资金不够、场所拒绝）时退回爆仓保护的减仓（如果设了）。
     #[serde(default)]
     pub auto_margin_max_usdt: Option<Decimal>,
+    /// 超时退出：持仓超过这么多小时、且按两边盘口现在平掉的整笔净额（含资金费）亏损不超过
+    /// [`timeout_max_loss_usdt`](Self::timeout_max_loss_usdt)，就整笔平仓，释放名额。
+    /// 按盘口核对，不按标记价；资金费查不到时不评估。必须与可接受亏损成对设置。
+    #[serde(default)]
+    pub timeout_hours: Option<Decimal>,
+    /// 超时退出可接受的最大亏损（USDT，≥ 0；0 = 保本才平）。
+    #[serde(default)]
+    pub timeout_max_loss_usdt: Option<Decimal>,
+    /// 止损：按两边盘口**现在平掉**的整笔净额（含资金费、平仓手续费与穿价）亏到 −它（USDT）就整笔平仓。
+    /// 防的是「回到正常基差」不发生、偏离越拉越大。资金费查不到时按 0 计（宁可早止损，不因查不到就不止损）；
+    /// 盘口拿不到时不按标记价平。
+    #[serde(default)]
+    pub stop_loss_usdt: Option<Decimal>,
 }
 
 impl TaskRules {
@@ -350,11 +465,48 @@ impl TaskRules {
             && self.basis_exit_pct.is_none()
             && self.take_profit_usdt.is_none()
             && self.auto_margin_pct.is_none()
+            && self.timeout_hours.is_none()
+            && self.stop_loss_usdt.is_none()
     }
 
     /// 自动加保证金是否启用：触发线与累计上限都给了。
     pub fn auto_margin(&self) -> Option<(Decimal, Decimal)> {
         self.auto_margin_pct.zip(self.auto_margin_max_usdt)
+    }
+
+    /// 超时退出是否启用：小时数与可接受亏损都给了。
+    pub fn timeout_exit(&self) -> Option<(Decimal, Decimal)> {
+        self.timeout_hours.zip(self.timeout_max_loss_usdt)
+    }
+
+    /// 止盈按盘口核对时要达到的净额：设了盘口门槛就用它，否则就是止盈金额本身。没设止盈时为 `None`。
+    pub fn take_profit_book_min(&self) -> Option<Decimal> {
+        self.take_profit_usdt
+            .map(|target| self.take_profit_book_min_usdt.unwrap_or(target))
+    }
+
+    /// 盘口平掉的整笔净额（含资金费）够不够止盈：要 ≥ 门槛，且门槛降低时也必须为正（门槛 0 = 为正就平）。
+    pub fn take_profit_book_passes(&self, book_net: Decimal) -> bool {
+        self.take_profit_book_min()
+            .is_some_and(|min| book_net >= min && book_net > Decimal::ZERO)
+    }
+
+    /// 单笔名义缩小到原来的 `ratio`（0 < ratio ≤ 1）时的规则：所有**按 USDT 计的金额**（止盈、止损、超时可接受的
+    /// 亏损、加保证金累计上限）同比例缩小，占名义的比例不变。按盘口深度缩小单笔（见 [`crate::sizing`]）之后，
+    /// 原来按整笔算的 1 USDT 止盈就成了名义的好几倍，小仓位几乎碰不到。百分比、小时数这类规则不动。
+    pub fn scaled(&self, ratio: Decimal) -> Self {
+        if ratio <= Decimal::ZERO || ratio >= Decimal::ONE {
+            return self.clone();
+        }
+        let scale = |amount: Option<Decimal>| amount.map(|value| (value * ratio).round_dp(4));
+        Self {
+            take_profit_usdt: scale(self.take_profit_usdt),
+            take_profit_book_min_usdt: scale(self.take_profit_book_min_usdt),
+            stop_loss_usdt: scale(self.stop_loss_usdt),
+            timeout_max_loss_usdt: scale(self.timeout_max_loss_usdt),
+            auto_margin_max_usdt: scale(self.auto_margin_max_usdt),
+            ..self.clone()
+        }
     }
 }
 
@@ -426,6 +578,32 @@ pub struct PairPosition {
     /// 开仓时计划与实际成交的对照、各步耗时（见 [`crate::report`]）。旧台账、回滚掉的仓位没有。
     #[serde(default)]
     pub open_report: Option<crate::report::OpenReport>,
+    /// 开仓计划里两条腿各在哪家、先下哪条（见 [`PlannedLegs`]）。旧台账、补登的仓位没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned: Option<PlannedLegs>,
+}
+
+/// 开仓计划的两条腿：建仓中断、第一腿结果不明时，台账里还没有第二腿的任何订单，续上建仓
+/// （[`crate::Executor::resume_open`]）靠它知道第二腿该在哪家补。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedLegs {
+    pub long: Venue,
+    pub short: Venue,
+    /// 先下的那条腿（买 = 多腿）。
+    pub first: Side,
+    /// 开仓时的强制补腿容差（小数，见 [`crate::PositionSetup::force_hedge`]）。没开为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_hedge: Option<Decimal>,
+}
+
+impl PlannedLegs {
+    /// 这一侧的计划场所（买 = 多腿）。
+    pub fn venue(&self, side: Side) -> Venue {
+        match side {
+            Side::Buy => self.long,
+            Side::Sell => self.short,
+        }
+    }
 }
 
 /// 已实现盈亏的出处。
@@ -502,8 +680,32 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
+    /// 待核实的成交（Lighter 推送：均价 = 成交额 ÷ 数量）反推回来的数量要正好是交易所报的数，
+    /// 回滚 / 平仓的只减仓单才对得上步长。
+    #[test]
+    fn a_provisional_fill_gives_back_its_exact_quantity() {
+        for (value, size) in [
+            (dec!(199.844656), dec!(4.3219)),
+            (dec!(200.060751), dec!(4.3219)),
+            (dec!(199.368640), dec!(0.0034)),
+            (dec!(7.123456789), dec!(3)),
+        ] {
+            let leg = LegFill {
+                venue: Venue::Lighter,
+                side: Side::Buy,
+                notional_usdt: value,
+                average_price: value / size,
+                fee_usdt: Decimal::ZERO,
+                client_order_id: ClientOrderId::for_leg("p1", Side::Buy, 0),
+                margin_usdt: None,
+            };
+            assert_eq!(leg.quantity(), Some(size), "{value} / {size}");
+        }
+    }
+
     fn order(notional: Decimal) -> NewOrder {
         NewOrder {
+            post_only: false,
             margin_mode: crate::MarginMode::Isolated,
             client_order_id: ClientOrderId::for_leg("p1", Side::Buy, 0),
             venue: Venue::Binance,
@@ -544,6 +746,57 @@ mod tests {
             ClientOrderId::for_leg("p", Side::Buy, 0).to_string(),
             "p-buy-0"
         );
+    }
+
+    #[test]
+    fn order_ids_parse_back_to_their_position_side_and_role() {
+        // 往返：命名一改，这里先报错，明细不会悄悄失配。
+        let id = "live-1791552609523";
+        for side in [Side::Buy, Side::Sell] {
+            for n in [0, 1, 12] {
+                assert_eq!(
+                    ClientOrderId::for_leg(id, side, n).parse_for(id),
+                    Some((side, OrderRole::Entry { attempt: n }))
+                );
+                assert_eq!(
+                    ClientOrderId::for_trim(id, side, n).parse_for(id),
+                    Some((side, OrderRole::Trim { n }))
+                );
+                assert_eq!(
+                    ClientOrderId::for_exit(id, side, n).parse_for(id),
+                    Some((side, OrderRole::Exit { n }))
+                );
+                assert_eq!(
+                    ClientOrderId::for_add(id, side, n).parse_for(id),
+                    Some((side, OrderRole::Add { n }))
+                );
+                assert_eq!(
+                    ClientOrderId::for_undo(id, side, n).parse_for(id),
+                    Some((side, OrderRole::Undo { n }))
+                );
+            }
+        }
+        // 前缀相同的别的仓位、外部订单、认不出的尾巴都不算。
+        let other = ClientOrderId::for_exit("live-17915526095230", Side::Sell, 1);
+        assert_eq!(other.parse_for(id), None);
+        for raw in [
+            "hyperliquid-io:oid:100000000001",
+            "live-1791552609523-sell-",
+            "live-1791552609523-sell-exit",
+            "live-1791552609523-sell-exitx",
+            "live-1791552609523-hold-0",
+            "live-1791552609523",
+        ] {
+            assert_eq!(ClientOrderId(raw.into()).parse_for(id), None, "{raw}");
+        }
+        // 腿：开仓买 = 多腿；减仓、平仓反向，卖 = 多腿。
+        assert!(OrderRole::Entry { attempt: 0 }.is_long_leg(Side::Buy));
+        assert!(OrderRole::Exit { n: 1 }.is_long_leg(Side::Sell));
+        assert!(OrderRole::Trim { n: 1 }.is_long_leg(Side::Sell));
+        assert!(!OrderRole::Exit { n: 1 }.is_long_leg(Side::Buy));
+        assert!(OrderRole::Add { n: 1 }.is_long_leg(Side::Buy));
+        assert!(OrderRole::Undo { n: 1 }.is_long_leg(Side::Sell));
+        assert!(OrderRole::Add { n: 2 }.is_entry() && !OrderRole::Undo { n: 2 }.is_entry());
     }
 
     #[test]
@@ -603,6 +856,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned: None,
         };
         assert!(position.is_naked(), "两腿都没成交也是裸敞口");
 
@@ -660,6 +914,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned: None,
         };
         // 基差收敛到 0 → 赚 1%
         assert_eq!(position.basis_pnl_pct(dec!(0)), dec!(1.0));
@@ -686,6 +941,33 @@ mod tests {
             leg.quantity().unwrap().scale(),
             2,
             "尾巴消掉后是干净的 751.99"
+        );
+    }
+
+    #[test]
+    fn a_quantity_from_a_rounded_average_price_snaps_to_the_lot() {
+        // 某次实盘：bitget 两笔 44 @ 2.98 + 23 @ 2.981，均价被舍到 12 位小数 2.980343283582。
+        let leg = |notional, average| LegFill {
+            venue: Venue::Bitget,
+            side: Side::Buy,
+            notional_usdt: notional,
+            average_price: average,
+            fee_usdt: Decimal::ZERO,
+            client_order_id: ClientOrderId::for_leg("lit", Side::Buy, 0),
+            margin_usdt: None,
+        };
+        assert_eq!(
+            leg(dec!(199.683), dec!(2.980343283582)).quantity(),
+            Some(dec!(67))
+        );
+        // 真实的 9 位小数数量不会被吞成 8 位。
+        assert_eq!(
+            leg(dec!(123.456789), dec!(1)).quantity(),
+            Some(dec!(123.456789))
+        );
+        assert_eq!(
+            leg(dec!(0.123456789), dec!(1)).quantity(),
+            Some(dec!(0.123456789))
         );
     }
 }

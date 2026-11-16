@@ -39,6 +39,32 @@ pub struct VenueFill {
 /// 数量对得上的容许误差：台账数量是名义 ÷ 均价反推的，交易所有最小步长取整。
 const QUANTITY_TOLERANCE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
 
+/// 窗口里的成交摘要（时间 买/卖 数量@价格，最多 12 笔）：核不出来时跟着原因一起记下，
+/// 不用再去交易所翻就能看出多出来的是哪几笔（例如开仓方向的成交数量是台账的两倍）。
+fn describe_window(window: &[&VenueFill]) -> String {
+    const MAX: usize = 12;
+    let mut parts: Vec<String> = window
+        .iter()
+        .take(MAX)
+        .map(|fill| {
+            format!(
+                "{} {}{}@{}",
+                fill.at.format("%m-%d %H:%M:%S"),
+                match fill.side {
+                    Side::Buy => "买",
+                    Side::Sell => "卖",
+                },
+                fill.quantity.normalize(),
+                fill.price.normalize()
+            )
+        })
+        .collect();
+    if window.len() > MAX {
+        parts.push(format!("…共 {} 笔", window.len()));
+    }
+    format!("窗口内成交：{}", parts.join("、"))
+}
+
 /// 一条腿的核算结果。
 #[derive(Debug, Clone, Serialize)]
 pub struct LegSettlement {
@@ -146,17 +172,19 @@ pub fn settle_leg(
     let entered = sum(leg.side);
     if !close_to(entered) {
         return Err(format!(
-            "{venue} 成交记录里的开仓数量 {} 与台账的 {} 对不上，可能混进了别的开仓",
+            "{venue} 成交记录里的开仓数量 {} 与台账的 {} 对不上，可能混进了别的开仓（{}）",
             entered.normalize(),
-            quantity.round_dp(8).normalize()
+            quantity.round_dp(8).normalize(),
+            describe_window(&window)
         ));
     }
     let exited = sum(closing);
     if !close_to(exited) {
         return Err(format!(
-            "{venue} 成交记录里的平仓数量 {} 与台账的 {} 对不上（只平了一部分、或多平了）",
+            "{venue} 成交记录里的平仓数量 {} 与台账的 {} 对不上（只平了一部分、或多平了）（{}）",
             exited.normalize(),
-            quantity.round_dp(8).normalize()
+            quantity.round_dp(8).normalize(),
+            describe_window(&window)
         ));
     }
     let exit_fills: Vec<&&VenueFill> = window.iter().filter(|fill| fill.side == closing).collect();
@@ -387,6 +415,25 @@ mod tests {
         ));
         let error = settle_leg(&short, &flipped, at(0), at(59)).unwrap_err();
         assert!(error.contains("反向开仓"), "{error}");
+    }
+
+    #[test]
+    fn a_quantity_mismatch_lists_the_fills_that_were_in_the_window() {
+        let short = leg(Venue::Arcus, Side::Sell, dec!(0.5547), dec!(0.224391404));
+        let mut over = arcus_fills();
+        over.push(fill(
+            55,
+            Side::Buy,
+            dec!(500),
+            dec!(0.57),
+            dec!(0),
+            FillEffect::Close,
+        ));
+        let error = settle_leg(&short, &over, at(0), at(59)).unwrap_err();
+        assert!(
+            error.contains("窗口内成交：") && error.contains("买500@0.57"),
+            "{error}"
+        );
     }
 
     #[test]

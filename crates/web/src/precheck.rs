@@ -848,6 +848,7 @@ impl Prechecker {
 
     async fn check(&self, report: &ScanReport, job: &Job, limits: &Limits) -> Verdict {
         let request = OpenRequest {
+            maker: None,
             margin_mode: job.key.margin_mode,
             base: job.symbol.base.clone(),
             quote: Some(job.symbol.quote.clone()),
@@ -860,6 +861,10 @@ impl Prechecker {
             view: job.key.view.clone(),
             depth_levels: DEPTH_LEVELS,
             rules: TaskRules::default(),
+            relative_to_normal: false,
+            leg_order: arb_exec::preflight::LegOrder::CheapFirst,
+            depth_fit: None,
+            force_hedge_pct: None,
         };
         let policy = if job.key.live {
             LeveragePolicy::Strict

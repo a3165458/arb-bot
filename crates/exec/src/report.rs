@@ -62,6 +62,14 @@ pub struct OpenReport {
     pub prepare_ms: i64,
     /// 执行器从开始到两腿都记完。
     pub total_ms: i64,
+    /// 两腿各自的下单往返（发单到拿到结果，毫秒），第二腿试了几次：自动交易按它看哪家交易所变慢了。
+    /// 旧台账没有这几项。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_order_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub second_order_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub second_attempts: Option<u32>,
 }
 
 /// 计时用的时刻。`quoted_at` 是取盘口的时刻（`prepare` 里拉完两个盘口之后）。
@@ -128,7 +136,12 @@ pub fn open_report(
     timing: &OpenTiming,
 ) -> Option<OpenReport> {
     let quote_to = |at: DateTime<Utc>| timing.quoted_at.map(|quoted| millis(quoted, at));
-    let first_exec = leg_execution(plan.first_leg(), first, quote_to(timing.first_filled_at))?;
+    // 限价记实际下单用的（按保本线封顶后的，见 `Plan::first_leg_capped`）。
+    let first_exec = leg_execution(
+        &plan.first_leg_capped(),
+        first,
+        quote_to(timing.first_filled_at),
+    )?;
     let second_exec = leg_execution(plan.second_leg(), second, quote_to(timing.second_filled_at))?;
 
     let (long_fill, short_fill) = if first.side == Side::Buy {
@@ -147,11 +160,20 @@ pub fn open_report(
         vs_expected_usdt,
         vs_best_usdt,
         fees_usdt: first_exec.fee_usdt + second_exec.fee_usdt,
-        unhedged_ms: millis(timing.first_filled_at, timing.second_filled_at),
+        // 两腿同时下时第二腿可能先回来：只有一条腿的窗口是两个时刻之差。
+        unhedged_ms: (timing.second_filled_at - timing.first_filled_at)
+            .num_milliseconds()
+            .abs(),
         prepare_ms: millis(timing.started_at, timing.ready_at),
-        total_ms: millis(timing.started_at, timing.second_filled_at),
+        total_ms: millis(
+            timing.started_at,
+            timing.first_filled_at.max(timing.second_filled_at),
+        ),
         first: first_exec,
         second: second_exec,
+        first_order_ms: None,
+        second_order_ms: None,
+        second_attempts: None,
     })
 }
 
@@ -257,6 +279,8 @@ mod tests {
             expected_price: expected,
             slippage: (expected - best).abs() / best,
             book_notional: dec!(46000),
+            fee: Decimal::ZERO,
+            maker_rest_ms: None,
         }
     }
 
@@ -294,6 +318,8 @@ mod tests {
             long,
             short,
             expected_cost: dec!(0.0013415),
+            min_locked_basis: None,
+            leg_order: crate::preflight::LegOrder::Slippage,
         };
         (
             plan,
@@ -365,6 +391,20 @@ mod tests {
         assert_eq!(report.second.quote_to_fill_ms, Some(6248));
         assert_eq!(report.unhedged_ms, 3648);
         assert_eq!(report.prepare_ms, 312);
+        assert_eq!(report.total_ms, 5360);
+    }
+
+    #[test]
+    fn parallel_fills_in_reverse_order_do_not_report_zero_naked_time_or_end_early() {
+        let (plan, long, short) = pons();
+        let normal = timing();
+        let reverse = OpenTiming {
+            first_filled_at: normal.second_filled_at,
+            second_filled_at: normal.first_filled_at,
+            ..normal
+        };
+        let report = open_report(&plan, &long, &short, &reverse).unwrap();
+        assert_eq!(report.unhedged_ms, 3648);
         assert_eq!(report.total_ms, 5360);
     }
 

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arb_core::{ArbResult, Venue};
+use arb_core::{ArbResult, Symbol, Venue};
 use rust_decimal::Decimal;
 
 use crate::broker::Broker;
@@ -24,6 +24,9 @@ use crate::types::{PairPosition, PositionStatus};
 pub struct Divergence {
     pub kind: DivergenceKind,
     pub venue: Option<Venue>,
+    /// 这处不一致属于哪个币。`None`：整个场所没核对（查询失败），或归不到哪个币（见 [`Self::blocks`]）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<Symbol>,
     /// 仓位 id 或客户订单号。
     pub reference: String,
     pub detail: String,
@@ -51,6 +54,23 @@ impl Divergence {
     pub fn needs_attention(&self) -> bool {
         true
     }
+
+    /// 这处不一致是否波及 `symbol` 在 `venues` 上的仓位（要冻结它：不评估规则、不开新仓、不为续上建仓发单）。
+    ///
+    /// 只冻结出问题的币，其余照常：知道属于哪个币的只管那个币；整个场所没核对（持仓或挂单查询失败）的，
+    /// 冻结在这个场所上有腿的；归不到哪个币也归不到哪个场所的，全部冻结。
+    pub fn blocks(&self, symbol: &Symbol, venues: &[Venue]) -> bool {
+        self.blocks_where(&|own| own == symbol, venues)
+    }
+
+    /// 同 [`Self::blocks`]，但是不是同一个币由 `same` 判断（开仓请求只有 base，quote 可能没给）。
+    pub fn blocks_where(&self, same: &dyn Fn(&Symbol) -> bool, venues: &[Venue]) -> bool {
+        match (&self.symbol, self.kind, self.venue) {
+            (Some(own), _, _) => same(own),
+            (None, DivergenceKind::Unverified, Some(venue)) => venues.contains(&venue),
+            _ => true,
+        }
+    }
 }
 
 /// 对账结果。
@@ -61,12 +81,55 @@ pub struct Reconciliation {
     pub checked_positions: usize,
     /// 核对过的场所数。
     pub checked_venues: usize,
+    /// 各场所这次核对（持仓、挂单两次查询并发）用了多少毫秒。只给日志看哪家拖慢了对账。
+    #[serde(skip)]
+    pub elapsed_ms: Vec<(Venue, u64)>,
 }
 
 impl Reconciliation {
+    /// 最慢的那家场所和它用的毫秒数（对账要等它）。
+    pub fn slowest(&self) -> Option<(Venue, u64)> {
+        self.elapsed_ms.iter().copied().max_by_key(|(_, ms)| *ms)
+    }
+
     /// 是否完全一致（且全部核对过）。
     pub fn is_clean(&self) -> bool {
         self.divergences.is_empty()
+    }
+
+    /// 有没有哪处不一致波及 `symbol` 在 `venues` 上的仓位（见 [`Divergence::blocks`]）。
+    pub fn blocks(&self, symbol: &Symbol, venues: &[Venue]) -> bool {
+        self.divergences
+            .iter()
+            .any(|divergence| divergence.blocks(symbol, venues))
+    }
+
+    /// 开新仓 / 补仓用：`base`（及给了的 `quote`）在两腿场所 `venues` 上是否被冻结。
+    pub fn blocks_open(&self, base: &str, quote: Option<&str>, venues: &[Venue]) -> bool {
+        let (base, quote) = (base.trim(), quote.map(str::trim));
+        let same = |own: &Symbol| {
+            own.base.eq_ignore_ascii_case(base)
+                && quote.is_none_or(|quote| own.quote.eq_ignore_ascii_case(quote))
+        };
+        self.divergences
+            .iter()
+            .any(|divergence| divergence.blocks_where(&same, venues))
+    }
+
+    /// 冻结了什么，给人看：出问题的币、整个没核对的场所；有归不到哪里的就是「全部」。
+    pub fn frozen_scope(&self) -> Vec<String> {
+        let mut scope: Vec<String> = Vec::new();
+        for divergence in &self.divergences {
+            let item = match (&divergence.symbol, divergence.kind, divergence.venue) {
+                (Some(symbol), _, _) => symbol.to_string(),
+                (None, DivergenceKind::Unverified, Some(venue)) => format!("{venue} 上的全部仓位"),
+                _ => return vec!["全部".into()],
+            };
+            if !scope.contains(&item) {
+                scope.push(item);
+            }
+        }
+        scope
     }
 }
 
@@ -105,6 +168,7 @@ pub async fn reconcile(
         result.checked_venues += part.checked_venues;
         result.checked_positions += part.checked_positions;
         result.divergences.extend(part.divergences);
+        result.elapsed_ms.extend(part.elapsed_ms);
     }
     Ok(result)
 }
@@ -116,19 +180,36 @@ async fn reconcile_venue(
     positions: &[&PairPosition],
     local_orders: &HashMap<Venue, Vec<String>>,
 ) -> Reconciliation {
-    let venue = &venue;
+    let started = std::time::Instant::now();
+    let (positions_read, open_read) =
+        futures_util::future::join(broker.positions(), broker.open_orders()).await;
+    let mut result = reconcile_reads(&venue, positions_read, open_read, positions, local_orders);
+    result.elapsed_ms = vec![(venue, started.elapsed().as_millis() as u64)];
+    result
+}
+
+/// [`reconcile_venue`] 的核对部分：持仓与挂单两次查询的结果已经拿到（两次查询互不依赖，并发发出）。
+/// 持仓查询失败就只报「未核对」，不看挂单。
+fn reconcile_reads(
+    venue: &Venue,
+    positions_read: ArbResult<Vec<crate::broker::VenuePosition>>,
+    open_read: ArbResult<Vec<crate::types::OrderState>>,
+    positions: &[&PairPosition],
+    local_orders: &HashMap<Venue, Vec<String>>,
+) -> Reconciliation {
     let mut result = Reconciliation {
         checked_venues: 1,
         ..Reconciliation::default()
     };
 
     // 1) 交易所的持仓 vs 本地的敞口。
-    let venue_positions = match broker.positions().await {
+    let venue_positions = match positions_read {
         Ok(positions) => positions,
         Err(error) => {
             result.divergences.push(Divergence {
                 kind: DivergenceKind::Unverified,
                 venue: Some(*venue),
+                symbol: None,
                 reference: venue.to_string(),
                 detail: format!("持仓查询失败，本场所**未核对**：{error}"),
             });
@@ -146,6 +227,7 @@ async fn reconcile_venue(
             result.divergences.push(Divergence {
                 kind: DivergenceKind::NakedLeg,
                 venue: Some(*venue),
+                symbol: Some(position.symbol.clone()),
                 reference: position.id.clone(),
                 detail: "仓位状态是 Open 但只有一条腿的成交记录".into(),
             });
@@ -163,6 +245,7 @@ async fn reconcile_venue(
                     _ => result.divergences.push(Divergence {
                         kind: DivergenceKind::Unverified,
                         venue: Some(*venue),
+                        symbol: Some(position.symbol.clone()),
                         reference: position.id.clone(),
                         detail: "台账缺成交数量，无法核对真实持仓".into(),
                     }),
@@ -184,6 +267,7 @@ async fn reconcile_venue(
                     DivergenceKind::PositionMismatch
                 },
                 venue: Some(*venue),
+                symbol: Some(symbol.clone()),
                 reference: symbol.to_string(),
                 detail: format!("{symbol} 台账数量 {quantity}，场所净数量 {on_venue}"),
             });
@@ -194,6 +278,7 @@ async fn reconcile_venue(
             result.divergences.push(Divergence {
                 kind: DivergenceKind::PositionMismatch,
                 venue: Some(*venue),
+                symbol: Some(symbol.clone()),
                 reference: symbol.to_string(),
                 detail: format!("{symbol} 台账没有持仓，场所净数量 {quantity}"),
             });
@@ -201,12 +286,13 @@ async fn reconcile_venue(
     }
 
     // 2) 交易所的挂单 vs 本地台账。交易所多出来的挂单最危险。
-    let venue_open = match broker.open_orders().await {
+    let venue_open = match open_read {
         Ok(orders) => orders,
         Err(error) => {
             result.divergences.push(Divergence {
                 kind: DivergenceKind::Unverified,
                 venue: Some(*venue),
+                symbol: None,
                 reference: venue.to_string(),
                 detail: format!("挂单查询失败，本场所**未核对**：{error}"),
             });
@@ -224,6 +310,7 @@ async fn reconcile_venue(
             result.divergences.push(Divergence {
                 kind: DivergenceKind::UnknownOpenOrder,
                 venue: Some(*venue),
+                symbol: Some(order.order.symbol.clone()),
                 reference: id.clone(),
                 detail: format!(
                     "交易所有一笔本地台账不知道的挂单：{} {} {}，它随时可能成交",
@@ -241,6 +328,8 @@ async fn reconcile_venue(
             result.divergences.push(Divergence {
                 kind: DivergenceKind::OrderMissingOnVenue,
                 venue: Some(*venue),
+                // 本地挂单清单只有订单号：调用方按台账补上是哪个币（见 `desk::reconcile_ledger`）。
+                symbol: None,
                 reference: id.clone(),
                 detail: "本地记着这笔挂单，交易所那边已经不在场上了（成交或已撤）".into(),
             });

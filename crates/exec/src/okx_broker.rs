@@ -488,6 +488,7 @@ impl OkxBroker {
                     Some(parse_decimal(&remote.lever)?)
                 };
                 NewOrder {
+                    post_only: false,
                     margin_mode: crate::MarginMode::Isolated,
                     client_order_id: ClientOrderId(format!("okx-external-{}", remote.ord_id)),
                     venue: Venue::Okx,
@@ -639,6 +640,7 @@ impl Broker for OkxBroker {
     }
 
     async fn place(&self, order: &NewOrder) -> ArbResult<OrderAck> {
+        crate::broker::refuse_post_only(order)?;
         self.options.authorize(Venue::Okx)?;
         if order.venue != Venue::Okx || order.client_order_id.0.is_empty() {
             return Err(error("下单请求的场所不对或客户订单号为空"));
@@ -1585,6 +1587,7 @@ mod tests {
 
     fn order(quantity: Option<Decimal>, reduce_only: bool) -> NewOrder {
         NewOrder {
+            post_only: false,
             margin_mode: crate::MarginMode::Isolated,
             client_order_id: ClientOrderId("live-1-buy-0".into()),
             venue: Venue::Okx,

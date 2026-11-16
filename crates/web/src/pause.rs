@@ -10,9 +10,10 @@
 //! 熔断后要操作者看过原因、手动恢复；恢复时记下时刻，之后只数这个时刻之后的新失败，旧的失败
 //! 不会让恢复后的第一次失败立刻再次熔断。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use arb_exec::{PairPosition, PositionStatus};
+use arb_exec::{OrderState, PairPosition, PositionStatus};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +77,41 @@ pub fn save(path: &Path, state: &PauseState) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// 开仓以回滚收场（`Unwound`）但「不是失败」的两种：
+/// - 下过单、一张都没成交 —— 什么都没发生：挂单到点撤了，或吃单的第一腿就被交易所拒了 / 没吃到
+///   （某次实盘：Hyperliquid 周末按预言机限价拒单「Price too far from oracle」，用户定为不计失败）；
+/// - 挂单成交太小，凑不够对冲腿的最小下单额，回滚了那一小块（备注带 [`arb_exec::MAKER_DUST_NOTE`]）—— 只付一笔
+///   平仓的吃单费与穿价。
+///
+/// 这两种不说明有什么东西坏了：不该计入连续失败，也不该打断前面的失败计数。数熔断时把它们整个拿掉。
+///
+/// 「没成交过」要看订单：回滚会把仓位的两条腿清空，**不能**用「腿为空」来判断（那样会把一次真正的回滚
+/// 也当成什么都没发生）。只要这笔仓位的任何一张订单有成交（含回滚的平仓单），就不是「没成交」；
+/// 台账里一张单都没有的也不算（不知道发生了什么）。
+pub fn is_benign_attempt(position: &PairPosition, orders: &HashMap<String, OrderState>) -> bool {
+    if position.status != PositionStatus::Unwound {
+        return false;
+    }
+    let prefix = format!("{}-", position.id);
+    let mut ordered = false;
+    let mut resting = false;
+    let mut traded = false;
+    for (id, order) in orders {
+        if id.starts_with(&prefix) {
+            ordered = true;
+            resting |= order.order.post_only;
+            traded |= order.filled_usdt > rust_decimal::Decimal::ZERO;
+        }
+    }
+    ordered
+        && (!traded
+            || resting
+                && position
+                    .note
+                    .as_deref()
+                    .is_some_and(|note| note.contains(arb_exec::MAKER_DUST_NOTE)))
+}
+
 /// 最近连续几笔开仓是以回滚收场的（只数 `after` 之后开的）。
 ///
 /// 从最新的一笔往回数：`Unwound` 算一次失败，遇到任何别的结局（成功开成的 `Open` / `Closed` /
@@ -130,6 +166,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned: None,
         }
     }
 
@@ -154,6 +191,87 @@ mod tests {
         // 还在进行的不算失败也不算成功：从它就停。
         let running = [position("x", Unwound, 20), position("y", Opening, 5)];
         assert_eq!(consecutive_failed_opens(&running, None), 0);
+    }
+
+    /// 挂单没成交（或成交太碎、回滚了一小块）的尝试不是失败，也不能把前面的失败打断；但真正的回滚
+    /// （成交了、对冲失败、回滚）仍是失败 —— 即使回滚之后仓位的两条腿已经被清空。
+    #[test]
+    fn untraded_attempts_and_dust_makers_are_not_failures_but_real_rollbacks_are() {
+        use PositionStatus::*;
+        let order = |id: &str, post_only: bool, reduce_only: bool, filled: i64| {
+            let mut state = arb_exec::OrderState::new(arb_exec::NewOrder {
+                post_only,
+                client_order_id: arb_exec::ClientOrderId(id.into()),
+                venue: arb_core::Venue::Binance,
+                symbol: arb_core::Symbol::perp("BTC", "USDT"),
+                side: arb_core::Side::Buy,
+                notional_usdt: Decimal::from(50),
+                quantity: None,
+                limit_price: Some(Decimal::from(100)),
+                reduce_only,
+                margin_mode: arb_exec::MarginMode::Isolated,
+                leverage: Some(Decimal::from(2)),
+            });
+            state.status = arb_exec::OrderStatus::Cancelled;
+            state.filled_usdt = Decimal::from(filled);
+            (id.to_string(), state)
+        };
+        let mut orders: HashMap<String, arb_exec::OrderState> = HashMap::new();
+        // m1：挂了单，一点没成交。
+        orders.extend([order("m1-buy-0", true, false, 0)]);
+        // m2：挂单成交了 40，对冲失败，回滚的平仓单也成交了：真正的回滚。
+        orders.extend([
+            order("m2-buy-0", true, false, 40),
+            order("m2-buy-exit1", false, true, 40),
+        ]);
+        // m3：成交了一小块（15）、凑不够对冲，回滚了（平仓单成交），备注带标记。
+        orders.extend([
+            order("m3-buy-0", true, false, 15),
+            order("m3-buy-exit1", false, true, 15),
+        ]);
+        // m4：普通吃单的回滚，没有只挂单。
+        orders.extend([
+            order("m4-buy-0", false, false, 40),
+            order("m4-buy-exit1", false, true, 40),
+        ]);
+        // m5：吃单第一腿就被交易所拒了，一张都没成交（某次实盘）。
+        orders.extend([order("m5-sell-0", false, false, 0)]);
+        let mut dust = position("m3", Unwound, 15);
+        dust.note = Some(format!(
+            "建仓未完成，已成交腿已全部回滚。{}",
+            arb_exec::MAKER_DUST_NOTE
+        ));
+        let history = [
+            position("a", Unwound, 60),
+            position("m1", Unwound, 50),
+            position("m2", Unwound, 40),
+            dust,
+            position("m4", Unwound, 10),
+            position("m5", Unwound, 5),
+        ];
+        let benign = |p: &PairPosition| is_benign_attempt(p, &orders);
+        assert!(benign(&history[1]), "没成交就撤了");
+        assert!(
+            !benign(&history[2]),
+            "挂单成交后回滚是真正的回滚，哪怕两条腿已经被清空"
+        );
+        assert!(benign(&history[3]), "成交太碎、回滚了一小块");
+        assert!(!benign(&history[4]), "普通吃单的回滚不是");
+        assert!(
+            benign(&history[5]),
+            "吃单第一腿被拒、一张都没成交：什么都没发生"
+        );
+        assert!(
+            !benign(&history[0]),
+            "台账里一张单都没有：不知道发生了什么，不豁免"
+        );
+        // 不是 Unwound 的不算。
+        let mut open = history[1].clone();
+        open.status = Open;
+        assert!(!benign(&open));
+        // 数熔断：a、m2、m4 三次真失败；m1、m3、m5 既不加数也不打断。
+        let counted = consecutive_failed_opens(history.iter().filter(|p| !benign(p)), None);
+        assert_eq!(counted, 3);
     }
 
     /// 恢复之后只数新失败：旧的三次失败不能让恢复后的第一次失败立刻再次熔断。

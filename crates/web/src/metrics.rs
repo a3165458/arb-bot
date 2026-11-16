@@ -309,6 +309,7 @@ pub fn render(scrape: &Scrape) -> String {
         "arb_alerts_suppressed_total {}",
         scrape.alerts_suppressed
     );
+    out.push_str(&crate::rh_spread::latency::METRICS.prometheus());
     out
 }
 

@@ -9,9 +9,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::types::{OrderState, PairPosition};
@@ -35,7 +37,7 @@ impl Record {
 }
 
 /// 重放结果：每个主键的最新状态。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Replayed {
     pub orders: HashMap<String, OrderState>,
     pub positions: HashMap<String, PairPosition>,
@@ -54,7 +56,29 @@ impl Replayed {
 pub struct Ledger {
     path: PathBuf,
     file: Mutex<tokio::fs::File>,
+    /// 这个进程里追加过几次（成功与否都算）：缓存「上次读台账时的结论」的调用方拿它判断台账变没变。
+    generation: AtomicU64,
+    /// [`Ledger::replay`] 已经解析过的前缀。
+    replayed: Mutex<Option<ReplayCache>>,
 }
+
+/// 台账已解析的前缀：到第几个字节（总在一个换行之后）、那时的重放结果。
+///
+/// 整本重放是纯 CPU 解析：实盘台账几 MB、几千行时，一次几十毫秒，下单前要做三次，
+/// 而且台账只会越来越长。追加式台账只在末尾长，所以只解析新追加的行。
+struct ReplayCache {
+    offset: u64,
+    /// 前缀最后这几个字节：下次接着读之前先核对，对不上（文件被别的工具改过）就整本重来。
+    tail: Vec<u8>,
+    replayed: Replayed,
+    broken: usize,
+    full_at: Instant,
+}
+
+/// 接着读之前核对的前缀末尾字节数。
+const REPLAY_TAIL: u64 = 256;
+/// 至少隔多久整本重放一次：万一有改动没被末尾核对发现，最多错这么久。
+const FULL_REPLAY_EVERY: Duration = Duration::from_secs(300);
 
 impl Ledger {
     /// 打开（不存在则创建）台账文件。目录会被自动创建。
@@ -118,6 +142,8 @@ impl Ledger {
         Ok(Self {
             path,
             file: Mutex::new(file),
+            generation: AtomicU64::new(0),
+            replayed: Mutex::new(None),
         })
     }
 
@@ -131,16 +157,54 @@ impl Ledger {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         line.push('\n');
         let mut file = self.file.lock().await;
-        file.write_all(line.as_bytes()).await?;
-        file.sync_data().await
+        // 先记一次再写：写到一半失败的也算「变过」，依赖旧结论的调用方宁可重读。
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        // 写之前的长度：写失败时截回这里。不截的话，文件末尾留着半行（磁盘满时常见），下一次写成功的
+        // 那条记录会接在半行后面、合成一行解析不了的坏行 —— 那条记录在重放里消失，对账看见坏行还会
+        // 拒绝一切开仓与规则，直到人工修台账。
+        let before = file.metadata().await?.len();
+        let written = match file.write_all(line.as_bytes()).await {
+            // tokio 的 `write_all` 只是把数据交给后台线程，写失败（磁盘满、IO 错误）要到 `flush` 才报出来；
+            // 直接 `sync_data` 会把这个错误吞掉、返回成功，留到下一次写才报，台账从此多一条半行。
+            Ok(()) => match file.flush().await {
+                Ok(()) => file.sync_data().await,
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        if let Err(error) = written {
+            match file.set_len(before).await {
+                Ok(()) => tracing::warn!(
+                    path = %self.path.display(), %error,
+                    "台账写入失败：已截回写之前的长度，没有留下半行"
+                ),
+                Err(cut) => tracing::error!(
+                    path = %self.path.display(), %error, %cut,
+                    "台账写入失败，截回也失败：末尾可能有半行，重启时会移到 .torn 旁路文件"
+                ),
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// 追加过几次（见字段说明）。两次读到的值相同 = 这期间本进程没写过台账。
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     /// 这个仓位 id 的全部历史记录（最旧在前）。结束后的仓位已经清掉了两条腿，事后要拿
     /// 开仓时的腿（价格、数量）就得回头翻它。
+    ///
+    /// 平仓前就要用（[`crate::executor`] 的 `before_exit`）：只解析含这个 id 的行 —— JSON 只转义引号、
+    /// 反斜杠和控制字符，id 里没有这些，它的记录里就必然原样有这个 id；其余几千行不用解析（整本解析
+    /// 东京要约 50ms）。id 里有要转义的字符就照旧逐行解析。
     pub async fn position_history(&self, id: &str) -> std::io::Result<Vec<PairPosition>> {
         let content = read_complete_lines(&self.path).await?;
+        let literal = !id.chars().any(|c| c == '"' || c == '\\' || c.is_control());
         Ok(content
             .lines()
+            .filter(|line| !literal || line.contains(id))
             .filter_map(|line| serde_json::from_str::<Record>(line).ok())
             .filter_map(|record| match record {
                 Record::Position(position) if position.id == id => Some(*position),
@@ -150,19 +214,90 @@ impl Ledger {
     }
 
     /// 重放整个台账。坏行只跳过并计数，不让一行脏数据毁掉整份历史。
+    ///
+    /// 结果与 [`replay_file`] 整本重放完全相同，只是把解析过的前缀缓存下来，之后只解析新追加的行
+    /// （见 [`ReplayCache`]）。文件变短、前缀末尾对不上、或离上次整本重放超过 [`FULL_REPLAY_EVERY`]
+    /// 时整本重来（放到阻塞线程池里做，不占异步工作线程）。
     pub async fn replay(&self) -> std::io::Result<(Replayed, usize)> {
-        replay_file(&self.path).await
+        let mut cache = self.replayed.lock().await;
+        if let Some(cached) = cache.as_mut()
+            && cached.full_at.elapsed() < FULL_REPLAY_EVERY
+            && extend(&self.path, cached).await?
+        {
+            return Ok((cached.replayed.clone(), cached.broken));
+        }
+        let path = self.path.clone();
+        let full = tokio::task::spawn_blocking(move || replay_prefix(&path))
+            .await
+            .map_err(std::io::Error::other)??;
+        let result = (full.replayed.clone(), full.broken);
+        *cache = Some(full);
+        Ok(result)
     }
 }
 
-/// 只读地重放一份台账文件：不创建、不修补、不追加。
-///
-/// 看板用它展示持仓。[`Ledger::open`] 会创建文件并给半行补换行，那是写操作 ——
-/// 只读的一方不该改动执行方正在追加的文件。文件不存在时返回空结果。
-pub async fn replay_file(path: impl AsRef<Path>) -> std::io::Result<(Replayed, usize)> {
-    let content = read_complete_lines(path.as_ref()).await?;
+/// 把缓存接着读到文件当前末尾。返回 `false` = 接不上（文件变短、前缀末尾变了），要整本重放。
+async fn extend(path: &Path, cached: &mut ReplayCache) -> std::io::Result<bool> {
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let len = file.metadata().await?.len();
+    if len < cached.offset {
+        return Ok(false);
+    }
+    let from = cached.offset - cached.tail.len() as u64;
+    file.seek(std::io::SeekFrom::Start(from)).await?;
+    let mut bytes = Vec::with_capacity((len - from) as usize);
+    file.read_to_end(&mut bytes).await?;
+    if !bytes.starts_with(&cached.tail) {
+        return Ok(false);
+    }
+    let fresh = &bytes[cached.tail.len()..];
+    let end = complete_end(fresh);
+    if end == 0 {
+        return Ok(true);
+    }
+    cached.broken += apply_lines(
+        &mut cached.replayed,
+        &String::from_utf8_lossy(&fresh[..end]),
+    );
+    cached.offset += end as u64;
+    let consumed = &bytes[..cached.tail.len() + end];
+    cached.tail = consumed[consumed.len().saturating_sub(REPLAY_TAIL as usize)..].to_vec();
+    Ok(true)
+}
 
+/// 整本重放并记下解析到哪里（同步版，在阻塞线程池里跑）。
+fn replay_prefix(path: &Path) -> std::io::Result<ReplayCache> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let end = complete_end(&bytes);
     let mut replayed = Replayed::default();
+    let broken = apply_lines(&mut replayed, &String::from_utf8_lossy(&bytes[..end]));
+    Ok(ReplayCache {
+        offset: end as u64,
+        tail: bytes[end.saturating_sub(REPLAY_TAIL as usize)..end].to_vec(),
+        replayed,
+        broken,
+        full_at: Instant::now(),
+    })
+}
+
+/// 到最后一个换行为止（见 [`read_complete_lines`]）。
+fn complete_end(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1)
+}
+
+/// 按顺序把每一行记进重放结果（后来的覆盖先前的），返回解析不了的行数。
+fn apply_lines(replayed: &mut Replayed, content: &str) -> usize {
     let mut broken = 0usize;
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -180,6 +315,17 @@ pub async fn replay_file(path: impl AsRef<Path>) -> std::io::Result<(Replayed, u
             Err(_) => broken += 1,
         }
     }
+    broken
+}
+
+/// 只读地重放一份台账文件：不创建、不修补、不追加。
+///
+/// 看板用它展示持仓。[`Ledger::open`] 会创建文件并给半行补换行，那是写操作 ——
+/// 只读的一方不该改动执行方正在追加的文件。文件不存在时返回空结果。
+pub async fn replay_file(path: impl AsRef<Path>) -> std::io::Result<(Replayed, usize)> {
+    let content = read_complete_lines(path.as_ref()).await?;
+    let mut replayed = Replayed::default();
+    let broken = apply_lines(&mut replayed, &content);
     Ok((replayed, broken))
 }
 
@@ -202,10 +348,7 @@ async fn read_complete_lines(path: &Path) -> std::io::Result<String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(error),
     };
-    let end = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |at| at + 1);
+    let end = complete_end(&bytes);
     Ok(String::from_utf8_lossy(&bytes[..end]).into_owned())
 }
 
@@ -222,6 +365,7 @@ mod tests {
 
     fn order(id: &str, notional: Decimal) -> OrderState {
         OrderState::new(NewOrder {
+            post_only: false,
             margin_mode: crate::MarginMode::Isolated,
             client_order_id: ClientOrderId(id.into()),
             venue: Venue::Binance,
@@ -233,6 +377,33 @@ mod tests {
             reduce_only: false,
             leverage: None,
         })
+    }
+
+    /// 写盘失败（这里用 /dev/full 模拟磁盘满）必须在**这一次** `append` 报出来：订单意图「发单前必须落盘」，
+    /// 返回成功却没写进去，执行器就会照常发单。以前错误被 `sync_data` 吞掉、留到下一次写才报。
+    #[tokio::test]
+    async fn a_failed_write_is_reported_by_the_append_that_made_it() {
+        let full = std::path::Path::new("/dev/full");
+        if !full.exists() {
+            return;
+        }
+        // 不走 `Ledger::open`：它会先把整个文件读一遍，而 /dev/full 读出来是无穷的零。
+        let file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(full)
+            .await
+            .unwrap();
+        let ledger = Ledger {
+            path: full.to_path_buf(),
+            file: Mutex::new(file),
+            generation: AtomicU64::new(0),
+            replayed: Mutex::new(None),
+        };
+        let error = ledger
+            .append(&Record::Order(Box::new(order("full-1", dec!(10)))))
+            .await
+            .expect_err("磁盘满时这一次写就要报错");
+        assert_eq!(error.raw_os_error(), Some(28), "ENOSPC: {error}");
     }
 
     fn position(id: &str, status: PositionStatus) -> PairPosition {
@@ -263,6 +434,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned: None,
         }
     }
 
@@ -442,6 +614,193 @@ mod tests {
         assert!(exposed.contains(&"open"));
         assert!(exposed.contains(&"naked"), "回滚中的仓位仍然有敞口");
         assert!(!exposed.contains(&"closed"));
+
+        tokio::fs::remove_file(&path).await.ok();
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    /// 增量重放的结果必须与整本重放一模一样：同一个 key 后来的覆盖先前的、坏行照样计数、
+    /// 还没写完的半行不算（等它写完下次再读到）。
+    #[tokio::test]
+    async fn incremental_replay_matches_a_full_replay() {
+        let dir = std::env::temp_dir().join(format!("arb-ledger-inc-{}", std::process::id()));
+        let path = dir.join("ledger.jsonl");
+        let _ = tokio::fs::remove_file(&path).await;
+        let ledger = Ledger::open(&path).await.unwrap();
+        let summary = |replayed: &Replayed, broken: usize| {
+            let mut orders: Vec<_> = replayed
+                .orders
+                .iter()
+                .map(|(id, state)| (id.clone(), state.status, state.filled_usdt))
+                .collect();
+            orders.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut positions: Vec<_> = replayed
+                .positions
+                .iter()
+                .map(|(id, position)| (id.clone(), position.status))
+                .collect();
+            positions.sort_by(|a, b| a.0.cmp(&b.0));
+            format!("{orders:?} {positions:?} {broken}")
+        };
+        let same_as_full = |label: &'static str| {
+            let ledger = &ledger;
+            let path = path.clone();
+            async move {
+                let (cached, cached_broken) = ledger.replay().await.unwrap();
+                let (full, full_broken) = replay_file(&path).await.unwrap();
+                assert_eq!(
+                    summary(&cached, cached_broken),
+                    summary(&full, full_broken),
+                    "{label}"
+                );
+                (cached, cached_broken)
+            }
+        };
+
+        let (empty, _) = same_as_full("空台账").await;
+        assert!(empty.orders.is_empty());
+        ledger
+            .append(&Record::Order(Box::new(order("o1", dec!(100)))))
+            .await
+            .unwrap();
+        ledger
+            .append(&Record::Position(Box::new(position(
+                "p1",
+                PositionStatus::Opening,
+            ))))
+            .await
+            .unwrap();
+        same_as_full("头两行").await;
+
+        let mut filled = order("o1", dec!(100));
+        filled.status = crate::types::OrderStatus::Filled;
+        filled.filled_usdt = dec!(100);
+        ledger
+            .append(&Record::Order(Box::new(filled)))
+            .await
+            .unwrap();
+        ledger
+            .append(&Record::Position(Box::new(position(
+                "p1",
+                PositionStatus::Open,
+            ))))
+            .await
+            .unwrap();
+        let (replayed, _) = same_as_full("同一个 key 的新状态").await;
+        assert_eq!(
+            replayed.orders["o1"].status,
+            crate::types::OrderStatus::Filled
+        );
+        assert_eq!(replayed.positions["p1"].status, PositionStatus::Open);
+
+        // 坏行与写到一半的行（另一个任务正在追加）。
+        let mut raw = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        raw.write_all(b"not json\n").await.unwrap();
+        let next = serde_json::to_string(&Record::Order(Box::new(order("o2", dec!(5))))).unwrap();
+        let (head, rest) = next.split_at(next.len() / 2);
+        raw.write_all(head.as_bytes()).await.unwrap();
+        raw.sync_data().await.unwrap();
+        let (replayed, broken) = same_as_full("坏行计数、半行不算").await;
+        assert_eq!(broken, 1);
+        assert!(!replayed.orders.contains_key("o2"));
+        raw.write_all(rest.as_bytes()).await.unwrap();
+        raw.write_all(b"\n").await.unwrap();
+        raw.sync_data().await.unwrap();
+        let (replayed, _) = same_as_full("半行写完之后").await;
+        assert_eq!(replayed.orders["o2"].order.notional_usdt, dec!(5));
+
+        tokio::fs::remove_file(&path).await.ok();
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    /// 台账被别的工具改过（变短、或者已解析过的部分被改写）：缓存接不上，要整本重放，
+    /// 不能拿旧结论加上新尾巴。
+    #[tokio::test]
+    async fn incremental_replay_notices_a_rewritten_ledger() {
+        let dir = std::env::temp_dir().join(format!("arb-ledger-rewrite-{}", std::process::id()));
+        let path = dir.join("ledger.jsonl");
+        let _ = tokio::fs::remove_file(&path).await;
+        let ledger = Ledger::open(&path).await.unwrap();
+        for id in ["o1", "o2", "o3"] {
+            ledger
+                .append(&Record::Order(Box::new(order(id, dec!(100)))))
+                .await
+                .unwrap();
+        }
+        assert_eq!(ledger.replay().await.unwrap().0.orders.len(), 3);
+
+        // 变短：只留第一行。
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let first = content.lines().next().unwrap();
+        tokio::fs::write(&path, format!("{first}\n")).await.unwrap();
+        let (replayed, _) = ledger.replay().await.unwrap();
+        assert_eq!(replayed.orders.len(), 1, "台账变短了，要按新内容重放");
+
+        // 同样长、但已解析过的部分被改写（金额 100 → 900），后面又追加了一行。
+        let changed = first.replace("\"100\"", "\"900\"");
+        assert_ne!(changed, first, "测试数据里要有能改的金额");
+        let extra = serde_json::to_string(&Record::Order(Box::new(order("o4", dec!(1))))).unwrap();
+        tokio::fs::write(&path, format!("{changed}\n{extra}\n"))
+            .await
+            .unwrap();
+        let (replayed, _) = ledger.replay().await.unwrap();
+        assert_eq!(replayed.orders.len(), 2);
+        assert_eq!(
+            replayed.orders["o1"].order.notional_usdt,
+            dec!(900),
+            "前缀被改写过：不能沿用旧结论"
+        );
+
+        tokio::fs::remove_file(&path).await.ok();
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    /// 仓位历史先按 id 子串过滤再解析：结果与逐行解析完全相同（前缀相同的别的仓位、订单行都不混进来）。
+    #[tokio::test]
+    async fn position_history_keeps_every_record_of_exactly_that_position() {
+        let dir = std::env::temp_dir().join(format!("arb-ledger-history-{}", std::process::id()));
+        let path = dir.join("ledger.jsonl");
+        let _ = tokio::fs::remove_file(&path).await;
+        let ledger = Ledger::open(&path).await.unwrap();
+        for (id, status) in [
+            ("p1", PositionStatus::Opening),
+            ("p10", PositionStatus::Opening),
+            ("p1", PositionStatus::Open),
+            ("p10", PositionStatus::Open),
+            ("p1", PositionStatus::Closed),
+        ] {
+            ledger
+                .append(&Record::Position(Box::new(position(id, status))))
+                .await
+                .unwrap();
+            ledger
+                .append(&Record::Order(Box::new(order(
+                    &format!("{id}-buy-0"),
+                    dec!(1),
+                ))))
+                .await
+                .unwrap();
+        }
+        let statuses = |history: Vec<PairPosition>| {
+            history
+                .into_iter()
+                .map(|position| (position.id, position.status))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            statuses(ledger.position_history("p1").await.unwrap()),
+            [
+                ("p1".to_string(), PositionStatus::Opening),
+                ("p1".to_string(), PositionStatus::Open),
+                ("p1".to_string(), PositionStatus::Closed),
+            ]
+        );
+        assert_eq!(ledger.position_history("p10").await.unwrap().len(), 2);
+        assert!(ledger.position_history("p2").await.unwrap().is_empty());
 
         tokio::fs::remove_file(&path).await.ok();
         tokio::fs::remove_dir_all(&dir).await.ok();

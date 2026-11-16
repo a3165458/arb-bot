@@ -18,8 +18,49 @@ use serde::Serialize;
 
 /// 配对榜最多返回多少行。两家大所同时上市的合约可能有几百个，全量下发没有意义。
 pub const MAX_PAIR_ROWS: usize = 300;
-/// 持仓页展示最近多少笔已结束的仓位。
+/// 「最近结束」不带分页参数时每页几笔（Telegram、旧请求）。
 pub const MAX_CLOSED_POSITIONS: usize = 20;
+/// 「最近结束」每页最多几笔。
+pub const MAX_CLOSED_PER_PAGE: usize = 100;
+
+/// 「最近结束」取哪一页（从 1 起）。超出末页的按末页给。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosedPage {
+    pub page: usize,
+    pub per_page: usize,
+    /// 连用户移除（隐藏）了的也列出来（带 `dismissed` 标记，页面上可以恢复）。
+    pub show_dismissed: bool,
+}
+
+impl Default for ClosedPage {
+    fn default() -> Self {
+        Self {
+            page: 1,
+            per_page: MAX_CLOSED_POSITIONS,
+            show_dismissed: false,
+        }
+    }
+}
+
+impl ClosedPage {
+    /// 请求参数：缺省用默认，页码至少 1，每页 1 ～ [`MAX_CLOSED_PER_PAGE`]。
+    pub fn from_query(page: Option<usize>, per_page: Option<usize>) -> Self {
+        let default = Self::default();
+        Self {
+            page: page.unwrap_or(default.page).max(1),
+            per_page: per_page
+                .unwrap_or(default.per_page)
+                .clamp(1, MAX_CLOSED_PER_PAGE),
+            show_dismissed: false,
+        }
+    }
+
+    /// 连已移除的也列出来。
+    pub fn with_dismissed(mut self, show: bool) -> Self {
+        self.show_dismissed = show;
+        self
+    }
+}
 /// 开仓计划允许的单腿名义上限。
 pub const MAX_PLAN_SIZE_USDT: u32 = 1_000_000;
 
@@ -654,6 +695,16 @@ pub struct PositionView {
     /// 实盘：开仓以来两条腿实际收付的资金费（交易所结算流水）。纸面不结算资金费，为 `None`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub funding: Option<crate::trade::PositionFunding>,
+    /// 已结束的仓位：从台账订单还原的双边明细（开仓、减仓、平仓的成交与手续费）。持仓中为 `None`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<arb_exec::breakdown::PositionBreakdown>,
+    /// 已结束的仓位：它的订单有没有任何成交。`false` = 什么都没发生（被拒、第一腿没吃到、准备阶段就没过），
+    /// 页面据此标「没成交」、允许一键清理；持仓中为 `None`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traded: Option<bool>,
+    /// 用户已经把它从「最近结束」里移除（只在「显示已隐藏」时才会列出）。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dismissed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -662,13 +713,42 @@ pub struct Positions {
     pub broken_lines: usize,
     /// 还有敞口的仓位，最新的在前。
     pub open: Vec<PositionView>,
-    /// 最近结束的仓位（已平仓 / 已回滚）。
+    /// 最近结束的仓位（已平仓 / 已回滚）里的这一页，最近结束的在前。
     pub closed: Vec<PositionView>,
+    /// 列表里一共有几笔结束的（不含被移除的，除非请求了「显示已隐藏」）。
+    pub closed_total: usize,
+    /// 被用户移除（隐藏）的有几笔；它们仍在台账里、仍计入所有统计。
+    pub dismissed_count: usize,
+    /// 列表里「没成交过」、可以一键清理的有几笔（不含已移除的）。
+    pub failed_count: usize,
+    /// `closed` 是第几页（从 1 起；请求超出末页时是末页）、每页几笔。
+    pub closed_page: usize,
+    pub closed_per_page: usize,
+    /// 全量台账的交易统计（笔数、净盈亏、成交额），不受分页与隐藏影响。
+    pub stats: crate::stats::TradeStats,
 }
 
 /// 台账里的持仓 + 按当前快照的监控评估。
 /// 每笔仓位两条腿在交易所的实际保证金状态（仓位 id → （多腿，空腿））。纸面或查不到时为空。
 pub type LegStates = HashMap<String, (Option<VenueLegState>, Option<VenueLegState>)>;
+
+/// 这些仓位里，扫描快照没有的腿所在的场所（要实时拉行情顶上，见 [`positions_page_full`]）。
+pub(crate) fn venues_missing_from_scan(
+    positions: &[&arb_exec::PairPosition],
+    report: &ScanReport,
+) -> std::collections::BTreeSet<Venue> {
+    positions
+        .iter()
+        .filter(|position| position.status.has_exposure())
+        .flat_map(|position| {
+            [position.long.as_ref(), position.short.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter(|leg| leg_snapshot(report, leg.venue, &position.symbol).is_none())
+                .map(|leg| leg.venue)
+        })
+        .collect()
+}
 
 /// 同名合约可能拆成多个身份簇；只取包含指定场所的快照。
 pub(crate) fn leg_snapshot<'a>(
@@ -683,16 +763,95 @@ pub(crate) fn leg_snapshot<'a>(
         .find_map(|view| leg(view, venue))
 }
 
+#[cfg(test)]
 pub fn positions(
     replayed: &Replayed,
     broken_lines: usize,
     ledger: &str,
     report: &ScanReport,
     states: &LegStates,
+    funding: Option<HashMap<String, crate::trade::PositionFunding>>,
+) -> Positions {
+    positions_page(
+        replayed,
+        broken_lines,
+        ledger,
+        report,
+        states,
+        funding,
+        ClosedPage::default(),
+    )
+}
+
+/// [`positions`]，「最近结束」取第 `page` 页（不带「已移除」清单；线上走 [`positions_page_with`]）。
+#[cfg(test)]
+pub fn positions_page(
+    replayed: &Replayed,
+    broken_lines: usize,
+    ledger: &str,
+    report: &ScanReport,
+    states: &LegStates,
+    funding: Option<HashMap<String, crate::trade::PositionFunding>>,
+    page: ClosedPage,
+) -> Positions {
+    positions_page_with(
+        replayed,
+        broken_lines,
+        ledger,
+        report,
+        states,
+        funding,
+        page,
+        &crate::dismissed::Dismissed::new(),
+    )
+}
+
+/// [`positions_page`]，并按用户的「已移除」清单（见 [`crate::dismissed`]）隐藏「最近结束」里的仓位。
+/// 移除只影响这个列表：台账、对账、当日盈亏、熔断都不看它。
+#[allow(clippy::too_many_arguments)]
+pub fn positions_page_with(
+    replayed: &Replayed,
+    broken_lines: usize,
+    ledger: &str,
+    report: &ScanReport,
+    states: &LegStates,
+    funding: Option<HashMap<String, crate::trade::PositionFunding>>,
+    page: ClosedPage,
+    dismissed: &crate::dismissed::Dismissed,
+) -> Positions {
+    positions_page_full(
+        replayed,
+        broken_lines,
+        ledger,
+        report,
+        &HashMap::new(),
+        states,
+        funding,
+        page,
+        dismissed,
+    )
+}
+
+/// [`positions_page_with`]；`fallback` 是扫描快照里**没有**的腿的实时行情（场所、合约 → 快照）。
+///
+/// 价差扫描只收「同一资产、参考价相差 5% 以内」的行，一条腿的价格偏离其它场所超过 5% 就被排除在快照外
+/// （某次实盘：HL xyz 43.5、CEX 45.8），持仓页对这笔就评估不了：标记价、浮动盈亏、强平距离、每日资金费
+/// 全空。持仓是真实在手的，不能因为扫描把它当成别的资产就没数据：扫描里找不到的腿用实时行情顶上。
+#[allow(clippy::too_many_arguments)]
+pub fn positions_page_full(
+    replayed: &Replayed,
+    broken_lines: usize,
+    ledger: &str,
+    report: &ScanReport,
+    fallback: &HashMap<(Venue, Symbol), MarketSnapshot>,
+    states: &LegStates,
     mut funding: Option<HashMap<String, crate::trade::PositionFunding>>,
+    page: ClosedPage,
+    dismissed: &crate::dismissed::Dismissed,
 ) -> Positions {
     let mut open = Vec::new();
     let mut closed = Vec::new();
+    let (mut dismissed_count, mut failed_count) = (0usize, 0usize);
     for position in replayed.positions.values() {
         if position.status.has_exposure() {
             // `None` 是纸面（不结算，按 0）；实盘映射里没查到的仍是未知。
@@ -713,10 +872,11 @@ pub fn positions(
                     .as_ref()
                     .zip(position.short.as_ref())
                     .map(|(long, short)| {
-                        (
-                            leg_snapshot(report, long.venue, &position.symbol),
-                            leg_snapshot(report, short.venue, &position.symbol),
-                        )
+                        let find = |venue: Venue| {
+                            leg_snapshot(report, venue, &position.symbol)
+                                .or_else(|| fallback.get(&(venue, position.symbol.clone())))
+                        };
+                        (find(long.venue), find(short.venue))
                     });
             let (evaluation, quotes_missing) = match quotes {
                 Some((Some(long), Some(short))) => {
@@ -746,13 +906,30 @@ pub fn positions(
                 evaluation,
                 quotes_missing,
                 funding: position_funding,
+                breakdown: None,
+                traded: None,
+                dismissed: false,
             });
         } else {
+            let hidden = dismissed.contains_key(&position.id);
+            if hidden {
+                dismissed_count += 1;
+                if !page.show_dismissed {
+                    continue;
+                }
+            }
+            let traded = crate::dismissed::traded(position, &replayed.orders);
+            if !traded && !hidden {
+                failed_count += 1;
+            }
             closed.push(PositionView {
                 position: position.clone(),
                 evaluation: None,
                 quotes_missing: false,
                 funding: None,
+                breakdown: None,
+                traded: Some(traded),
+                dismissed: hidden,
             });
         }
     }
@@ -761,12 +938,33 @@ pub fn positions(
         view.position.closed_at.unwrap_or(view.position.opened_at)
     };
     closed.sort_by_key(|view| std::cmp::Reverse(ended(view)));
-    closed.truncate(MAX_CLOSED_POSITIONS);
+    let closed_total = closed.len();
+    let last_page = closed_total.div_ceil(page.per_page).max(1);
+    let closed_page = page.page.min(last_page);
+    let mut closed: Vec<PositionView> = closed
+        .into_iter()
+        .skip((closed_page - 1) * page.per_page)
+        .take(page.per_page)
+        .collect();
+    // 只给要展示的那一页还原明细：台账里结束的仓位只会越来越多。
+    for view in &mut closed {
+        view.breakdown = arb_exec::breakdown::position_breakdown(&view.position, &replayed.orders);
+    }
     Positions {
         ledger: ledger.to_string(),
         broken_lines,
         open,
         closed,
+        closed_total,
+        dismissed_count,
+        failed_count,
+        closed_page,
+        closed_per_page: page.per_page,
+        stats: crate::stats::trade_stats_excluding(
+            replayed,
+            Utc::now(),
+            &crate::stats::load_excluded(ledger),
+        ),
     }
 }
 
@@ -822,6 +1020,7 @@ mod tests {
                     rates: 1,
                     error: None,
                     elapsed_ms: 1,
+                    reused_age_ms: None,
                 })
                 .collect(),
             symbols: views
@@ -1124,6 +1323,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned: None,
         };
         let mut replayed = Replayed::default();
         replayed
@@ -1135,6 +1335,20 @@ mod tests {
         let mut orphan = position("c", PositionStatus::Open);
         orphan.symbol = Symbol::perp("SOL", "USDT");
         replayed.positions.insert("c".into(), orphan);
+        // 已结束那笔的平仓单：持仓页据此还原双边明细。
+        replayed.orders.insert(
+            "b-sell-exit1".into(),
+            serde_json::from_value(serde_json::json!({
+                "order": {
+                    "client_order_id": "b-sell-exit1", "venue": "hyperliquid", "symbol": "ETH/USDT",
+                    "side": "sell", "notional_usdt": "1000", "quantity": "10", "limit_price": null,
+                    "reduce_only": true, "margin_mode": "isolated", "leverage": null
+                },
+                "venue_order_id": "1", "status": "filled", "filled_usdt": "1010",
+                "average_price": "101", "fee_usdt": "0.5", "reject_reason": null
+            }))
+            .unwrap(),
+        );
 
         let view = positions(
             &replayed,
@@ -1153,5 +1367,306 @@ mod tests {
         let json = serde_json::to_value(eth).unwrap();
         assert_eq!(json["id"], "a", "仓位字段平铺在外层");
         assert!(json["evaluation"]["observation"]["funding_apr"].is_string());
+        assert!(json.get("breakdown").is_none(), "持仓中的仓位不带明细");
+        let closed = serde_json::to_value(&view.closed[0]).unwrap();
+        let exits = &closed["breakdown"]["long"]["exits"];
+        assert_eq!(exits.as_array().unwrap().len(), 1);
+        assert_eq!(
+            exits[0]["role"],
+            serde_json::json!({"kind": "exit", "n": 1})
+        );
+        assert_eq!(closed["breakdown"]["long"]["venue"], "hyperliquid");
+    }
+
+    /// 某次实盘：扫描快照因价格偏离 >5% 把一条腿排除在外时，持仓页用实时行情顶上，
+    /// 不再整笔评估不了（标记价、浮动盈亏、强平距离、每日资金费全空）。没有顶上的行情才如实说缺行情。
+    #[test]
+    fn a_leg_the_scan_dropped_is_evaluated_from_live_quotes_instead_of_going_blank() {
+        let report = two_symbols();
+        let leg = |venue, side| LegFill {
+            venue,
+            side,
+            notional_usdt: dec!(1000),
+            average_price: dec!(100),
+            fee_usdt: Decimal::ZERO,
+            client_order_id: ClientOrderId::for_leg("g", side, 0),
+            margin_usdt: Some(dec!(200)),
+        };
+        let mut replayed = Replayed::default();
+        replayed.positions.insert(
+            "g".into(),
+            PairPosition {
+                margin_mode: arb_exec::MarginMode::Isolated,
+                id: "g".into(),
+                symbol: Symbol::perp("SOL", "USDT"),
+                strategy: Strategy::Spread,
+                long: Some(leg(Venue::Hyperliquid, Side::Buy)),
+                short: Some(leg(Venue::Lighter, Side::Sell)),
+                entry_basis_pct: Decimal::ZERO,
+                expected_round_trip_cost: Decimal::ZERO,
+                status: PositionStatus::Open,
+                opened_at: Utc::now(),
+                closed_at: None,
+                note: None,
+                leverage: Some(dec!(5)),
+                rules: TaskRules::default(),
+                trims: 0,
+                exits: 0,
+                margin_added_usdt: Decimal::ZERO,
+                realized_pnl_usdt: Decimal::ZERO,
+                realized_fee_usdt: Decimal::ZERO,
+                realized_source: None,
+                realized_funding_usdt: None,
+                funding_checked_at: None,
+                closed_externally: false,
+                entry_legs: None,
+                pnl_unattributed: None,
+                open_report: None,
+                planned: None,
+            },
+        );
+        let exposed = replayed.exposed();
+        // 扫描里没有 SOL：两条腿所在的场所都要实时拉。
+        let missing = venues_missing_from_scan(&exposed, &report);
+        assert_eq!(
+            missing.into_iter().collect::<Vec<_>>(),
+            vec![Venue::Hyperliquid, Venue::Lighter]
+        );
+        let page = |fallback: &HashMap<(Venue, Symbol), MarketSnapshot>| {
+            positions_page_full(
+                &replayed,
+                0,
+                "ledger.jsonl",
+                &report,
+                fallback,
+                &LegStates::new(),
+                None,
+                ClosedPage::default(),
+                &crate::dismissed::Dismissed::new(),
+            )
+        };
+        let blank = page(&HashMap::new());
+        assert!(blank.open[0].quotes_missing && blank.open[0].evaluation.is_none());
+
+        let live: HashMap<(Venue, Symbol), MarketSnapshot> = [Venue::Hyperliquid, Venue::Lighter]
+            .into_iter()
+            .map(|venue| {
+                (
+                    (venue, Symbol::perp("SOL", "USDT")),
+                    snapshot(venue, "SOL", dec!(0.0001), Some(dec!(0.02))),
+                )
+            })
+            .collect();
+        let filled = page(&live);
+        assert!(!filled.open[0].quotes_missing);
+        let observation = &filled.open[0].evaluation.as_ref().unwrap().observation;
+        assert!(observation.pnl.funding_daily_usdt.is_some());
+        // 只补缺的：快照里有的腿（ETH）不需要实时拉。
+        let mut with_eth = replayed.clone();
+        let mut eth = with_eth.positions["g"].clone();
+        eth.id = "e".into();
+        eth.symbol = Symbol::perp("ETH", "USDT");
+        with_eth.positions.insert("e".into(), eth);
+        let exposed = with_eth.exposed();
+        let missing = venues_missing_from_scan(&exposed, &report);
+        assert!(missing.contains(&Venue::Hyperliquid) && missing.contains(&Venue::Lighter));
+        let only_eth: Vec<_> = exposed
+            .iter()
+            .filter(|position| position.symbol == Symbol::perp("ETH", "USDT"))
+            .copied()
+            .collect();
+        assert!(venues_missing_from_scan(&only_eth, &report).is_empty());
+    }
+
+    /// 「最近结束」的移除：默认不列出被移除的，页码与总数只数列出来的；带 `show_dismissed` 才列出并标记；
+    /// 没成交的标 `traded: false` 并计入可一键清理的数；持仓中的永远不受影响，也不带这两个字段。
+    #[test]
+    fn dismissed_positions_leave_the_closed_list_but_are_counted_and_can_be_shown_again() {
+        use crate::dismissed::{Dismissed, Entry};
+        let report = two_symbols();
+        let mut replayed = Replayed::default();
+        let start = Utc::now();
+        let make = |id: &str, status: &str, minutes: i64| -> PairPosition {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "symbol": "ETH/USDT", "strategy": "spread", "long": null, "short": null,
+                "entry_basis_pct": "0", "expected_round_trip_cost": "0", "status": status,
+                "opened_at": start, "closed_at": start + chrono::Duration::minutes(minutes),
+                "note": null, "leverage": "3", "rules": {}, "trims": 0, "exits": 0
+            }))
+            .unwrap()
+        };
+        // fail1/fail2：没成交；real：开仓成交过；still：持仓中。
+        for (id, status, minutes) in [
+            ("fail1", "unwound", 1),
+            ("fail2", "unwound", 2),
+            ("real", "closed", 3),
+            ("still", "open", 4),
+        ] {
+            replayed
+                .positions
+                .insert(id.into(), make(id, status, minutes));
+        }
+        replayed.orders.insert(
+            "real-buy-0".into(),
+            serde_json::from_value(serde_json::json!({
+                "order": {
+                    "client_order_id": "real-buy-0", "venue": "hyperliquid", "symbol": "ETH/USDT",
+                    "side": "buy", "notional_usdt": "1000", "quantity": "10", "limit_price": null,
+                    "reduce_only": false, "margin_mode": "isolated", "leverage": null
+                },
+                "venue_order_id": "1", "status": "filled", "filled_usdt": "1000",
+                "average_price": "100", "fee_usdt": "0.5", "reject_reason": null
+            }))
+            .unwrap(),
+        );
+        let page = |show: bool, dismissed: &Dismissed| {
+            positions_page_with(
+                &replayed,
+                0,
+                "ledger.jsonl",
+                &report,
+                &LegStates::new(),
+                None,
+                ClosedPage::default().with_dismissed(show),
+                dismissed,
+            )
+        };
+        let none = Dismissed::new();
+        let before = page(false, &none);
+        assert_eq!(before.closed_total, 3);
+        assert_eq!((before.dismissed_count, before.failed_count), (0, 2));
+        let traded: Vec<(&str, Option<bool>)> = before
+            .closed
+            .iter()
+            .map(|view| (view.position.id.as_str(), view.traded))
+            .collect();
+        assert_eq!(
+            traded,
+            vec![
+                ("real", Some(true)),
+                ("fail2", Some(false)),
+                ("fail1", Some(false))
+            ],
+            "最近结束的在前，每笔标了有没有成交"
+        );
+        assert_eq!(before.open[0].traded, None, "持仓中的不带");
+
+        let mut hidden = Dismissed::new();
+        hidden.insert(
+            "fail1".into(),
+            Entry {
+                at: Utc::now(),
+                symbol: "ETH/USDT".into(),
+                status: "unwound".into(),
+                traded: false,
+            },
+        );
+        let after = page(false, &hidden);
+        assert_eq!(after.closed_total, 2, "被移除的不再算在列表里");
+        assert_eq!((after.dismissed_count, after.failed_count), (1, 1));
+        assert!(after.closed.iter().all(|view| view.position.id != "fail1"));
+        assert_eq!(after.open.len(), 1, "持仓中的不受影响");
+
+        let shown = page(true, &hidden);
+        assert_eq!(shown.closed_total, 3);
+        let flagged: Vec<(&str, bool)> = shown
+            .closed
+            .iter()
+            .map(|view| (view.position.id.as_str(), view.dismissed))
+            .collect();
+        assert_eq!(
+            flagged,
+            vec![("real", false), ("fail2", false), ("fail1", true)]
+        );
+        // 已移除的不再算作「可一键清理」。
+        assert_eq!(shown.failed_count, 1);
+        // 没有移除过的字段不进 JSON（旧页面不受影响）。
+        let json = serde_json::to_value(&shown.closed[0]).unwrap();
+        assert!(json.get("dismissed").is_none());
+        assert_eq!(json["traded"], true);
+        assert_eq!(
+            serde_json::to_value(&shown.closed[2]).unwrap()["dismissed"],
+            true
+        );
+    }
+
+    #[test]
+    fn closed_positions_are_paged_newest_first_and_a_page_past_the_end_shows_the_last() {
+        let report = two_symbols();
+        let mut replayed = Replayed::default();
+        let start = Utc::now();
+        for n in 0..23i64 {
+            let id = format!("p{n:02}");
+            let position: PairPosition = serde_json::from_value(serde_json::json!({
+                "id": id, "symbol": "ETH/USDT", "strategy": "spread", "long": null, "short": null,
+                "entry_basis_pct": "0", "expected_round_trip_cost": "0", "status": "closed",
+                "opened_at": start, "closed_at": start + chrono::Duration::minutes(n),
+                "note": null, "leverage": "3", "rules": {}, "trims": 0, "exits": 0
+            }))
+            .unwrap();
+            replayed.positions.insert(id, position);
+        }
+        let page = |page, per_page| {
+            positions_page(
+                &replayed,
+                0,
+                "ledger.jsonl",
+                &report,
+                &LegStates::new(),
+                None,
+                ClosedPage::from_query(page, per_page),
+            )
+        };
+        let ids = |view: &Positions| {
+            view.closed
+                .iter()
+                .map(|row| row.position.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let first = page(None, Some(10));
+        assert_eq!(
+            (first.closed_total, first.closed_page, first.closed_per_page),
+            (23, 1, 10)
+        );
+        assert_eq!(
+            ids(&first).first().map(String::as_str),
+            Some("p22"),
+            "最近结束的在前"
+        );
+        assert_eq!(ids(&first).len(), 10);
+        let third = page(Some(3), Some(10));
+        assert_eq!(ids(&third), ["p02", "p01", "p00"]);
+        let past = page(Some(9), Some(10));
+        assert_eq!(past.closed_page, 3, "超出末页按末页给");
+        assert_eq!(ids(&past), ids(&third));
+
+        let default = page(None, None);
+        assert_eq!(
+            default.closed.len(),
+            MAX_CLOSED_POSITIONS,
+            "不带参数和以前一样给 20 笔"
+        );
+        assert_eq!(
+            page(Some(0), Some(0)).closed_per_page,
+            1,
+            "页码、每页至少 1"
+        );
+        assert_eq!(
+            page(None, Some(10_000)).closed_per_page,
+            MAX_CLOSED_PER_PAGE
+        );
+
+        let empty = positions_page(
+            &Replayed::default(),
+            0,
+            "ledger.jsonl",
+            &report,
+            &LegStates::new(),
+            None,
+            ClosedPage::from_query(Some(4), Some(10)),
+        );
+        assert_eq!((empty.closed_total, empty.closed_page), (0, 1));
+        assert!(empty.closed.is_empty());
     }
 }

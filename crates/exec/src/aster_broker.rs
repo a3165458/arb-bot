@@ -698,6 +698,7 @@ impl AsterBroker {
                 entry.order
             }
             None => NewOrder {
+                post_only: false,
                 margin_mode: crate::MarginMode::Isolated,
                 client_order_id: client_order_id.clone(),
                 venue: Venue::Aster,
@@ -796,6 +797,7 @@ impl Broker for AsterBroker {
     }
 
     async fn place(&self, order: &NewOrder) -> ArbResult<OrderAck> {
+        crate::broker::refuse_post_only(order)?;
         self.authorize()?;
         let _submission = self.submit.lock().await;
         if order.venue != Venue::Aster || order.client_order_id.0.is_empty() {
@@ -1563,6 +1565,7 @@ mod tests {
     #[test]
     fn order_units_use_base_quantity_for_aster() {
         let order = NewOrder {
+            post_only: false,
             margin_mode: crate::MarginMode::Isolated,
             client_order_id: ClientOrderId("p1-buy-0".into()),
             venue: Venue::Aster,

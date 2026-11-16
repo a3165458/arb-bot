@@ -104,6 +104,9 @@ pub struct Opportunity {
 
     /// 一次往返的手续费率：两腿各自的开平共 4 笔。
     pub round_trip_fee: Decimal,
+    /// 两腿各自的单边吃单费率（小数）：执行时据此决定先下哪条腿、回滚一条腿要付多少。
+    pub long_fee: Decimal,
+    pub short_fee: Decimal,
     /// 一次往返的穿价成本（两腿相对买卖价差之和）。`None` = 至少一腿拿不到盘口。
     pub round_trip_spread: Option<Decimal>,
     /// 实际用于计算的一次性成本 = 手续费 + 穿价（拿不到盘口时只算手续费）。
@@ -185,69 +188,9 @@ pub fn rank(rates: &[&MarketSnapshot], config: &RankConfig) -> Vec<Opportunity> 
             if short.venue == long.venue {
                 continue;
             }
-            let short_daily = to_daily(short.period_rate, short.interval_h);
-            let long_daily = to_daily(long.period_rate, long.interval_h);
-            let daily_spread = short_daily - long_daily;
-
-            let basis_pct = entry_basis_pct(short, long);
-            let executable_pct = executable_basis_pct(short, long);
-            // 两条策略关心的方向不同：资金费看费差，价差看能不能成交的价差。
-            // 标记价差为正但买一卖一为负时，价差方向不成立。
-            let funding_side = daily_spread > Decimal::ZERO;
-            let spread_side = executable_pct.is_some_and(|basis| basis > Decimal::ZERO);
-            if !funding_side && !spread_side {
-                continue;
+            if let Some(op) = pair_opportunity(long, short, config, funding_days, true) {
+                out.push(op);
             }
-
-            let round_trip_fee = (venue_fee(short, config.fee_per_side)
-                + venue_fee(long, config.fee_per_side))
-                * Decimal::TWO;
-            // 穿价：一次往返四条腿的净额是 −(spread_short + spread_long)。
-            let round_trip_spread = crossing_cost(short, long);
-            let round_trip_cost = round_trip_fee + round_trip_spread.unwrap_or(Decimal::ZERO);
-            let spread_unknown = round_trip_spread.is_none();
-
-            // 资金费视角：基差保持不变 → 基差项为 0。
-            let funding_daily = daily_spread - round_trip_cost / funding_days;
-
-            // 价差视角：可成交价差收敛到 0。开仓穿价已经在买一/卖一里，
-            // 这里只再扣平仓那一次穿价和全程手续费。持有期内的资金费不算进来。
-            let (spread_days, hold_measured) =
-                config.hold_days_for(&short.symbol, long.venue, short.venue);
-            // 一次性净额。持有天数只说明资本要绑多久，不能拿去把这一笔乘成一年。
-            let spread_net = match executable_pct {
-                Some(pct) if !spread_unknown => {
-                    let basis = pct / Decimal::from(100u32);
-                    let exit_cross = round_trip_spread.unwrap_or(Decimal::ZERO) / Decimal::TWO;
-                    basis - exit_cross - round_trip_fee
-                }
-                _ => Decimal::ZERO,
-            };
-
-            out.push(Opportunity {
-                symbol: short.symbol.clone(),
-                long: long.venue,
-                short: short.venue,
-                long_interval_h: long.interval_h,
-                short_interval_h: short.interval_h,
-                long_daily,
-                short_daily,
-                daily_spread,
-                apr: to_apr(daily_spread),
-                round_trip_fee,
-                round_trip_spread,
-                round_trip_cost,
-                spread_unknown,
-                funding_daily,
-                funding_apr: to_apr(funding_daily),
-                spread_net,
-                spread_hold_days: spread_days,
-                hold_measured,
-                entry_basis_pct: basis_pct,
-                executable_basis_pct: executable_pct,
-                quote_mismatch: short.symbol.quote != long.symbol.quote,
-                oi_capped: short.oi_capped || long.oi_capped,
-            });
         }
     }
 
@@ -260,6 +203,102 @@ pub fn rank(rates: &[&MarketSnapshot], config: &RankConfig) -> Vec<Opportunity> 
             .then_with(|| a.short.cmp(&b.short))
     });
     out
+}
+
+/// 一对（多 `long`、空 `short`）的两条策略数字。`filter` 为真时，费差与可成交价差都不为正的配对返回
+/// `None`（[`rank`] 的口径）。
+fn pair_opportunity(
+    long: &MarketSnapshot,
+    short: &MarketSnapshot,
+    config: &RankConfig,
+    funding_days: Decimal,
+    filter: bool,
+) -> Option<Opportunity> {
+    let short_daily = to_daily(short.period_rate, short.interval_h);
+    let long_daily = to_daily(long.period_rate, long.interval_h);
+    let daily_spread = short_daily - long_daily;
+
+    let basis_pct = entry_basis_pct(short, long);
+    let executable_pct = executable_basis_pct(short, long);
+    // 两条策略关心的方向不同：资金费看费差，价差看能不能成交的价差。
+    // 标记价差为正但买一卖一为负时，价差方向不成立。
+    let funding_side = daily_spread > Decimal::ZERO;
+    let spread_side = executable_pct.is_some_and(|basis| basis > Decimal::ZERO);
+    if filter && !funding_side && !spread_side {
+        return None;
+    }
+
+    let (short_fee, long_fee) = (
+        venue_fee(short, config.fee_per_side),
+        venue_fee(long, config.fee_per_side),
+    );
+    let round_trip_fee = (short_fee + long_fee) * Decimal::TWO;
+    // 穿价：一次往返四条腿的净额是 −(spread_short + spread_long)。
+    let round_trip_spread = crossing_cost(short, long);
+    let round_trip_cost = round_trip_fee + round_trip_spread.unwrap_or(Decimal::ZERO);
+    let spread_unknown = round_trip_spread.is_none();
+
+    // 资金费视角：基差保持不变 → 基差项为 0。
+    let funding_daily = daily_spread - round_trip_cost / funding_days;
+
+    // 价差视角：可成交价差收敛到 0。开仓穿价已经在买一/卖一里，
+    // 这里只再扣平仓那一次穿价和全程手续费。持有期内的资金费不算进来。
+    let (spread_days, hold_measured) = config.hold_days_for(&short.symbol, long.venue, short.venue);
+    // 一次性净额。持有天数只说明资本要绑多久，不能拿去把这一笔乘成一年。
+    let spread_net = match executable_pct {
+        Some(pct) if !spread_unknown => {
+            let basis = pct / Decimal::from(100u32);
+            let exit_cross = round_trip_spread.unwrap_or(Decimal::ZERO) / Decimal::TWO;
+            basis - exit_cross - round_trip_fee
+        }
+        _ => Decimal::ZERO,
+    };
+
+    Some(Opportunity {
+        symbol: short.symbol.clone(),
+        long: long.venue,
+        short: short.venue,
+        long_interval_h: long.interval_h,
+        short_interval_h: short.interval_h,
+        long_daily,
+        short_daily,
+        daily_spread,
+        apr: to_apr(daily_spread),
+        round_trip_fee,
+        long_fee,
+        short_fee,
+        round_trip_spread,
+        round_trip_cost,
+        spread_unknown,
+        funding_daily,
+        funding_apr: to_apr(funding_daily),
+        spread_net,
+        spread_hold_days: spread_days,
+        hold_measured,
+        entry_basis_pct: basis_pct,
+        executable_basis_pct: executable_pct,
+        quote_mismatch: short.symbol.quote != long.symbol.quote,
+        oi_capped: short.oi_capped || long.oi_capped,
+    })
+}
+
+/// 指定方向（多 `long`、空 `short`）的这一对，**不**按「价差 / 费差为正」过滤。给「相对正常基差」的
+/// 价差单用：它们的可成交价差可以为负，赚的是回到正常水平的那一段。数字口径与 [`rank`] 完全相同。
+pub fn pair_unfiltered(
+    long: &MarketSnapshot,
+    short: &MarketSnapshot,
+    config: &RankConfig,
+) -> Option<Opportunity> {
+    if long.venue == short.venue {
+        return None;
+    }
+    pair_opportunity(
+        long,
+        short,
+        config,
+        positive_or_one(config.amortize_days),
+        false,
+    )
 }
 
 /// 入场基差门槛：`Ok(())` = 可以进场，`Err(原因)` = 被挡下。
@@ -433,6 +472,40 @@ mod tests {
         let op = find(&ops, Venue::Lighter, Venue::Binance);
         // 只有 Binance 那条腿付钱：(0.0005 + 0) × 2
         assert_eq!(op.round_trip_fee, dec!(0.001));
+    }
+
+    #[test]
+    fn each_leg_carries_its_own_taker_fee_for_the_executor() {
+        // 线上快照的样子：Arcus 0.0225%（基础档）、Lighter RH 0；不知道的按默认费率。
+        let arcus = rate(Venue::Arcus, dec!(0.0001), 1, Some(dec!(0.000225)));
+        let lighter = rate(Venue::LighterRh, dec!(0.0002), 1, Some(dec!(0.0000)));
+        let ops = rank(&[&arcus, &lighter], &config(dec!(0.0005), dec!(7)));
+        for op in &ops {
+            let fee = |venue| {
+                if venue == Venue::Arcus {
+                    dec!(0.000225)
+                } else {
+                    Decimal::ZERO
+                }
+            };
+            assert_eq!((op.long_fee, op.short_fee), (fee(op.long), fee(op.short)));
+            assert_eq!(
+                op.round_trip_fee,
+                (op.long_fee + op.short_fee) * Decimal::TWO
+            );
+        }
+        let unknown = rate(Venue::Binance, dec!(0.0002), 8, None);
+        let ops = rank(&[&unknown, &lighter], &config(dec!(0.0007), dec!(7)));
+        let op = ops
+            .iter()
+            .find(|op| op.long == Venue::Binance || op.short == Venue::Binance)
+            .unwrap();
+        let binance_fee = if op.long == Venue::Binance {
+            op.long_fee
+        } else {
+            op.short_fee
+        };
+        assert_eq!(binance_fee, dec!(0.0007));
     }
 
     #[test]
