@@ -848,6 +848,7 @@ impl GateBroker {
             filled_usdt: quote,
             average_price: (base > Decimal::ZERO).then(|| quote / base),
             fee_usdt: fee,
+            fee_estimated: false,
             reject_reason: None,
         })
     }
@@ -986,6 +987,7 @@ impl Broker for GateBroker {
     }
 
     async fn place(&self, order: &NewOrder) -> ArbResult<OrderAck> {
+        crate::broker::refuse_post_only(order)?;
         self.options.authorize(VENUE)?;
         if order.venue != VENUE {
             return Err(err("本券商只接受 Gate 订单"));
@@ -1336,6 +1338,7 @@ fn synthetic_order(wire: &WireOrder, spec: &ContractSpec) -> ArbResult<NewOrder>
         })
         .unwrap_or(spec.mark_price);
     Ok(NewOrder {
+        post_only: false,
         margin_mode: crate::MarginMode::Isolated,
         client_order_id: ClientOrderId(format!("gate-external-{id}")),
         venue: VENUE,

@@ -17,7 +17,7 @@ arb-venues = { path = "crates/venues" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "fs", "io-util", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 async-trait = "0.1"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 thiserror = "2"

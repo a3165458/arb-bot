@@ -1,6 +1,7 @@
 //! Production Hyperliquid **perpetual dex** broker for the first perp dex and the HIP-3
 //! builder-deployed dexes `xyz` (`hyperliquid-xyz`) and `io` (`hyperliquid-io`); no spot
-//! or vault routing. Each dex is a distinct venue with its own clearinghouse and margin,
+//! or vault routing. Each dex is a distinct venue with its own clearinghouse and margin
+//! (in standard mode; unified/portfolio accounts keep one spot balance, see `free_collateral`),
 //! so one instance trades exactly one dex.
 //!
 //! Construction is explicit:
@@ -76,6 +77,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::Mutex as SyncMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -92,8 +94,12 @@ use sha3::{Digest, Keccak256};
 use tokio::sync::Mutex;
 
 use crate::broker::{Broker, FundingTotal, MarginOutcome, VenueLegState, VenuePosition};
+use crate::live_common::{Cached, Verified};
 use crate::types::{ClientOrderId, NewOrder, OrderAck, OrderState, OrderStatus};
 
+/// 吃单限价读实时顶档（`arb_venues::live_book`）时，行情连接的心跳最多可以多旧。心跳每 2 秒一次，
+/// 6 秒收不到任何消息监控就判死重连；超过这个值就当连接已经不可信，退回 REST。
+const BBO_MAX_AGE: Duration = Duration::from_secs(6);
 const INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const EXCHANGE_URL: &str = "https://api.hyperliquid.xyz/exchange";
 // Shared across broker instances in this process, never reused within a millisecond.
@@ -103,6 +109,35 @@ const MARGIN_READBACK_POLLS: usize = 6;
 const MARGIN_READBACK_INTERVAL: Duration = Duration::from_millis(500);
 /// 回读到的逐仓账本增量 ≥ 所补金额 × 这个比例才算生效（留 1% 给资金费结算之类的小额扰动）。
 const MARGIN_CONFIRM_RATIO: Decimal = Decimal::from_parts(99, 0, 0, false, 2);
+/// 下单被交易所受理后查订单状态：读节点会落后几秒，刚成交的 IOC 单这时 `orderStatus` 可能还回
+/// `unknownOid`。最多查这么多次，两次之间间隔 [`ORDER_READBACK_INTERVAL`]（约 5 秒）。
+const ORDER_READBACK_POLLS: usize = 10;
+#[cfg(not(test))]
+const ORDER_READBACK_INTERVAL: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const ORDER_READBACK_INTERVAL: Duration = Duration::from_millis(2);
+/// 第一腿待核实状态的读回：逐笔成交还没追上订单状态时，最多读这么多轮（每轮之间隔一个读回间隔）。
+const SETTLE_ATTEMPTS: usize = 4;
+/// 市场列表（`meta`）在这段时间内复用：开仓前的预热拉一次，紧接着的准备、下单不再各拉一次。
+/// 和 Arcus 的市场缓存同一个时长；下单被拒时清掉，下一次重新拉。
+const META_TTL: Duration = Duration::from_secs(20);
+/// 杠杆 / 保证金模式核对过（读回一致）后，这段时间内下单不再查 `activeAssetData`。
+const LEVERAGE_VERIFIED_TTL: Duration = Duration::from_secs(20);
+/// 账户的余额模式（`userAbstraction`：标准 / 统一 / 组合保证金）缓存多久。只是决定去哪里读可用保证金，
+/// 改模式是人工的低频操作；改了之后最多这么久按旧模式读（读错只会让开仓前的保证金预检拦错或放过，
+/// 真正下单仍由交易所按实际余额判定）。
+const ACCOUNT_MODE_TTL: Duration = Duration::from_secs(300);
+/// 下单（或核实）时已经从交易所完整读回、核对过的终态，这段时间内 `order_state` 直接给它：执行器下完单
+/// 紧接着还要 `order_state` 一次，IOC 的终态不会再变，再读一遍订单状态和逐笔成交只是多两次往返（约 0.6 秒，
+/// 第二腿和回滚都在等它）。只放内存（重启后照常去读）；待核实状态（[`Broker::place_for_hedge`]）从不放进来。
+const TERMINAL_TTL: Duration = Duration::from_secs(600);
+/// 只减仓单的本地持仓检查没过时，隔这么久再读（读节点滞后），一共再读这几次。
+const REDUCE_REREADS: [Duration; 4] = [
+    Duration::from_millis(300),
+    Duration::from_millis(500),
+    Duration::from_millis(800),
+    Duration::from_millis(1200),
+];
 
 /// Which HyperCore perpetual dex a [`HyperliquidBroker`] instance trades.
 ///
@@ -175,6 +210,12 @@ impl HyperliquidDex {
     }
 }
 
+/// [`HyperliquidBroker::submit_order`] 的结果：一次到位的确认，或 IOC 回包里的待核实状态。
+enum Submitted {
+    Ack(OrderAck),
+    Provisional(Box<OrderState>),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HyperliquidOptions {
     pub trading_enabled: bool,
@@ -193,6 +234,22 @@ pub struct HyperliquidBroker {
     taker_fee: Decimal,
     journal: SyncMutex<Journal>,
     submit: Mutex<()>,
+    /// `/info`、`/exchange` 的地址（生产就是 [`INFO_URL`] / [`EXCHANGE_URL`]；测试指向本地假服务器）。
+    info_url: String,
+    exchange_url: String,
+    /// 最近一次拉到的 `meta`，见 [`META_TTL`]。
+    meta: Cached<Arc<Meta>>,
+    /// 核对过的（币, 杠杆, 保证金模式），见 [`LEVERAGE_VERIFIED_TTL`]。
+    verified_leverage: Verified<(String, u32, crate::MarginMode)>,
+    /// `userAbstraction` 的应答，见 [`ACCOUNT_MODE_TTL`]。
+    account_mode: Cached<Value>,
+    /// 读回核对过的终态（cloid → 时刻, 状态），见 [`TERMINAL_TTL`]。
+    terminal: SyncMutex<HashMap<String, (std::time::Instant, OrderState)>>,
+    /// 下单回包给出的结局（cloid → 时刻, 状态），读节点还查不到这张单时兜底，见 [`Self::remember_reply`]。
+    replied: SyncMutex<HashMap<String, (std::time::Instant, OrderState)>>,
+    /// 每个合约最近一次读回的成交里实际收的费率（手续费 ÷ 成交额）。按回包估手续费时优先用它：HIP-3 各市场
+    /// 费率不同（2026-10-31 核对：xyz 多数 0.0086%，STRC 0.0864%），配置的吃单费率 0.09% 会把多数单估高十倍。
+    fee_rates: SyncMutex<HashMap<Symbol, Decimal>>,
 }
 
 // Deliberately no Debug/Serialize for the broker or signer-bearing construction inputs.
@@ -232,6 +289,44 @@ struct Asset {
 #[derive(Deserialize)]
 struct Meta {
     universe: Vec<Asset>,
+    /// 这个 dex 的保证金币（现货 token 编号，2026-10-11 三个 dex 都是整数 0）。统一账户按它在现货余额里
+    /// 找可用额。按原始值存、用时再取整数：类型变了只影响这一处，不连累整份 `meta` 解析失败。
+    #[serde(default, rename = "collateralToken")]
+    collateral_token: Option<Value>,
+}
+
+/// 帐户余额模式（`userAbstraction`）。统一账户 / 组合保证金下，全部余额与占用都在现货状态里，
+/// 各 perp dex 的 `clearinghouseState` 没有意义（官方文档 Account abstraction modes）。
+fn balances_live_in_spot(mode: &Value) -> bool {
+    matches!(mode.as_str(), Some("unifiedAccount" | "portfolioMargin"))
+}
+
+/// 统一账户里这个 dex 的保证金币还能用多少：`tokenToAvailableAfterMaintenance` 与 `total − hold`
+/// 取小（前者只扣维持保证金，可能偏乐观）。两个都没有就是不知道，不当 0。
+fn unified_free(spot: &Value, token: u64) -> Option<Decimal> {
+    let parse = |v: &Value| v.as_str().and_then(|raw| Decimal::from_str(raw).ok());
+    let available = spot
+        .get("tokenToAvailableAfterMaintenance")
+        .and_then(Value::as_array)
+        .and_then(|rows| {
+            rows.iter().find_map(|row| {
+                let pair = row.as_array()?;
+                (pair.first()?.as_u64()? == token).then(|| parse(pair.get(1)?))?
+            })
+        });
+    let unlocked = spot
+        .get("balances")
+        .and_then(Value::as_array)
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("token").and_then(Value::as_u64) == Some(token))
+        })
+        .and_then(|row| Some(parse(row.get("total")?)? - parse(row.get("hold")?)?));
+    let free = match (available, unlocked) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    free.map(|value| value.max(Decimal::ZERO))
 }
 
 fn market_supports_mode(dex: HyperliquidDex, asset: &Asset, mode: crate::MarginMode) -> bool {
@@ -367,6 +462,77 @@ struct RemoteFill {
 }
 
 impl HyperliquidBroker {
+    /// [`Broker::funding_since`]，「现在」由调用方给（测试用固定时刻，见 [`SharedFunding::usable_at`]）。
+    async fn funding_since_at(
+        &self,
+        symbol: &Symbol,
+        since: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> ArbResult<Option<FundingTotal>> {
+        let since_ms = since.timestamp_millis();
+        let key = (self.info_url.clone(), self.account.clone());
+        let shared = shared_funding()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .and_then(|cached| {
+                (cached.usable_at(now) && cached.start <= since_ms).then(|| {
+                    cached
+                        .rows
+                        .iter()
+                        .filter(|row| row.time >= since_ms)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+            });
+        if let Some(raw) = shared {
+            return Ok(Some(FundingTotal::from_rows(
+                funding_rows(self.dex, symbol, raw)?,
+                since,
+            )));
+        }
+        let mut raw = Vec::new();
+        let mut start = since_ms;
+        for _ in 0..FUNDING_PAGES {
+            let page: Vec<UserFunding> = post(
+                &self.client,
+                &self.info_url,
+                &json!({"type":"userFunding", "user":self.account, "startTime":start}),
+            )
+            .await?;
+            let full = page.len() >= FUNDING_PAGE;
+            let last = page.iter().map(|row| row.time).max();
+            raw.extend(page);
+            match last {
+                Some(last) if full => start = last + 1,
+                _ => {
+                    let rows = funding_rows(self.dex, symbol, raw.clone())?;
+                    let mut shared = shared_funding()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    // 已有的更新鲜、起点又更早的就留着它（它盖得住这次的）。
+                    if shared
+                        .get(&key)
+                        .is_none_or(|cached| !cached.usable_at(now) || since_ms <= cached.start)
+                    {
+                        shared.insert(
+                            key,
+                            SharedFunding {
+                                fetched: now,
+                                start: since_ms,
+                                rows: raw,
+                            },
+                        );
+                    }
+                    return Ok(Some(FundingTotal::from_rows(rows, since)));
+                }
+            }
+        }
+        Err(error(
+            "funding history exceeds the page limit; total would be incomplete",
+        ))
+    }
+
     /// Reads metadata/actual fee schedule; never sends an exchange action at construction.
     /// The journal must be a durable path unique to this account, dex and broker process.
     /// Master-account or approved agent keys are supported; vault/subaccount routing is not.
@@ -469,8 +635,18 @@ impl HyperliquidBroker {
             taker_fee,
             journal: SyncMutex::new(journal),
             submit: Mutex::new(()),
+            info_url: INFO_URL.to_string(),
+            exchange_url: EXCHANGE_URL.to_string(),
+            meta: Cached::new(),
+            verified_leverage: Verified::new(LEVERAGE_VERIFIED_TTL),
+            account_mode: Cached::new(),
+            terminal: SyncMutex::new(HashMap::new()),
+            replied: SyncMutex::new(HashMap::new()),
+            fee_rates: SyncMutex::new(HashMap::new()),
         };
         broker.metadata().await?;
+        // 下单用的常驻 WebSocket 连接（三个 dex 共用一条）；没连上时下单自动走 HTTP。
+        crate::hl_ws::start_shared();
         Ok(broker)
     }
 
@@ -483,11 +659,62 @@ impl HyperliquidBroker {
         Ok(())
     }
 
-    async fn metadata(&self) -> ArbResult<Meta> {
-        self.metadata_at(INFO_URL).await
+    async fn metadata(&self) -> ArbResult<Arc<Meta>> {
+        self.metadata_at(&self.info_url).await
     }
 
-    async fn metadata_at(&self, info_url: &str) -> ArbResult<Meta> {
+    /// [`Broker::free_collateral`] 的实现（`info_url` 可指向测试用的假服务器）。只读。
+    async fn free_collateral_at(&self, info_url: &str) -> ArbResult<Option<Decimal>> {
+        let mode = match self.account_mode.get(ACCOUNT_MODE_TTL) {
+            Some(mode) => mode,
+            None => {
+                let mode: Value = post(
+                    &self.client,
+                    info_url,
+                    &json!({"type":"userAbstraction", "user":self.account}),
+                )
+                .await?;
+                self.account_mode.put(mode.clone());
+                mode
+            }
+        };
+        if balances_live_in_spot(&mode) {
+            // 保证金币（`meta`，有缓存）和现货余额并发读：开仓前的保证金预检和拉盘口同时做，
+            // 它慢一个往返，报价就要多放一个往返才能下单。
+            let spot_query = json!({"type":"spotClearinghouseState", "user":self.account});
+            let (meta, spot) = tokio::join!(
+                self.metadata_within_at(info_url),
+                post::<Value>(&self.client, info_url, &spot_query),
+            );
+            // 没报保证金币就不知道该看哪个余额：给 None（只警告），不猜 USDC。
+            let Some(token) = meta?.collateral_token.as_ref().and_then(Value::as_u64) else {
+                return Ok(None);
+            };
+            return Ok(unified_free(&spot?, token));
+        }
+        let state: Value = post(
+            &self.client,
+            info_url,
+            &json!({
+                "type":"clearinghouseState", "user":self.account,
+                "dex":self.dex.info_dex().unwrap_or(""),
+            }),
+        )
+        .await?;
+        let summary = state.get("marginSummary");
+        let number = |key: &str| {
+            summary
+                .and_then(|summary| summary.get(key))
+                .and_then(Value::as_str)
+                .and_then(|raw| Decimal::from_str(raw).ok())
+        };
+        Ok(number("accountValue")
+            .zip(number("totalMarginUsed"))
+            .map(|(value, used)| (value - used).max(Decimal::ZERO)))
+    }
+
+    /// 拉一次最新的 `meta` 并放进缓存（[`META_TTL`]）。
+    async fn metadata_at(&self, info_url: &str) -> ArbResult<Arc<Meta>> {
         let body = match self.dex.info_dex() {
             Some(dex) => json!({"type":"meta", "dex":dex}),
             None => json!({"type":"meta"}),
@@ -496,27 +723,48 @@ impl HyperliquidBroker {
         if meta.universe.is_empty() {
             return Err(error("empty perpetual metadata"));
         }
+        let meta = Arc::new(meta);
+        self.meta.put(Arc::clone(&meta));
         Ok(meta)
     }
 
-    async fn asset(&self, symbol: &Symbol) -> ArbResult<(u32, Asset)> {
-        self.asset_at(INFO_URL, symbol).await
+    /// 缓存里不超过 [`META_TTL`] 的 `meta`，没有就拉一次。
+    async fn metadata_within_at(&self, info_url: &str) -> ArbResult<Arc<Meta>> {
+        match self.meta.get(META_TTL) {
+            Some(meta) => Ok(meta),
+            None => self.metadata_at(info_url).await,
+        }
     }
 
+    async fn asset(&self, symbol: &Symbol) -> ArbResult<(u32, Asset)> {
+        self.asset_at(&self.info_url, symbol).await
+    }
+
+    /// 缓存优先；缓存里找不到这个合约（可能刚上线）就再拉一次最新的 `meta`。
     async fn asset_at(&self, info_url: &str, symbol: &Symbol) -> ArbResult<(u32, Asset)> {
+        if let Some(meta) = self.meta.get(META_TTL)
+            && let Some(found) = self.find_asset(&meta, symbol)?
+        {
+            return Ok(found);
+        }
         let meta = self.metadata_at(info_url).await?;
+        self.find_asset(&meta, symbol)?
+            .ok_or_else(|| error(format!("unknown perp market {symbol}")))
+    }
+
+    fn find_asset(&self, meta: &Meta, symbol: &Symbol) -> ArbResult<Option<(u32, Asset)>> {
         let mut found = None;
-        for (index, asset) in meta.universe.into_iter().enumerate() {
+        for (index, asset) in meta.universe.iter().enumerate() {
             if symbol_of(self.dex, &asset.name)? == *symbol {
                 if found.is_some() {
                     return Err(error("ambiguous perp market identity"));
                 }
                 let index = u32::try_from(index).map_err(|_| error("asset index overflow"))?;
                 let id = self.dex.asset_id(self.perp_dex_index, index)?;
-                found = Some((id, asset));
+                found = Some((id, asset.clone()));
             }
         }
-        found.ok_or_else(|| error(format!("unknown perp market {symbol}")))
+        Ok(found)
     }
 
     async fn configure_margin(
@@ -529,17 +777,21 @@ impl HyperliquidBroker {
         if !market_supports_mode(self.dex, asset, mode) {
             return Err(error("此 Hyperliquid 合约不支持所选保证金模式"));
         }
-        let query = json!({"type":"activeAssetData", "user":self.account, "coin":asset.name});
-        let matches = |data: &Value| {
-            data.get("coin").and_then(Value::as_str) == Some(asset.name.as_str())
-                && data.pointer("/leverage/type").and_then(Value::as_str) == Some(mode.as_str())
-                && data.pointer("/leverage/value").and_then(Value::as_u64)
-                    == Some(u64::from(leverage))
-        };
-        let current: Value = post(&self.client, INFO_URL, &query).await?;
-        if matches(&current) {
+        // 刚核对过（预热或上一次准备）：不再往返一次。
+        let key = (asset.name.clone(), leverage, mode);
+        if self.verified_leverage.is_fresh(&key) {
             return Ok(());
         }
+        let query = json!({"type":"activeAssetData", "user":self.account, "coin":asset.name});
+        let matches = |data: &Value| leverage_matches(data, &asset.name, leverage, mode);
+        let current: Value = post(&self.client, &self.info_url, &query).await?;
+        if matches(&current) {
+            self.mark_verified(key);
+            return Ok(());
+        }
+        // 要改杠杆了：这个币之前核对过的结果立刻作废（改到一半失败也不会留下过期的「核对过」）。
+        self.verified_leverage
+            .forget_where(|(coin, _, _)| coin == &asset.name);
         let reply = self
             .exchange(&LeverageAction {
                 kind: "updateLeverage",
@@ -552,13 +804,64 @@ impl HyperliquidBroker {
             return Err(error("leverage update not acknowledged"));
         }
         for _ in 0..5 {
-            let readback: Value = post(&self.client, INFO_URL, &query).await?;
+            let readback: Value = post(&self.client, &self.info_url, &query).await?;
             if matches(&readback) {
+                self.mark_verified(key);
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         Err(error("保证金模式/杠杆读回未确认，没有下单"))
+    }
+
+    /// 记下这个（币, 杠杆, 模式）读回核对过了：同一个币之前核对过的别的杠杆 / 模式一并作废（交易所里现在
+    /// 是这一个，旧的不能再让下一次跳过核对）。
+    fn mark_verified(&self, key: (String, u32, crate::MarginMode)) {
+        self.verified_leverage
+            .forget_where(|(coin, _, _)| coin == &key.0);
+        self.verified_leverage.mark(key);
+    }
+
+    /// 记下一笔读回核对过的终态（活着的单不记），顺手清掉过期的。
+    fn remember_terminal(&self, state: &OrderState) {
+        if state.status.is_live() {
+            return;
+        }
+        let cloid = client_cloid(&state.order.client_order_id);
+        if let Ok(mut terminal) = self.terminal.lock() {
+            terminal.retain(|_, (at, _)| at.elapsed() < TERMINAL_TTL);
+            terminal.insert(cloid, (std::time::Instant::now(), state.clone()));
+        }
+    }
+
+    fn known_terminal(&self, cloid: &str) -> Option<OrderState> {
+        let terminal = self.terminal.lock().ok()?;
+        let (at, state) = terminal.get(cloid)?;
+        (at.elapsed() < TERMINAL_TTL).then(|| state.clone())
+    }
+
+    /// 记下下单回包里交易所给出的结局：IOC 的成交量与均价（[`Self::provisional`]），或明确拒绝（没进撮合、
+    /// 一点没成交）。读节点会落后几秒到十几秒（10-17 xyz:MSFT 已成交 8 秒多还是 `unknownOid`），这时
+    /// [`Broker::order_state`] 用它，不把一张结局已知的单当成「结果不明」。不进 [`Self::terminal`]：手续费是
+    /// 估的、均价偏保守；读回一旦查到就以读回为准并清掉。只放内存：重启后读节点早已追上。
+    fn remember_reply(&self, state: &OrderState) {
+        let cloid = client_cloid(&state.order.client_order_id);
+        if let Ok(mut replied) = self.replied.lock() {
+            replied.retain(|_, (at, _)| at.elapsed() < TERMINAL_TTL);
+            replied.insert(cloid, (std::time::Instant::now(), state.clone()));
+        }
+    }
+
+    fn replied_state(&self, cloid: &str) -> Option<OrderState> {
+        let replied = self.replied.lock().ok()?;
+        let (at, state) = replied.get(cloid)?;
+        (at.elapsed() < TERMINAL_TTL).then(|| state.clone())
+    }
+
+    fn forget_reply(&self, cloid: &str) {
+        if let Ok(mut replied) = self.replied.lock() {
+            replied.remove(cloid);
+        }
     }
 
     fn reservation(&self, cloid: &str) -> ArbResult<Option<Reservation>> {
@@ -585,7 +888,7 @@ impl HyperliquidBroker {
 
     async fn exchange<T: Serialize + Sync>(&self, action: &T) -> ArbResult<Value> {
         let body = self.signed_request(action)?;
-        let response: Value = post(&self.client, EXCHANGE_URL, &body).await?;
+        let response: Value = post(&self.client, &self.exchange_url, &body).await?;
         if response.get("status").and_then(Value::as_str) != Some("ok") {
             // Never echo arbitrary server data that could contain a signed request.
             return Err(error(
@@ -593,6 +896,65 @@ impl HyperliquidBroker {
             ));
         }
         Ok(response)
+    }
+
+    /// 签名并**只发一次**下单，把应答分成「受理 / 明确拒绝 / 不知道」（见 [`classify_order_reply`]）。
+    /// `Err` 只在没有发出任何请求时返回（只读模式、签名失败、请求构造失败）。
+    async fn send_order_action<T: Serialize + Sync>(&self, action: &T) -> ArbResult<OrderSend> {
+        let body = self.signed_request(action)?;
+        // 优先走常驻 WebSocket 的 `post`（[`crate::hl_ws`]）：连接常驻、已握手。**只发一次**：
+        // 没交给连接（没连上 / 判死 / 熔断 / 在途太多）才改走 HTTP，同一份没发出去过的请求体；
+        // 一旦交给了连接，超时 / 断线都是「结果不明」，直接返回 `Unknown`，绝不再用 HTTP 补发。
+        // 只在生产地址上用：指向测试假服务器时不碰真实连接。
+        if self.exchange_url == EXCHANGE_URL
+            && let Some(poster) = crate::hl_ws::shared()
+        {
+            match poster
+                .post_action(body.clone(), crate::hl_ws::POST_TIMEOUT)
+                .await
+            {
+                crate::hl_ws::PostOutcome::NotSent => {}
+                crate::hl_ws::PostOutcome::Reply(Ok(payload)) => {
+                    return Ok(classify_order_reply(200, Some(&payload.to_string())));
+                }
+                // 服务端的错误字符串镜像 HTTP 状态码与描述（如 `429 …`）：按同一口径分类，读不出状态码就当不知道。
+                crate::hl_ws::PostOutcome::Reply(Err(text)) => {
+                    return Ok(match text
+                        .split_whitespace()
+                        .next()
+                        .and_then(|code| code.parse::<u16>().ok())
+                    {
+                        Some(status) => classify_order_reply(status, None),
+                        None => OrderSend::Unknown(
+                            "websocket error reply without a status code; the order may have been placed"
+                                .to_string(),
+                        ),
+                    });
+                }
+                crate::hl_ws::PostOutcome::Unknown(reason) => {
+                    return Ok(OrderSend::Unknown(format!(
+                        "websocket order request outcome unknown ({reason}); the order may have been placed"
+                    )));
+                }
+            }
+        }
+        let response = match self
+            .client
+            .post(&self.exchange_url)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) if e.is_builder() => {
+                return Err(error("order request could not be built; nothing was sent"));
+            }
+            // 超时、连接中断……请求可能已经到了对面：只能当成不知道。
+            Err(e) => return Ok(OrderSend::Unknown(transport_reason(&e))),
+        };
+        let status = response.status().as_u16();
+        let text = response.text().await.ok();
+        Ok(classify_order_reply(status, text.as_deref()))
     }
 
     /// `clearinghouseState` 里这个币的逐仓持仓；没有持仓、不是逐仓、读不到账本都是 `Err`。
@@ -714,9 +1076,39 @@ impl HyperliquidBroker {
     }
 
     async fn remote_status(&self, oid: Value) -> ArbResult<Option<RemoteStatus>> {
+        self.remote_status_at(&self.info_url, oid).await
+    }
+
+    /// 交易所已经回了「受理」的订单：它一定存在，`unknownOid` 只是读节点还没追上，
+    /// 所以按 [`ORDER_READBACK_POLLS`] 次轮询，查到就返回。轮询只读，不会重复提交任何东西。
+    /// 轮询用完仍是 `unknownOid` 返回 `Ok(None)`；最后一次是请求错误则返回那个错误。
+    async fn remote_status_after_ack(
+        &self,
+        info_url: &str,
+        oid: Value,
+        interval: Duration,
+    ) -> ArbResult<Option<RemoteStatus>> {
+        let mut last = Ok(None);
+        for attempt in 0..ORDER_READBACK_POLLS {
+            if attempt > 0 {
+                tokio::time::sleep(interval).await;
+            }
+            last = self.remote_status_at(info_url, oid.clone()).await;
+            if matches!(last, Ok(Some(_))) {
+                break;
+            }
+        }
+        last
+    }
+
+    async fn remote_status_at(
+        &self,
+        info_url: &str,
+        oid: Value,
+    ) -> ArbResult<Option<RemoteStatus>> {
         let response: Value = post(
             &self.client,
-            INFO_URL,
+            info_url,
             &json!({"type":"orderStatus", "user":self.account, "oid":oid}),
         )
         .await?;
@@ -769,6 +1161,7 @@ impl HyperliquidBroker {
             saved.order
         } else {
             NewOrder {
+                post_only: false,
                 margin_mode: crate::MarginMode::Isolated,
                 client_order_id: id,
                 venue: self.dex.venue(),
@@ -805,6 +1198,12 @@ impl HyperliquidBroker {
             None
         };
         state.fee_usdt = fees;
+        if notional > Decimal::ZERO
+            && fees >= Decimal::ZERO
+            && let Ok(mut rates) = self.fee_rates.lock()
+        {
+            rates.insert(state.order.symbol.clone(), fees / notional);
+        }
         if status == OrderStatus::Rejected {
             state.reject_reason = Some(remote.status);
         }
@@ -818,7 +1217,7 @@ impl HyperliquidBroker {
         loop {
             let rows: Vec<RemoteFill> = post(
                 &self.client,
-                INFO_URL,
+                &self.info_url,
                 &json!({
                     "type":"userFillsByTime", "user":self.account,
                     "startTime":start, "endTime":end, "aggregateByTime":false,
@@ -865,9 +1264,23 @@ impl HyperliquidBroker {
             let slippage = self.options.market_slippage.ok_or_else(|| {
                 error("market orders require explicit market_slippage or a limit price")
             })?;
+            // 先读行情 WebSocket 已经放进本进程的顶档（`bbo`，见 `arb_venues::live_book`）：吃单限价只用对手方
+            // 顶档，不必每单先 REST 拉一遍 `l2Book`（一个往返）。没有、连接心跳太旧、交叉、该侧为空
+            // 都退回 REST，限价规则与滑点上限不变。
+            if let Some(((bid, _), (ask, _))) =
+                arb_venues::live_book::top(self.dex.venue(), &order.symbol.base, BBO_MAX_AGE)
+            {
+                let top = if order.side == Side::Buy { ask } else { bid };
+                let factor = if order.side == Side::Buy {
+                    Decimal::ONE + slippage
+                } else {
+                    Decimal::ONE - slippage
+                };
+                return tick_price(multiply(top, factor)?, asset.sz_decimals, order.side);
+            }
             let book: Value = post(
                 &self.client,
-                INFO_URL,
+                &self.info_url,
                 &match self.dex.info_dex() {
                     // `coin` already carries the dex prefix; `dex` is ignored by this
                     // endpoint but sent for parity with the other per-dex queries.
@@ -900,10 +1313,398 @@ impl HyperliquidBroker {
         };
         tick_price(raw, asset.sz_decimals, order.side)
     }
+
+    /// 下单（[`Broker::place`]、[`Broker::place_for_hedge`] 共用）。`quick`：IOC 回包里已经给出成交量和
+    /// 均价时直接返回待核实状态（见 [`Self::provisional`]），不等订单状态与逐笔成交的读回。
+    async fn submit_order(&self, order: &NewOrder, quick: bool) -> ArbResult<Submitted> {
+        self.authorize()?;
+        // 分段耗时（见下面「Hyperliquid 下单分段耗时」）：等下单锁、发单前的查重、其余准备、`/exchange` 往返。
+        let entered = std::time::Instant::now();
+        let _submission = self.submit.lock().await;
+        let locked = std::time::Instant::now();
+        if order.venue != self.dex.venue() || order.client_order_id.0.is_empty() {
+            return Err(error("wrong venue or empty client order ID"));
+        }
+        let cloid = client_cloid(&order.client_order_id);
+        let reservation = self.reservation(&cloid)?;
+        if let Some(saved) = &reservation
+            && !same_intent(&saved.order, order)
+        {
+            return Err(error("client order ID reused with a different intent"));
+        }
+        if let Some(remote) = self.remote_status(json!(cloid)).await? {
+            let state = self
+                .state_from_remote(remote, Some(&order.client_order_id))
+                .await?;
+            return ack(&state).map(Submitted::Ack);
+        }
+        let checked = std::time::Instant::now();
+        if reservation.is_some() {
+            return Err(error(
+                "reserved order ID is unresolved/expired; do not resubmit, reconcile manually",
+            ));
+        }
+        let (asset_id, asset) = self.asset(&order.symbol).await?;
+        if asset.is_delisted
+            || (!order.reduce_only && !market_supports_mode(self.dex, &asset, order.margin_mode))
+        {
+            return Err(error(
+                "market is delisted or does not support the selected margin mode",
+            ));
+        }
+        let price = self.price(order, &asset).await?;
+        let quantity = order_quantity(order, price, asset.sz_decimals)?;
+        // 10 美元下限：reduce-only 恰好平掉整笔持仓时 HL 不拦（下面读到持仓后再判断）。
+        // 某次实盘：开仓第一腿只吃到 0.30 USDT，回滚和之后每次平仓都被这里本地拦下，
+        // 零头裸在 HL 上平不掉。
+        let below_minimum = multiply(quantity, price)? < Decimal::TEN;
+        if below_minimum && !order.reduce_only {
+            return Err(error("order is below Hyperliquid's $10 minimum notional"));
+        }
+        let leverage = if order.reduce_only {
+            None
+        } else {
+            let value = order
+                .leverage
+                .ok_or_else(|| error("opening order requires explicit isolated leverage"))?;
+            if !value.fract().is_zero()
+                || value < Decimal::ONE
+                || value > Decimal::from(asset.max_leverage)
+            {
+                return Err(error("leverage must be an integer within the market limit"));
+            }
+            Some(value.to_u32().ok_or_else(|| error("invalid leverage"))?)
+        };
+        // Enforce reduce-only on-chain as well as checking the current position locally.
+        // 读节点会落后几秒（10-17 实测 8 秒以上）：刚成交就马上回滚 / 退零头时，持仓可能还没出现。
+        // 本地检查没过就隔一会儿再读，最多 REDUCE_REREADS 次；订单本身带 `r:true`，交易所也会强制只减仓。
+        if order.reduce_only {
+            let mut rereads = REDUCE_REREADS.iter();
+            loop {
+                let position = self
+                    .positions()
+                    .await?
+                    .into_iter()
+                    .find(|p| p.symbol == order.symbol);
+                let reduces = position.as_ref().is_some_and(|position| {
+                    let closes = (position.net_quantity > Decimal::ZERO
+                        && order.side == Side::Sell)
+                        || (position.net_quantity < Decimal::ZERO && order.side == Side::Buy);
+                    closes && quantity <= position.net_quantity.abs()
+                });
+                if reduces {
+                    let closes_all =
+                        position.is_some_and(|position| quantity == position.net_quantity.abs());
+                    if below_minimum && !closes_all {
+                        return Err(error(
+                            "order is below Hyperliquid's $10 minimum notional (only a reduce-only order closing the whole position may be smaller)",
+                        ));
+                    }
+                    break;
+                }
+                match rereads.next() {
+                    Some(delay) => tokio::time::sleep(*delay).await,
+                    None => {
+                        return Err(error(
+                            "reduce-only quantity/direction exceeds the current position",
+                        ));
+                    }
+                }
+            }
+        }
+        // 杠杆先设好再预约订单号：设杠杆失败（读回不一致、限频）时这张单根本没发，不能留下一个永远
+        // 「查不到、不能当没成交」的预约。
+        if let Some(leverage) = leverage {
+            self.configure_margin(asset_id, &asset, leverage, order.margin_mode)
+                .await?;
+        }
+        // Reserve BEFORE any mutating call. A timeout or process death never permits replay.
+        self.journal
+            .lock()
+            .map_err(|_| error("intent journal lock poisoned"))?
+            .reserve(Reservation {
+                account: self.account.clone(),
+                signer: self.signer_address.clone(),
+                cloid: cloid.clone(),
+                order: order.clone(),
+                effective_quantity: quantity,
+            })?;
+        let price_text = price.normalize().to_string();
+        let quantity_text = quantity.normalize().to_string();
+        let action = OrderAction {
+            kind: "order",
+            grouping: "na",
+            orders: [WireOrder {
+                a: asset_id,
+                b: order.side == Side::Buy,
+                p: &price_text,
+                s: &quantity_text,
+                r: order.reduce_only,
+                t: LimitType {
+                    limit: TimeInForce { tif: "Ioc" },
+                },
+                c: &cloid,
+            }],
+        };
+        let sending = std::time::Instant::now();
+        let sent = self.send_order_action(&action).await;
+        // 时间花在哪：`exchange_ms` 是 `/exchange` 一个往返（交易所收单、进块、回包），本地改不动；
+        // 其余几段是我们自己的。11-07～11-14 第一腿中位 765ms。
+        tracing::info!(
+            order = %order.client_order_id,
+            venue = %self.dex.venue(),
+            lock_ms = locked.duration_since(entered).as_millis() as u64,
+            check_ms = checked.duration_since(locked).as_millis() as u64,
+            prepare_ms = sending.duration_since(checked).as_millis() as u64,
+            exchange_ms = sending.elapsed().as_millis() as u64,
+            "Hyperliquid 下单分段耗时"
+        );
+        let reply = match sent? {
+            OrderSend::Accepted(reply) => reply,
+            // 请求在处理前就被拒（限频 429、其它 4xx、顶层 `status: err`）：这张单没进撮合。记下结局，紧接着的
+            // `order_state` 读回用它 —— 以前这里直接 `?`，预约的订单号永远「查不到、不能当没成交」，
+            // 做第二腿时第一腿就一直裸着。
+            OrderSend::Refused(reason) => {
+                self.meta.clear();
+                let mut rejected = OrderState::new(order.clone());
+                rejected.status = OrderStatus::Rejected;
+                rejected.reject_reason = Some(reason);
+                self.remember_reply(&rejected);
+                return Err(error(
+                    "order refused before processing; reserved ID retained",
+                ));
+            }
+            OrderSend::Unknown(reason) => {
+                return Err(error(format!("{reason}; reconcile reserved ID")));
+            }
+        };
+        let statuses = reply
+            .pointer("/response/data/statuses")
+            .and_then(Value::as_array)
+            .ok_or_else(|| error("missing exchange order statuses; reconcile reserved ID"))?;
+        if statuses.len() != 1
+            || reply.pointer("/response/type").and_then(Value::as_str) != Some("order")
+        {
+            return Err(error(
+                "unexpected exchange order response; reconcile reserved ID",
+            ));
+        }
+        if let Some(reason) = statuses[0].get("error") {
+            // 精度、上下架之类变了也会被拒：下一次重新拉 `meta`。
+            self.meta.clear();
+            // 回包明确拒绝 = 没进撮合，一点没成交（IOC 没有对手盘也是这样回）。读节点要过几秒才查得到这张
+            // 被拒的单：记下回包的结局，紧接着的 `order_state` 查不到时用它（见 `remember_reply`）。
+            let mut rejected = OrderState::new(order.clone());
+            rejected.status = OrderStatus::Rejected;
+            rejected.reject_reason = Some(venue_text(Some(reason)));
+            self.remember_reply(&rejected);
+            return Err(error("order rejected by venue; reserved ID retained"));
+        }
+        let replied = self.provisional(order, &statuses[0], quantity, price, asset.sz_decimals)?;
+        if quick && let Some(state) = &replied {
+            // 记下回包的结局：之后 `settle` 读不全（成交明细晚到）时，`order_state` 还能按它给出成交。
+            self.remember_reply(state);
+            return Ok(Submitted::Provisional(Box::new(state.clone())));
+        }
+        // Ack only proves acceptance; require actual status + complete fills including fees.
+        // 回包里有交易所单号就按单号查（同 `settle_at`）。
+        let lookup = replied
+            .as_ref()
+            .and_then(|state| state.venue_order_id.as_deref())
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .map_or_else(|| json!(cloid), |oid| json!(oid));
+        let polled = self
+            .remote_status_after_ack(&self.info_url, lookup, ORDER_READBACK_INTERVAL)
+            .await;
+        let remote = match (polled, replied.clone()) {
+            (Ok(Some(remote)), _) => remote,
+            // 轮询完读节点还是查不到（或读回出错），但回包已经给出了成交量与均价：先按回包记，不把一张
+            // 已经成交的单当成结果不明（那样执行器只能中断，台账少一条腿、对账一直不干净）。
+            (_, Some(state)) => {
+                tracing::warn!(
+                    order = %order.client_order_id,
+                    filled = %state.filled_usdt,
+                    "下单回包已给出成交，读节点还查不到这张单：先按回包记（手续费是估的），之后读到以读回为准"
+                );
+                self.remember_reply(&state);
+                return ack(&state).map(Submitted::Ack);
+            }
+            (polled, None) => polled?
+                .ok_or_else(|| error("accepted order not yet queryable; reserved ID retained"))?,
+        };
+        let state = match self
+            .state_from_remote(remote, Some(&order.client_order_id))
+            .await
+        {
+            Ok(state) => state,
+            // 订单状态先查到、逐笔成交还没追上（读节点滞后）：`verified_status` 核不齐会报错。回包已经给出
+            // 成交量与均价时先按回包记，不把一张已经成交的单当成结果不明（执行器会把第二腿记成中断、仓位卡在
+            // Opening）。之后读得齐了以读回为准。
+            Err(err) => match replied {
+                Some(state) => {
+                    tracing::warn!(
+                        order = %order.client_order_id,
+                        filled = %state.filled_usdt,
+                        error = %err,
+                        "订单查到了但成交明细还没跟上：先按下单回包记（手续费是估的），之后读到以读回为准"
+                    );
+                    self.remember_reply(&state);
+                    return ack(&state).map(Submitted::Ack);
+                }
+                None => return Err(err),
+            },
+        };
+        self.remember_terminal(&state);
+        ack(&state).map(Submitted::Ack)
+    }
+
+    /// 按回包估手续费用的费率：这个合约最近一次读回的实际费率，没有就用配置的吃单费率（偏保守）。
+    fn estimated_fee_rate(&self, symbol: &Symbol) -> Decimal {
+        self.fee_rates
+            .lock()
+            .ok()
+            .and_then(|rates| rates.get(symbol).copied())
+            .unwrap_or(self.taker_fee)
+    }
+
+    /// IOC 回包 `{"filled":{"totalSz","avgPx","oid"}}` 里的待核实状态（[`Broker::place_for_hedge`]）。
+    /// 数量就是交易所报的成交量（准的）；均价按回包往不利方向放一个单位、且不越过订单限价 —— 回包的
+    /// 均价可能是舍入过的，第二腿的保本价按它算只会略严、不会放宽。单位取「回包最后一位小数」和「这个
+    /// 价位一个 tick」里更细的那个：价格字符串会去掉末尾的 0（5.3600 报成 `"5.36"`），只看字符串的话
+    /// 低价合约一放就是 0.01（约 0.2%），比整笔的边际还大。手续费按吃单费率估。回包里没有成交、
+    /// 字段缺失或对不上（超过下单量）返回 `None`，走完整的读回。
+    fn provisional(
+        &self,
+        order: &NewOrder,
+        status: &Value,
+        quantity: Decimal,
+        limit: Decimal,
+        sz_decimals: u32,
+    ) -> ArbResult<Option<OrderState>> {
+        let Some(filled) = status.get("filled") else {
+            return Ok(None);
+        };
+        let field = |key: &str| {
+            filled
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(|raw| Decimal::from_str(raw).ok())
+        };
+        let (Some(total), Some(reported), Some(oid)) = (
+            field("totalSz"),
+            field("avgPx"),
+            filled.get("oid").and_then(Value::as_u64),
+        ) else {
+            return Ok(None);
+        };
+        if total <= Decimal::ZERO || total > quantity || reported <= Decimal::ZERO {
+            return Ok(None);
+        }
+        let unit = Decimal::new(
+            1,
+            reported
+                .scale()
+                .max(tick_decimals(reported, sz_decimals))
+                .min(28),
+        );
+        let price = match order.side {
+            Side::Buy => (reported + unit).min(limit.max(reported)),
+            Side::Sell => (reported - unit).max(limit.min(reported)),
+        };
+        let notional = multiply(total, price)?;
+        let mut state = OrderState::new(order.clone());
+        state.venue_order_id = Some(oid.to_string());
+        // IOC：没成交完的部分已经撤了（和读回时 `verified_status` 的判定一致）。
+        state.status = if total == quantity {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::Cancelled
+        };
+        state.filled_usdt = notional;
+        state.average_price = Some(price);
+        state.fee_usdt = multiply(notional, self.estimated_fee_rate(&order.symbol))?;
+        state.fee_estimated = true;
+        Ok(Some(state))
+    }
+
+    /// [`Broker::settle_hedge`]：按回包里的 oid 轮询订单状态（读节点会落后几秒），再按逐笔成交还原；
+    /// 逐笔成交也可能还没追上，对不上就隔一会儿再读，最多 [`SETTLE_ATTEMPTS`] 次。
+    async fn settle_at(
+        &self,
+        info_url: &str,
+        provisional: &OrderState,
+        interval: Duration,
+    ) -> ArbResult<Option<OrderState>> {
+        let id = &provisional.order.client_order_id;
+        let oid = match provisional
+            .venue_order_id
+            .as_deref()
+            .and_then(|raw| raw.parse::<u64>().ok())
+        {
+            Some(oid) => json!(oid),
+            None => json!(client_cloid(id)),
+        };
+        let mut last = Err(error("order not settled"));
+        for attempt in 0..SETTLE_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(interval).await;
+            }
+            let Some(remote) = self
+                .remote_status_after_ack(info_url, oid.clone(), interval)
+                .await?
+            else {
+                return Err(error(
+                    "accepted order not yet queryable; reserved ID retained",
+                ));
+            };
+            last = self.state_from_remote(remote, Some(id)).await;
+            if let Ok(state) = &last {
+                self.remember_terminal(state);
+                break;
+            }
+        }
+        last.map(Some)
+    }
 }
 
 #[async_trait]
 impl Broker for HyperliquidBroker {
+    /// 只读预热：市场列表（顺手进缓存）与这个币当前的逐仓杠杆，一致就记下，之后的准备与下单
+    /// 不再查。要改杠杆的留给 [`Broker::prepare_open_mode`]（下单已定之后）。
+    /// 下单按 `szDecimals` 位小数向零取整（[`order_quantity`]）。
+    async fn quantity_step(&self, symbol: &Symbol) -> ArbResult<Option<Decimal>> {
+        let (_, asset) = self.asset(symbol).await?;
+        lot_step(asset.sz_decimals).map(Some)
+    }
+
+    async fn warm_reads(&self, symbol: &Symbol, leverage: Option<Decimal>) -> ArbResult<()> {
+        let Some(leverage) = leverage else {
+            return Ok(());
+        };
+        let (_, asset) = self.asset(symbol).await?;
+        let leverage = crate::margin::leverage(self.dex.venue(), Some(leverage))?
+            .to_u32()
+            .ok_or_else(|| error("invalid leverage"))?;
+        let mode = crate::MarginMode::Isolated;
+        // 不合法的组合不在这里报：留给准备阶段按原来的路径拒绝。
+        if leverage > asset.max_leverage || !market_supports_mode(self.dex, &asset, mode) {
+            return Ok(());
+        }
+        let key = (asset.name.clone(), leverage, mode);
+        if !self.verified_leverage.is_fresh(&key) {
+            let current: Value = post(
+                &self.client,
+                &self.info_url,
+                &json!({"type":"activeAssetData", "user":self.account, "coin":asset.name}),
+            )
+            .await?;
+            if leverage_matches(&current, &asset.name, leverage, mode) {
+                self.mark_verified(key);
+            }
+        }
+        Ok(())
+    }
+
     async fn prepare_open_mode(
         &self,
         symbol: &Symbol,
@@ -933,128 +1734,23 @@ impl Broker for HyperliquidBroker {
     }
 
     async fn place(&self, order: &NewOrder) -> ArbResult<OrderAck> {
-        self.authorize()?;
-        let _submission = self.submit.lock().await;
-        if order.venue != self.dex.venue() || order.client_order_id.0.is_empty() {
-            return Err(error("wrong venue or empty client order ID"));
+        crate::broker::refuse_post_only(order)?;
+        match self.submit_order(order, false).await? {
+            Submitted::Ack(ack) => Ok(ack),
+            Submitted::Provisional(state) => ack(&state),
         }
-        let cloid = client_cloid(&order.client_order_id);
-        let reservation = self.reservation(&cloid)?;
-        if let Some(saved) = &reservation
-            && !same_intent(&saved.order, order)
-        {
-            return Err(error("client order ID reused with a different intent"));
+    }
+
+    async fn place_for_hedge(&self, order: &NewOrder) -> ArbResult<Option<OrderState>> {
+        match self.submit_order(order, true).await? {
+            Submitted::Ack(_) => Ok(None),
+            Submitted::Provisional(state) => Ok(Some(*state)),
         }
-        if let Some(remote) = self.remote_status(json!(cloid)).await? {
-            let state = self
-                .state_from_remote(remote, Some(&order.client_order_id))
-                .await?;
-            return ack(&state);
-        }
-        if reservation.is_some() {
-            return Err(error(
-                "reserved order ID is unresolved/expired; do not resubmit, reconcile manually",
-            ));
-        }
-        let (asset_id, asset) = self.asset(&order.symbol).await?;
-        if asset.is_delisted
-            || (!order.reduce_only && !market_supports_mode(self.dex, &asset, order.margin_mode))
-        {
-            return Err(error(
-                "market is delisted or does not support the selected margin mode",
-            ));
-        }
-        let price = self.price(order, &asset).await?;
-        let quantity = order_quantity(order, price, asset.sz_decimals)?;
-        if multiply(quantity, price)? < Decimal::TEN {
-            return Err(error("order is below Hyperliquid's $10 minimum notional"));
-        }
-        let leverage = if order.reduce_only {
-            None
-        } else {
-            let value = order
-                .leverage
-                .ok_or_else(|| error("opening order requires explicit isolated leverage"))?;
-            if !value.fract().is_zero()
-                || value < Decimal::ONE
-                || value > Decimal::from(asset.max_leverage)
-            {
-                return Err(error("leverage must be an integer within the market limit"));
-            }
-            Some(value.to_u32().ok_or_else(|| error("invalid leverage"))?)
-        };
-        // Enforce reduce-only on-chain as well as checking the current position locally.
-        if order.reduce_only {
-            let position = self
-                .positions()
-                .await?
-                .into_iter()
-                .find(|p| p.symbol == order.symbol)
-                .ok_or_else(|| error("reduce-only order has no matching position"))?;
-            let closes = (position.net_quantity > Decimal::ZERO && order.side == Side::Sell)
-                || (position.net_quantity < Decimal::ZERO && order.side == Side::Buy);
-            if !closes || quantity > position.net_quantity.abs() {
-                return Err(error(
-                    "reduce-only quantity/direction exceeds the current position",
-                ));
-            }
-        }
-        // Reserve BEFORE any mutating call. A timeout or process death never permits replay.
-        self.journal
-            .lock()
-            .map_err(|_| error("intent journal lock poisoned"))?
-            .reserve(Reservation {
-                account: self.account.clone(),
-                signer: self.signer_address.clone(),
-                cloid: cloid.clone(),
-                order: order.clone(),
-                effective_quantity: quantity,
-            })?;
-        if let Some(leverage) = leverage {
-            self.configure_margin(asset_id, &asset, leverage, order.margin_mode)
-                .await?;
-        }
-        let price_text = price.normalize().to_string();
-        let quantity_text = quantity.normalize().to_string();
-        let action = OrderAction {
-            kind: "order",
-            grouping: "na",
-            orders: [WireOrder {
-                a: asset_id,
-                b: order.side == Side::Buy,
-                p: &price_text,
-                s: &quantity_text,
-                r: order.reduce_only,
-                t: LimitType {
-                    limit: TimeInForce { tif: "Ioc" },
-                },
-                c: &cloid,
-            }],
-        };
-        let reply = self.exchange(&action).await?;
-        let statuses = reply
-            .pointer("/response/data/statuses")
-            .and_then(Value::as_array)
-            .ok_or_else(|| error("missing exchange order statuses; reconcile reserved ID"))?;
-        if statuses.len() != 1
-            || reply.pointer("/response/type").and_then(Value::as_str) != Some("order")
-        {
-            return Err(error(
-                "unexpected exchange order response; reconcile reserved ID",
-            ));
-        }
-        if statuses[0].get("error").is_some() {
-            return Err(error("order rejected by venue; reserved ID retained"));
-        }
-        // Ack only proves acceptance; require actual status + complete fills including fees.
-        let remote = self
-            .remote_status(json!(cloid))
-            .await?
-            .ok_or_else(|| error("accepted order not yet queryable; reserved ID retained"))?;
-        let state = self
-            .state_from_remote(remote, Some(&order.client_order_id))
-            .await?;
-        ack(&state)
+    }
+
+    async fn settle_hedge(&self, provisional: &OrderState) -> ArbResult<Option<OrderState>> {
+        self.settle_at(&self.info_url, provisional, ORDER_READBACK_INTERVAL)
+            .await
     }
 
     async fn order_state(&self, client_order_id: &ClientOrderId) -> ArbResult<Option<OrderState>> {
@@ -1064,19 +1760,42 @@ impl Broker for HyperliquidBroker {
                 raw.parse::<u64>()
                     .map_err(|_| error("invalid external order ID"))?
             ),
-            None => json!(client_cloid(client_order_id)),
+            None => {
+                let cloid = client_cloid(client_order_id);
+                if let Some(state) = self
+                    .known_terminal(&cloid)
+                    .filter(|state| state.order.client_order_id == *client_order_id)
+                {
+                    return Ok(Some(state));
+                }
+                json!(cloid)
+            }
         };
-        let Some(remote) = self.remote_status(oid).await? else {
-            if self.reservation(&client_cloid(client_order_id))?.is_some() {
+        let cloid = client_cloid(client_order_id);
+        let remote = match self.remote_status(oid).await {
+            Ok(remote) => remote,
+            // 读回出错：下单回包给过结局就先用它（见 `remember_reply`）。
+            Err(err) => return self.replied_state(&cloid).map(Some).ok_or(err),
+        };
+        let Some(remote) = remote else {
+            if let Some(state) = self.replied_state(&cloid) {
+                return Ok(Some(state));
+            }
+            if self.reservation(&cloid)?.is_some() {
                 return Err(error(
                     "reserved order no longer queryable; cannot assume it never filled",
                 ));
             }
             return Ok(None);
         };
-        self.state_from_remote(remote, Some(client_order_id))
-            .await
-            .map(Some)
+        let state = match self.state_from_remote(remote, Some(client_order_id)).await {
+            Ok(state) => state,
+            // 订单查到了、成交明细还没跟上：同读回出错，回包给过结局就先用它。
+            Err(err) => return self.replied_state(&cloid).map(Some).ok_or(err),
+        };
+        self.remember_terminal(&state);
+        self.forget_reply(&cloid);
+        Ok(Some(state))
     }
 
     async fn cancel(&self, venue_order_id: &str) -> ArbResult<()> {
@@ -1121,7 +1840,7 @@ impl Broker for HyperliquidBroker {
     async fn open_orders(&self) -> ArbResult<Vec<OrderState>> {
         let orders: Vec<RemoteOrder> = post(
             &self.client,
-            INFO_URL,
+            &self.info_url,
             &json!({
                 "type":"frontendOpenOrders", "user":self.account,
                 "dex":self.dex.info_dex().unwrap_or(""),
@@ -1152,7 +1871,7 @@ impl Broker for HyperliquidBroker {
     async fn leg_state(&self, symbol: &Symbol) -> ArbResult<Option<VenueLegState>> {
         let state: Value = post(
             &self.client,
-            INFO_URL,
+            &self.info_url,
             &json!({
                 "type":"clearinghouseState", "user":self.account,
                 "dex":self.dex.info_dex().unwrap_or(""),
@@ -1176,47 +1895,15 @@ impl Broker for HyperliquidBroker {
         Ok(None)
     }
 
-    /// 能拿来开新仓的 USDC。
+    /// 能拿来开新仓的保证金。
     ///
-    /// 标准账户（`disabled` / `default` / `dexAbstraction`）看本 dex 的
-    /// `clearinghouseState.marginSummary`：`accountValue − totalMarginUsed`。
-    /// `withdrawable` 是能提走的钱，和开新仓不是一回事，不用它。各 dex 的余额互相独立，
-    /// 现货里的 USDC 也不能拿来当永续保证金。
-    ///
-    /// 统一账户与组合保证金则相反：官方说明这两种模式的余额与占用都在
-    /// `spotClearinghouseState`，各 dex 的永续账户状态没有意义（经常整段是 0）。
-    /// 这时可用保证金是 USDC 的 `total − hold`（`hold` 已含挂单和已占用保证金）。
-    /// 主 dex 与 HIP-3 的 `xyz` / `io` 共用这一份 USDC，不再去读那个为 0 的永续账本。
-    /// 模式读不到就报错，不把「永续账本是 0」当成没钱。
-    ///
-    /// <https://hyperliquid.gitbook.io/hyperliquid-docs/trading/account-abstraction-modes>
-    /// <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot>
+    /// - 统一账户 / 组合保证金：余额在现货状态里，按本 dex 的保证金币（`meta.collateralToken`，
+    ///   主 dex / xyz / io 都是 USDC = 0）取可用额。这时各 dex 的 `clearinghouseState` 恒为 0，
+    ///   按它算会把有钱的账户当成 0（2026-10-09 io 开仓被误拒）。
+    /// - 其它（标准模式）：本 dex 的账户价值减去已占用保证金；各 dex 的余额互相独立。
+    ///   HL 的 `withdrawable` 是能提走的钱，和「能拿来开新仓」不是一回事，所以不用它。
     async fn free_collateral(&self) -> ArbResult<Option<Decimal>> {
-        let mode: String = post(
-            &self.client,
-            INFO_URL,
-            &json!({"type":"userAbstraction", "user":self.account}),
-        )
-        .await?;
-        if abstraction_shares_spot(&mode) {
-            let spot: Value = post(
-                &self.client,
-                INFO_URL,
-                &json!({"type":"spotClearinghouseState", "user":self.account}),
-            )
-            .await?;
-            return unified_usdc_free(&spot).map(Some);
-        }
-        let state: Value = post(
-            &self.client,
-            INFO_URL,
-            &json!({
-                "type":"clearinghouseState", "user":self.account,
-                "dex":self.dex.info_dex().unwrap_or(""),
-            }),
-        )
-        .await?;
-        Ok(perp_free_collateral(&state))
+        self.free_collateral_at(&self.info_url).await
     }
 
     fn supports_add_margin(&self) -> bool {
@@ -1237,8 +1924,8 @@ impl Broker for HyperliquidBroker {
     /// 官方接口：<https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint#update-isolated-margin>
     async fn add_margin(&self, symbol: &Symbol, amount_usdt: Decimal) -> ArbResult<MarginOutcome> {
         self.add_margin_at(
-            INFO_URL,
-            EXCHANGE_URL,
+            &self.info_url,
+            &self.exchange_url,
             MARGIN_READBACK_INTERVAL,
             symbol,
             amount_usdt,
@@ -1256,7 +1943,7 @@ impl Broker for HyperliquidBroker {
     ) -> ArbResult<Option<Vec<crate::settlement::VenueFill>>> {
         let page: Vec<UserFill> = post(
             &self.client,
-            INFO_URL,
+            &self.info_url,
             &json!({
                 "type":"userFillsByTime", "user":self.account,
                 "startTime":since.timestamp_millis(), "endTime":until.timestamp_millis(),
@@ -1281,37 +1968,21 @@ impl Broker for HyperliquidBroker {
     /// `userFunding`（公开）：同一个地址所有 dex 的资金费都在里面（HIP-3 的币名带
     /// `dex:` 前缀），按本券商这个 dex 的合约过滤。`usdc` 正 = 收到；一次最多 500 条，
     /// 满页就从最后一条之后接着查。
+    ///
+    /// 拉到的原始流水按（接口, 地址）共享一会儿（见 [`SharedFunding`]）。
     async fn funding_since(
         &self,
         symbol: &Symbol,
         since: chrono::DateTime<chrono::Utc>,
     ) -> ArbResult<Option<FundingTotal>> {
-        let mut rows = Vec::new();
-        let mut start = since.timestamp_millis();
-        for _ in 0..FUNDING_PAGES {
-            let page: Vec<UserFunding> = post(
-                &self.client,
-                INFO_URL,
-                &json!({"type":"userFunding", "user":self.account, "startTime":start}),
-            )
-            .await?;
-            let full = page.len() >= FUNDING_PAGE;
-            let last = page.iter().map(|row| row.time).max();
-            rows.extend(funding_rows(self.dex, symbol, page)?);
-            match last {
-                Some(last) if full => start = last + 1,
-                _ => return Ok(Some(FundingTotal::from_rows(rows, since))),
-            }
-        }
-        Err(error(
-            "funding history exceeds the page limit; total would be incomplete",
-        ))
+        self.funding_since_at(symbol, since, chrono::Utc::now())
+            .await
     }
 
     async fn positions(&self) -> ArbResult<Vec<VenuePosition>> {
         let response: Value = post(
             &self.client,
-            INFO_URL,
+            &self.info_url,
             &json!({
                 "type":"clearinghouseState", "user":self.account,
                 "dex":self.dex.info_dex().unwrap_or(""),
@@ -1424,52 +2095,6 @@ impl Journal {
 
 fn error(message: impl Into<String>) -> ArbError {
     ArbError::venue("hyperliquid", message)
-}
-
-/// 统一账户与组合保证金的抵押在现货清算所，不在各 dex 的永续账本。
-fn abstraction_shares_spot(mode: &str) -> bool {
-    matches!(mode, "unifiedAccount" | "portfolioMargin")
-}
-
-/// 标准账户：本 dex 永续账本里还能开新仓的 USDC。缺字段是「不知道」，不是 0。
-fn perp_free_collateral(state: &Value) -> Option<Decimal> {
-    let summary = state.get("marginSummary");
-    let number = |key: &str| {
-        summary
-            .and_then(|summary| summary.get(key))
-            .and_then(Value::as_str)
-            .and_then(|raw| Decimal::from_str(raw).ok())
-    };
-    number("accountValue")
-        .zip(number("totalMarginUsed"))
-        .map(|(value, used)| (value - used).max(Decimal::ZERO))
-}
-
-/// 统一账户 / 组合保证金：USDC 的 `total − hold`。
-///
-/// 没有 USDC 这一行就是 0（账户里没有这种抵押）。缺 `balances`、或有 USDC 但数字读不懂，
-/// 是响应坏了，报错，不当成 0。`hold` 大于 `total` 时按 0，不报负的可用保证金。
-fn unified_usdc_free(spot: &Value) -> ArbResult<Decimal> {
-    let balances = spot
-        .get("balances")
-        .and_then(Value::as_array)
-        .ok_or_else(|| error("missing spot balances"))?;
-    let Some(usdc) = balances.iter().find(|row| is_usdc(row)) else {
-        return Ok(Decimal::ZERO);
-    };
-    let total = decimal_field(usdc, "total")?;
-    let hold = decimal_field(usdc, "hold")?;
-    Ok(total
-        .checked_sub(hold)
-        .unwrap_or(Decimal::ZERO)
-        .max(Decimal::ZERO))
-}
-
-fn is_usdc(row: &Value) -> bool {
-    match row.get("coin").and_then(Value::as_str) {
-        Some(coin) => coin == "USDC",
-        None => row.get("token").and_then(Value::as_u64) == Some(0),
-    }
 }
 
 fn leg_state_from_position(position: &Value) -> VenueLegState {
@@ -1632,6 +2257,53 @@ fn judge_margin_change(
     }
 }
 
+/// `/exchange` 对下单的应答分类（纯函数，见 [`classify_order_reply`]）。
+#[derive(Debug, PartialEq)]
+enum OrderSend {
+    /// `{"status":"ok"}`：受理了，每张单的结局在 `statuses` 里。
+    Accepted(Value),
+    /// 请求在处理前就被拒：这张单没进撮合。
+    Refused(String),
+    /// 可能已经被处理：结局要读回。
+    Unknown(String),
+}
+
+/// 下单应答：2xx 看顶层 `status`（`ok` 受理、`err` 处理前被拒、其它不知道）；429 和其它 4xx（408 除外）在处理前
+/// 就被拒；408、5xx 和其它状态码不知道。与补保证金的 [`classify_margin_reply`] 同一口径。
+fn classify_order_reply(status: u16, body: Option<&str>) -> OrderSend {
+    match status {
+        200..=299 => {
+            let Some(reply) = body.and_then(|text| serde_json::from_str::<Value>(text).ok()) else {
+                return OrderSend::Unknown(format!(
+                    "HTTP {status} with an unreadable body; the order may have been placed"
+                ));
+            };
+            match reply.get("status").and_then(Value::as_str) {
+                Some("ok") => OrderSend::Accepted(reply),
+                Some("err") => OrderSend::Refused(format!(
+                    "exchange rejected the order before processing: {}",
+                    venue_text(reply.get("response"))
+                )),
+                _ => OrderSend::Unknown(format!(
+                    "HTTP {status} with an unrecognised reply; the order may have been placed"
+                )),
+            }
+        }
+        429 => OrderSend::Refused(
+            "HTTP 429: rate limited before processing; the order was not placed".to_string(),
+        ),
+        408 | 500..=599 => OrderSend::Unknown(format!(
+            "HTTP {status}; the outcome is unknown and the order may have been placed"
+        )),
+        400..=499 => OrderSend::Refused(format!(
+            "HTTP {status}: request rejected before processing; the order was not placed"
+        )),
+        _ => OrderSend::Unknown(format!(
+            "HTTP {status} is unexpected; the order may have been placed"
+        )),
+    }
+}
+
 /// `/exchange` 对 `updateIsolatedMargin` 的应答分类（纯函数，见 [`classify_margin_reply`]）。
 #[derive(Debug, PartialEq, Eq)]
 enum MarginSend {
@@ -1787,14 +2459,50 @@ fn funding_rows(
     Ok(rows)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct UserFunding {
     /// 毫秒。
     time: i64,
     delta: FundingDelta,
 }
 
-#[derive(Debug, Deserialize)]
+/// 同一个地址的 `userFunding` 原始流水（全部 dex）：从 `start`（毫秒）起，`fetched` 时拉的。
+///
+/// `userFunding` 按地址返回全部 dex 的流水，而后台刷新资金费是每条腿各查一次、各自从开仓时刻起翻页：
+/// 同一个地址上几条腿（主站、xyz、io 的不同合约）就把同一份数据拉几遍。按条目计权的接口这样很快把
+/// 额度吃光（2026-10-24/25 东京每小时十几到四十几次 429，大半是它），连带拉盘口、读保证金一起被拒。
+/// 所以拉过的原始流水按（接口, 地址）共享一会儿：起点不晚于这次要的，就直接按 dex 和合约过滤。
+struct SharedFunding {
+    fetched: chrono::DateTime<chrono::Utc>,
+    start: i64,
+    rows: Vec<UserFunding>,
+}
+
+/// [`SharedFunding`] 能用多久。后台刷新一轮按开仓时间把所有腿挨个查完只要几秒。
+const SHARED_FUNDING_TTL: Duration = Duration::from_secs(10);
+/// 整点结算的流水最晚多久能查到：拉取时刻早于「最近一个整点 + 这么久」的那份可能缺这一笔。
+const FUNDING_SETTLE_GRACE: Duration = Duration::from_secs(60);
+
+impl SharedFunding {
+    /// `now` 还能不能用：没过 [`SHARED_FUNDING_TTL`]，并且拉的时候最近一次整点结算已经查得到了
+    /// （止盈复核会强制重查资金费，不能拿结算之前那份顶替）。
+    fn usable_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let hour = now.timestamp().div_euclid(3600) * 3600;
+        let settled = hour + FUNDING_SETTLE_GRACE.as_secs() as i64;
+        now.signed_duration_since(self.fetched)
+            .to_std()
+            .is_ok_and(|age| age < SHARED_FUNDING_TTL)
+            && self.fetched.timestamp() >= settled
+    }
+}
+
+fn shared_funding() -> &'static SyncMutex<HashMap<(String, String), SharedFunding>> {
+    static SHARED: std::sync::OnceLock<SyncMutex<HashMap<(String, String), SharedFunding>>> =
+        std::sync::OnceLock::new();
+    SHARED.get_or_init(|| SyncMutex::new(HashMap::new()))
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct FundingDelta {
     coin: String,
     /// 正 = 收到。
@@ -1939,6 +2647,14 @@ fn hip3_fee_scale(deployer_fee_scale: Decimal) -> ArbResult<Decimal> {
     }
 }
 
+/// 下单数量步长（见 [`Broker::quantity_step`]）：[`order_quantity`] 按 `szDecimals` 位小数向零取整。
+fn lot_step(sz_decimals: u32) -> ArbResult<Decimal> {
+    if sz_decimals > 6 {
+        return Err(error("invalid szDecimals"));
+    }
+    Ok(Decimal::new(1, sz_decimals))
+}
+
 fn order_quantity(order: &NewOrder, price: Decimal, decimals: u32) -> ArbResult<Decimal> {
     if decimals > 6 || price <= Decimal::ZERO || order.notional_usdt <= Decimal::ZERO {
         return Err(error("invalid precision, notional or price"));
@@ -1985,6 +2701,27 @@ fn tick_price(price: Decimal, sz_decimals: u32, side: Side) -> ArbResult<Decimal
     Ok(rounded.normalize())
 }
 
+/// 这个价位上永续一个 tick 有几位小数（和 [`tick_price`] 同一规则）：最多 5 位有效数字、最多
+/// `6 − szDecimals` 位小数。
+fn tick_decimals(price: Decimal, sz_decimals: u32) -> u32 {
+    let most = 6u32.saturating_sub(sz_decimals);
+    let price = price.abs();
+    let significant = if price >= Decimal::ONE {
+        let integer_digits = price.trunc().normalize().mantissa().to_string().len() as u32;
+        5u32.saturating_sub(integer_digits)
+    } else {
+        // 0.0123 → 小数点后有 1 个前导 0：5 位有效数字要 6 位小数。
+        let mut leading = 0u32;
+        let mut scaled = price;
+        while scaled > Decimal::ZERO && scaled < Decimal::new(1, 1) && leading < 20 {
+            scaled *= Decimal::TEN;
+            leading += 1;
+        }
+        5 + leading
+    };
+    most.min(significant)
+}
+
 fn same_intent(a: &NewOrder, b: &NewOrder) -> bool {
     if a.margin_mode != b.margin_mode {
         return false;
@@ -1998,6 +2735,13 @@ fn same_intent(a: &NewOrder, b: &NewOrder) -> bool {
         && a.limit_price == b.limit_price
         && a.reduce_only == b.reduce_only
         && a.leverage == b.leverage
+}
+
+/// `activeAssetData` 的应答是不是这个币、这个保证金模式、这个杠杆。
+fn leverage_matches(data: &Value, coin: &str, leverage: u32, mode: crate::MarginMode) -> bool {
+    data.get("coin").and_then(Value::as_str) == Some(coin)
+        && data.pointer("/leverage/type").and_then(Value::as_str) == Some(mode.as_str())
+        && data.pointer("/leverage/value").and_then(Value::as_u64) == Some(u64::from(leverage))
 }
 
 fn map_status(status: &str) -> ArbResult<OrderStatus> {
@@ -2201,6 +2945,7 @@ mod tests {
 
     fn order() -> NewOrder {
         NewOrder {
+            post_only: false,
             margin_mode: crate::MarginMode::Isolated,
             client_order_id: ClientOrderId("test-position-buy-0".into()),
             venue: Venue::Hyperliquid,
@@ -2305,6 +3050,18 @@ mod tests {
         }
     }
 
+    /// 报给执行器的步长和下单取整是同一份规格：步长整数倍的数量原样下出去（两腿同时下靠这个对齐数量）。
+    #[test]
+    fn a_quantity_on_the_reported_step_goes_out_unchanged() {
+        let step = lot_step(2).unwrap();
+        assert_eq!(step, dec!(0.01));
+        let mut order = order();
+        order.quantity = Some(step * Decimal::from(14880));
+        order.notional_usdt = dec!(148.8) * dec!(100);
+        assert_eq!(order_quantity(&order, dec!(100), 2).unwrap(), dec!(148.8));
+        assert!(lot_step(7).is_err());
+    }
+
     #[test]
     fn quantities_round_down_but_exits_must_be_exact() {
         let mut order = order();
@@ -2319,6 +3076,23 @@ mod tests {
         assert!(order_quantity(&order, dec!(100), 5).is_err());
         order.quantity = None;
         assert!(order_quantity(&order, dec!(100), 5).is_err());
+    }
+
+    #[test]
+    fn a_long_breakeven_limit_rounds_to_five_significant_figures_without_getting_worse() {
+        // 第二腿的保本价（`Plan::hedged_after`）有十几位小数。
+        assert_eq!(
+            tick_price(dec!(5.364712345678), 1, Side::Sell).unwrap(),
+            dec!(5.3648)
+        );
+        assert_eq!(
+            tick_price(dec!(5.364712345678), 1, Side::Buy).unwrap(),
+            dec!(5.3647)
+        );
+        assert_eq!(
+            tick_price(dec!(1591.611111111111), 2, Side::Buy).unwrap(),
+            dec!(1591.6)
+        );
     }
 
     #[test]
@@ -2507,6 +3281,89 @@ mod tests {
         );
     }
 
+    /// 同一个地址上的几条腿（这里是 xyz 的 TSLA 和 io 的 ANTH）共用一份 `userFunding`：只拉一次，各自按
+    /// dex、合约、起点过滤；要的起点比手上那份更早才重拉。
+    #[tokio::test]
+    async fn legs_on_one_address_share_one_user_funding_fetch() {
+        let mock =
+            Mock::start(
+                |path, body, _| match (path, body.get("type").and_then(Value::as_str)) {
+                    ("/info", Some("userFunding")) => Reply::Json(
+                        200,
+                        json!([
+                            {"time": 1_000_i64, "delta": {"coin": "xyz:TSLA", "usdc": "-1"}},
+                            {"time": 2_000_i64, "delta": {"coin": "io:ANTH", "usdc": "0.5"}},
+                            {"time": 3_000_i64, "delta": {"coin": "xyz:TSLA", "usdc": "-2"}},
+                            {"time": 4_000_i64, "delta": {"coin": "io:ANTH", "usdc": "0.25"}},
+                            {"time": 4_000_i64, "delta": {"coin": "BTC", "usdc": "9"}}
+                        ]),
+                    ),
+                    _ => Reply::Json(404, json!({})),
+                },
+            )
+            .await;
+        let mut xyz = test_broker(HyperliquidDex::Xyz, 1, false, Duration::from_secs(1));
+        xyz.info_url = mock.info();
+        let mut io = test_broker(HyperliquidDex::Io, 2, false, Duration::from_secs(1));
+        io.info_url = mock.info();
+        let at = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).unwrap();
+        let anth_symbol = symbol_of(HyperliquidDex::Io, "io:ANTH").unwrap();
+        // 整点后 5 分钟：最近一次结算早就查得到了。
+        let now = chrono::DateTime::from_timestamp(1_790_000_000 / 3600 * 3600 + 300, 0).unwrap();
+
+        let tsla = xyz
+            .funding_since_at(&Symbol::perp("TSLA", "USDT"), at(1_000), now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((tsla.usdt, tsla.payments), (dec!(-3), 2));
+        assert_eq!(mock.count("info:userFunding"), 1);
+
+        // 另一个 dex、起点更晚：用手上那份，不再请求。
+        let anth = io
+            .funding_since_at(&anth_symbol, at(3_000), now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (anth.usdt, anth.payments),
+            (dec!(0.25), 1),
+            "起点之前的不算"
+        );
+        assert_eq!(mock.count("info:userFunding"), 1);
+
+        // 起点更早：手上那份盖不住，重拉。
+        let anth = io
+            .funding_since_at(&anth_symbol, at(500), now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((anth.usdt, anth.payments), (dec!(0.75), 2));
+        assert_eq!(mock.count("info:userFunding"), 2);
+    }
+
+    /// 共享的那份流水：10 秒内、而且拉的时候最近一次整点结算已经查得到（整点后 60 秒）才能用。
+    /// 止盈复核强制重查资金费，不能拿结算之前拉的那份顶替。
+    #[test]
+    fn shared_funding_is_not_used_across_an_hourly_settlement() {
+        let hour = 1_790_000_000 / 3600 * 3600;
+        let at = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let fetched_at = |secs: i64| SharedFunding {
+            fetched: at(secs),
+            start: 0,
+            rows: Vec::new(),
+        };
+        // 整点后 5 分钟拉的：5 秒后能用，10 秒后不能用。
+        assert!(fetched_at(hour + 300).usable_at(at(hour + 305)));
+        assert!(!fetched_at(hour + 300).usable_at(at(hour + 310)));
+        // 整点前 3 秒拉的：过了整点就不能用（这一笔还没在里面）。
+        assert!(fetched_at(hour - 3).usable_at(at(hour - 1)));
+        assert!(!fetched_at(hour - 3).usable_at(at(hour + 2)));
+        // 整点后 30 秒拉的（结算可能还没查得到）：不能用；整点后 60 秒起拉的才能用。
+        assert!(!fetched_at(hour + 30).usable_at(at(hour + 35)));
+        assert!(fetched_at(hour + 60).usable_at(at(hour + 65)));
+    }
+
     #[test]
     fn hip3_symbols_round_trip_through_verified_aliases() {
         let xyz = HyperliquidDex::Xyz;
@@ -2648,66 +3505,6 @@ mod tests {
     }
 
     #[test]
-    fn unified_account_collateral_comes_from_spot_usdc_not_a_zero_perp_ledger() {
-        // 统一账户 + 逐仓：永续账本整段是 0，钱在现货 USDC。这是图里那种「保证金被识别为 0」。
-        let perp = json!({
-            "marginSummary": {"accountValue":"0.0","totalMarginUsed":"0.0"},
-            "crossMarginSummary": {"accountValue":"0.0","totalMarginUsed":"0.0"},
-            "withdrawable": "0.0",
-            "assetPositions": []
-        });
-        assert_eq!(perp_free_collateral(&perp), Some(Decimal::ZERO));
-        let spot = json!({"balances":[
-            {"coin":"USDC","token":0,"hold":"0.0","total":"131.088941","entryNtl":"0.0"},
-            {"coin":"HYPE","token":150,"hold":"1","total":"2","entryNtl":"0"}
-        ]});
-        assert_eq!(unified_usdc_free(&spot).unwrap(), dec!(131.088941));
-        // hold 是已经占用的保证金和挂单，不能再拿去开仓。
-        let held = json!({"balances":[
-            {"coin":"USDC","token":0,"hold":"10.5","total":"131.088941","entryNtl":"0.0"}
-        ]});
-        assert_eq!(unified_usdc_free(&held).unwrap(), dec!(120.588941));
-        // 占用比余额大：没有负的可用保证金。
-        let over = json!({"balances":[{"coin":"USDC","token":0,"hold":"2","total":"1"}]});
-        assert_eq!(unified_usdc_free(&over).unwrap(), Decimal::ZERO);
-        // 没有 USDC 行 = 没有这种抵押。别的币不算进来。
-        assert_eq!(
-            unified_usdc_free(
-                &json!({"balances":[{"coin":"PURR","token":1,"hold":"0","total":"2000"}]})
-            )
-            .unwrap(),
-            Decimal::ZERO
-        );
-        // 坏响应不当成 0。
-        assert!(unified_usdc_free(&json!({})).is_err());
-        assert!(unified_usdc_free(&json!({"balances":[{"coin":"USDC","total":"1"}]})).is_err());
-        // 只写了 token 0、没写币名时仍认作 USDC；写了别的币名即使 token 是 0 也不认。
-        assert_eq!(
-            unified_usdc_free(&json!({"balances":[{"token":0,"hold":"0","total":"4"}]})).unwrap(),
-            dec!(4)
-        );
-        assert_eq!(
-            unified_usdc_free(
-                &json!({"balances":[{"coin":"USDT","token":0,"hold":"0","total":"9"}]})
-            )
-            .unwrap(),
-            Decimal::ZERO
-        );
-
-        assert!(abstraction_shares_spot("unifiedAccount"));
-        assert!(abstraction_shares_spot("portfolioMargin"));
-        for mode in ["disabled", "default", "dexAbstraction", ""] {
-            assert!(!abstraction_shares_spot(mode), "{mode}");
-        }
-        // 标准账户仍只用永续账本，现货 USDC 不掺进来。
-        let funded = json!({
-            "marginSummary": {"accountValue":"100.5","totalMarginUsed":"40"}
-        });
-        assert_eq!(perp_free_collateral(&funded), Some(dec!(60.5)));
-        assert_eq!(perp_free_collateral(&json!({})), None);
-    }
-
-    #[test]
     fn update_isolated_margin_matches_official_python_sdk_vectors() {
         // 向量由官方 Python SDK（hyperliquid/utils/signing.py 的 `action_hash` /
         // `sign_l1_action`，action = {"type":"updateIsolatedMargin","asset":..,"isBuy":True,
@@ -2800,6 +3597,14 @@ mod tests {
             taker_fee: dec!(0.00045),
             journal: SyncMutex::new(journal),
             submit: Mutex::new(()),
+            info_url: INFO_URL.to_string(),
+            exchange_url: EXCHANGE_URL.to_string(),
+            meta: Cached::new(),
+            verified_leverage: Verified::new(LEVERAGE_VERIFIED_TTL),
+            account_mode: Cached::new(),
+            terminal: SyncMutex::new(HashMap::new()),
+            replied: SyncMutex::new(HashMap::new()),
+            fee_rates: SyncMutex::new(HashMap::new()),
         }
     }
 
@@ -3219,6 +4024,60 @@ mod tests {
         assert!(read_only.signed_request(&action).is_err());
     }
 
+    /// 2026-10-09 实盘 `orderStatus` 对已成交 IOC 单的应答（io:SNDK 卖出 0.4911）。
+    fn filled_order_status() -> Value {
+        json!({"status":"order","order":{"order":{
+            "coin":"io:SNDK","side":"A","limitPx":"1623.8","sz":"0.0","oid":100000000001u64,
+            "timestamp":1791552614871u64,"triggerCondition":"N/A","isTrigger":false,
+            "triggerPx":"0.0","children":[],"isPositionTpsl":false,"reduceOnly":false,
+            "orderType":"Limit","origSz":"0.4911","tif":"Ioc",
+            "cloid":"0x0c5bb80cad7695768327520496232c7b"
+        },"status":"filled","statusTimestamp":1791552614871u64}})
+    }
+
+    fn order_status_script(
+        unknown_first: usize,
+    ) -> impl Fn(&str, &Value, usize) -> Reply + Send + Sync + 'static {
+        move |path, body, nth| match (path, body["type"].as_str()) {
+            ("/info", Some("orderStatus")) if nth < unknown_first => {
+                Reply::Json(200, json!({"status":"unknownOid"}))
+            }
+            ("/info", Some("orderStatus")) => Reply::Json(200, filled_order_status()),
+            _ => Reply::Json(404, json!({})),
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_order_is_found_once_the_lagging_read_node_catches_up() {
+        // 某次实盘：卖单已全部成交，但成交后头几次 orderStatus 还是 unknownOid。
+        let mock = Mock::start(order_status_script(3)).await;
+        let broker = test_broker(HyperliquidDex::Io, 2, true, Duration::from_secs(1));
+        let remote = broker
+            .remote_status_after_ack(&mock.info(), json!("0x0c5b"), FAST)
+            .await
+            .unwrap()
+            .expect("the order exists once the node catches up");
+        assert_eq!(remote.status, "filled");
+        assert_eq!(
+            mock.count("info:orderStatus"),
+            4,
+            "stops polling as soon as it is found"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_order_still_unknown_after_all_polls_stays_unknown() {
+        // 轮询有上限：一直 unknownOid 就如实返回 None，由调用方按「已受理但查不到」处理，不当成没发出去。
+        let mock = Mock::start(order_status_script(usize::MAX)).await;
+        let broker = test_broker(HyperliquidDex::Io, 2, true, Duration::from_secs(1));
+        let remote = broker
+            .remote_status_after_ack(&mock.info(), json!("0x0c5b"), FAST)
+            .await
+            .unwrap();
+        assert!(remote.is_none());
+        assert_eq!(mock.count("info:orderStatus"), ORDER_READBACK_POLLS);
+    }
+
     #[tokio::test]
     async fn read_only_broker_refuses_before_sending_anything() {
         let mock = Mock::start(eth_script(|_| eth_state(RAW_BEFORE), ok_reply)).await;
@@ -3553,6 +4412,101 @@ mod tests {
         assert!(mock.writes().is_empty());
     }
 
+    /// 形状取自 2026-10-09 的公开应答：统一账户，各 perp dex 的 clearinghouseState 全 0，
+    /// USDC 在现货里。
+    fn unified_script(
+        mode: &'static str,
+        spot: Value,
+    ) -> impl Fn(&str, &Value, usize) -> Reply + Send + Sync + 'static {
+        move |path, body, _| match (path, body["type"].as_str()) {
+            ("/info", Some("userAbstraction")) => Reply::Json(200, json!(mode)),
+            ("/info", Some("meta")) => Reply::Json(
+                200,
+                json!({"universe":[{"name":"io:ANTH","szDecimals":2,"maxLeverage":6}],"collateralToken":0}),
+            ),
+            ("/info", Some("spotClearinghouseState")) => Reply::Json(200, spot.clone()),
+            ("/info", Some("clearinghouseState")) => Reply::Json(
+                200,
+                json!({"marginSummary":{"accountValue":"0.0","totalNtlPos":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"assetPositions":[]}),
+            ),
+            _ => Reply::Json(404, json!({})),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_unified_account_reads_free_collateral_from_spot_not_the_empty_dex_state() {
+        let spot = json!({
+            "balances":[{"coin":"USDC","token":0,"total":"2299.995434","hold":"0.0","entryNtl":"0.0"}],
+            "tokenToAvailableAfterMaintenance":[[0,"2299.995434"]],
+        });
+        let mock = Mock::start(unified_script("unifiedAccount", spot)).await;
+        let broker = test_broker(HyperliquidDex::Io, 10, false, Duration::from_secs(1));
+        let free = broker.free_collateral_at(&mock.info()).await.unwrap();
+        assert_eq!(free, Some(dec!(2299.995434)), "有钱的统一账户不能读成 0");
+        assert_eq!(
+            mock.info_bodies("meta")[0],
+            json!({"type":"meta","dex":"io"})
+        );
+        assert_eq!(mock.count("info:clearinghouseState"), 0);
+        assert!(mock.writes().is_empty(), "只读");
+
+        // 已有占用：按 total − hold 与维持后可用额里小的那个算。
+        let held = json!({
+            "balances":[{"coin":"USDC","token":0,"total":"1000","hold":"700","entryNtl":"0.0"}],
+            "tokenToAvailableAfterMaintenance":[[0,"800"]],
+        });
+        let mock = Mock::start(unified_script("portfolioMargin", held)).await;
+        let free = broker.free_collateral_at(&mock.info()).await.unwrap();
+        assert_eq!(free, Some(dec!(300)));
+    }
+
+    #[tokio::test]
+    async fn standard_mode_still_uses_the_dex_scoped_clearinghouse_state() {
+        let mock = Mock::start(unified_script("default", json!({"balances":[]}))).await;
+        let broker = test_broker(HyperliquidDex::Io, 10, false, Duration::from_secs(1));
+        // 标准模式下各 dex 独立：这个 dex 确实是 0，就是 0（拦住开仓是对的）。
+        assert_eq!(
+            broker.free_collateral_at(&mock.info()).await.unwrap(),
+            Some(Decimal::ZERO)
+        );
+        assert_eq!(
+            mock.info_bodies("clearinghouseState")[0]["dex"],
+            json!("io")
+        );
+        assert_eq!(mock.count("info:spotClearinghouseState"), 0);
+    }
+
+    /// 手动联网核对（只读 `/info`，不签名、不下单）：
+    /// `ARB_PROBE_HL_ACCOUNT=0x… cargo test -p arb-exec --lib live_free_collateral_probe -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "联网，手动跑"]
+    async fn live_free_collateral_probe() {
+        let account = std::env::var("ARB_PROBE_HL_ACCOUNT").expect("ARB_PROBE_HL_ACCOUNT");
+        for (dex, index) in [
+            (HyperliquidDex::Main, 0),
+            (HyperliquidDex::Xyz, 1),
+            (HyperliquidDex::Io, 10),
+        ] {
+            let mut broker = test_broker(dex, index, false, Duration::from_secs(15));
+            broker.account = hex(&decode_hex::<20>(&account).unwrap());
+            let free = broker.free_collateral().await.unwrap();
+            println!("{}: 可用保证金 {free:?}", dex.venue());
+        }
+    }
+
+    #[test]
+    fn unified_free_needs_the_collateral_token_and_never_goes_negative() {
+        let spot = json!({
+            "balances":[{"coin":"USDT0","token":268,"total":"50","hold":"0"}],
+            "tokenToAvailableAfterMaintenance":[[268,"-5"]],
+        });
+        assert_eq!(unified_free(&spot, 0), None, "没有这个币是不知道，不是 0");
+        assert_eq!(unified_free(&spot, 268), Some(Decimal::ZERO));
+        assert!(balances_live_in_spot(&json!("unifiedAccount")));
+        assert!(!balances_live_in_spot(&json!("dexAbstraction")));
+        assert!(!balances_live_in_spot(&json!("default")));
+    }
+
     #[tokio::test]
     async fn hip3_top_up_uses_the_builder_asset_id_and_dex_scoped_state() {
         // xyz 在 perpDexs 里是第 1 项；TSLA 在 xyz 的 meta 里是第 1 个（0 起）→ 110001。
@@ -3638,5 +4592,731 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, MarginOutcome::Applied);
+    }
+
+    /// io:SNDK 买单：800 USDT、限价 1623.8、3 倍逐仓。按 szDecimals 4 向下取整后下单量 0.4926。
+    fn sndk_buy() -> NewOrder {
+        NewOrder {
+            post_only: false,
+            client_order_id: ClientOrderId("live-1-buy-0".into()),
+            venue: Venue::HyperliquidIo,
+            symbol: Symbol::perp("SNDK", "USDT"),
+            side: Side::Buy,
+            notional_usdt: dec!(800),
+            quantity: None,
+            limit_price: Some(dec!(1623.8)),
+            reduce_only: false,
+            margin_mode: crate::MarginMode::Isolated,
+            leverage: Some(dec!(3)),
+        }
+    }
+
+    const SNDK_OID: u64 = 100000000001;
+    const SNDK_AT: u64 = 1791552614871;
+
+    /// 下单与读回的假交易所：第一次 `orderStatus`（下单前的幂等检查）没有这单；之后头 `lag` 次
+    /// 读回仍是 `unknownOid`（读节点落后），再往后是全部成交。逐笔成交两笔，合计 0.4926。
+    /// `exchange` 是下单回包（`None` = 回 `{"error":…}`）。
+    fn sndk_script(
+        lag: usize,
+        exchange: Option<Value>,
+    ) -> impl Fn(&str, &Value, usize) -> Reply + Send + Sync + 'static {
+        let cloid = client_cloid(&sndk_buy().client_order_id);
+        move |path, body, nth| match (path, body["type"].as_str()) {
+            ("/info", Some("orderStatus")) if nth <= lag => {
+                Reply::Json(200, json!({"status":"unknownOid"}))
+            }
+            ("/info", Some("orderStatus")) => Reply::Json(
+                200,
+                json!({"status":"order","order":{"order":{
+                    "coin":"io:SNDK","side":"B","limitPx":"1623.8","sz":"0.0","oid":SNDK_OID,
+                    "timestamp":SNDK_AT,"reduceOnly":false,"origSz":"0.4926","cloid":cloid
+                },"status":"filled","statusTimestamp":SNDK_AT}}),
+            ),
+            ("/info", Some("meta")) => Reply::Json(
+                200,
+                json!({"universe":[{"name":"io:SNDK","szDecimals":4,"maxLeverage":10,"onlyIsolated":true}]}),
+            ),
+            ("/info", Some("activeAssetData")) => Reply::Json(
+                200,
+                json!({"coin":"io:SNDK","leverage":{"type":"isolated","value":3}}),
+            ),
+            ("/info", Some("userFillsByTime")) => Reply::Json(
+                200,
+                json!([
+                    {"oid":SNDK_OID,"tid":1,"time":SNDK_AT,"coin":"io:SNDK","side":"B","sz":"0.3","px":"1623.7","fee":"0.2192","feeToken":"USDC"},
+                    {"oid":SNDK_OID,"tid":2,"time":SNDK_AT,"coin":"io:SNDK","side":"B","sz":"0.1926","px":"1623.8","fee":"0.1407","feeToken":"USDC"}
+                ]),
+            ),
+            ("/exchange", _) => Reply::Json(
+                200,
+                match &exchange {
+                    Some(status) => {
+                        json!({"status":"ok","response":{"type":"order","data":{"statuses":[status]}}})
+                    }
+                    None => json!({"status":"ok","response":{"type":"order","data":{"statuses":[
+                        {"error":"Order could not immediately match against any resting orders."}
+                    ]}}}),
+                },
+            ),
+            _ => Reply::Json(404, json!({})),
+        }
+    }
+
+    fn sndk_filled() -> Value {
+        json!({"filled":{"totalSz":"0.4926","avgPx":"1623.75","oid":SNDK_OID}})
+    }
+
+    fn mocked_broker(mock: &Mock) -> HyperliquidBroker {
+        let mut broker = test_broker(HyperliquidDex::Io, 2, true, Duration::from_secs(1));
+        broker.info_url = mock.info();
+        broker.exchange_url = mock.exchange();
+        broker
+    }
+
+    /// 平掉 某合约 零头：卖 0.002（限价 1600，约 3.2 USDT，低于 10 美元下限），持仓 `szi` 由参数给。
+    fn sndk_dust_close() -> NewOrder {
+        NewOrder {
+            client_order_id: ClientOrderId("live-1-sell-exit1".into()),
+            side: Side::Sell,
+            notional_usdt: dec!(3.2),
+            quantity: Some(dec!(0.002)),
+            limit_price: Some(dec!(1600)),
+            reduce_only: true,
+            leverage: None,
+            ..sndk_buy()
+        }
+    }
+
+    fn dust_script(
+        szi: &'static str,
+    ) -> impl Fn(&str, &Value, usize) -> Reply + Send + Sync + 'static {
+        move |path, body, _| match (path, body["type"].as_str()) {
+            ("/info", Some("orderStatus")) => Reply::Json(200, json!({"status":"unknownOid"})),
+            ("/info", Some("meta")) => Reply::Json(
+                200,
+                json!({"universe":[{"name":"io:SNDK","szDecimals":4,"maxLeverage":10,"onlyIsolated":true}]}),
+            ),
+            ("/info", Some("clearinghouseState")) => Reply::Json(
+                200,
+                position_state("io:SNDK", isolated_leverage("10"), szi, "0", "1"),
+            ),
+            ("/exchange", _) => Reply::Json(
+                200,
+                json!({"status":"ok","response":{"type":"order","data":{"statuses":[
+                    {"filled":{"totalSz":"0.002","avgPx":"1600","oid":SNDK_OID}}
+                ]}}}),
+            ),
+            _ => Reply::Json(404, json!({})),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reduce_only_order_closing_the_whole_dust_position_is_sent_despite_the_ten_dollar_minimum()
+     {
+        // 某次实盘：第一腿只吃到 0.30 USDT，回滚与每次平仓都被本地 10 美元下限拦下，零头平不掉。
+        let mock = Mock::start(dust_script("0.002")).await;
+        let broker = mocked_broker(&mock);
+        let _ = broker.place(&sndk_dust_close()).await;
+        assert!(
+            mock.sequence().iter().any(|step| step == "exchange"),
+            "整笔平掉零头的 reduce-only 单要发出去：{:?}",
+            mock.sequence()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reduce_only_order_below_ten_dollars_that_leaves_a_remainder_is_still_refused() {
+        let mock = Mock::start(dust_script("0.005")).await;
+        let broker = mocked_broker(&mock);
+        let error = broker
+            .place(&sndk_dust_close())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("$10 minimum"), "{error}");
+        assert!(
+            !mock.sequence().iter().any(|step| step == "exchange"),
+            "只平一部分、又低于下限：不发"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hedge_first_leg_returns_the_ioc_fill_before_any_readback_and_settles_to_the_fills() {
+        let mock = Mock::start(sndk_script(1, Some(sndk_filled()))).await;
+        let broker = mocked_broker(&mock);
+        let order = sndk_buy();
+        let provisional = broker
+            .place_for_hedge(&order)
+            .await
+            .unwrap()
+            .expect("IOC 回包里有成交：直接给待核实状态");
+        assert_eq!(
+            mock.sequence(),
+            [
+                "info:orderStatus",
+                "info:meta",
+                "info:activeAssetData",
+                "exchange"
+            ],
+            "不等订单状态、逐笔成交的读回"
+        );
+        assert_eq!(provisional.status, OrderStatus::Filled);
+        assert_eq!(provisional.venue_order_id.as_deref(), Some("100000000001"));
+        // 回包均价 1623.75 往不利方向（买：往上）放一位，不越过限价 1623.8。
+        assert_eq!(provisional.average_price, Some(dec!(1623.76)));
+        assert_eq!(provisional.filled_usdt, dec!(0.4926) * dec!(1623.76));
+        assert_eq!(
+            provisional.fee_usdt,
+            provisional.filled_usdt * dec!(0.00045)
+        );
+        assert!(
+            provisional.fee_estimated,
+            "按回包记的手续费是估的，要标出来"
+        );
+        let cloid = client_cloid(&order.client_order_id);
+        assert!(
+            broker.known_terminal(&cloid).is_none(),
+            "待核实状态不进终态缓存"
+        );
+
+        // 核实：读节点先落后一次，再按逐笔成交还原精确成交额与实收手续费。
+        let settled = broker
+            .settle_at(&mock.info(), &provisional, FAST)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.order, order);
+        assert_eq!(settled.status, OrderStatus::Filled);
+        assert_eq!(
+            settled.filled_usdt,
+            dec!(0.3) * dec!(1623.7) + dec!(0.1926) * dec!(1623.8)
+        );
+        assert_eq!(settled.fee_usdt, dec!(0.3599));
+        assert!(!settled.fee_estimated);
+        // 读回过一次实际费率：之后这个合约按回包估手续费就用它，不再用配置的吃单费率。
+        assert_eq!(
+            broker.estimated_fee_rate(&order.symbol),
+            dec!(0.3599) / settled.filled_usdt
+        );
+        assert_eq!(
+            broker.estimated_fee_rate(&Symbol::perp("OTHER", "USDT")),
+            dec!(0.00045)
+        );
+        assert!(settled.average_price.unwrap() < provisional.average_price.unwrap());
+        assert_eq!(mock.count("info:userFillsByTime"), 1);
+        assert!(mock.count("info:orderStatus") >= 3);
+        // 核实过的终态进缓存：之后的 order_state 不再往返。
+        let before = mock.total();
+        let again = broker
+            .order_state(&order.client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.filled_usdt, settled.filled_usdt);
+        assert_eq!(mock.total(), before);
+    }
+
+    #[tokio::test]
+    async fn a_plain_place_still_reads_back_the_order_and_its_fills() {
+        let mock = Mock::start(sndk_script(0, Some(sndk_filled()))).await;
+        let broker = mocked_broker(&mock);
+        let acked = broker.place(&sndk_buy()).await.unwrap();
+        assert_eq!(acked.venue_order_id, "100000000001");
+        assert_eq!(acked.status, OrderStatus::Filled);
+        // 执行器紧接着的 order_state：IOC 终态刚读回核对过，直接给，不再读两次。
+        let state = broker
+            .order_state(&sndk_buy().client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, OrderStatus::Filled);
+        assert_eq!(state.fee_usdt, dec!(0.3599));
+        assert_eq!(
+            mock.sequence(),
+            [
+                "info:orderStatus",
+                "info:meta",
+                "info:activeAssetData",
+                "exchange",
+                "info:orderStatus",
+                "info:userFillsByTime"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn warming_up_leaves_preparing_and_placing_without_meta_or_leverage_round_trips() {
+        let mock = Mock::start(sndk_script(0, Some(sndk_filled()))).await;
+        let broker = mocked_broker(&mock);
+        let order = sndk_buy();
+        broker
+            .warm_reads(&order.symbol, Some(dec!(3)))
+            .await
+            .unwrap();
+        assert_eq!(mock.sequence(), ["info:meta", "info:activeAssetData"]);
+        broker
+            .prepare_open_mode(&order.symbol, Side::Buy, Some(dec!(3)), order.margin_mode)
+            .await
+            .unwrap();
+        assert_eq!(mock.total(), 2, "预热过：准备阶段一次往返都没有");
+        broker.place_for_hedge(&order).await.unwrap().unwrap();
+        assert_eq!(mock.count("info:meta"), 1);
+        assert_eq!(mock.count("info:activeAssetData"), 1);
+
+        // 杠杆不一致时预热不记、不改：留给准备阶段去改。
+        let other = Mock::start(|path, body, _| match (path, body["type"].as_str()) {
+            ("/info", Some("meta")) => Reply::Json(
+                200,
+                json!({"universe":[{"name":"io:SNDK","szDecimals":4,"maxLeverage":10}]}),
+            ),
+            ("/info", Some("activeAssetData")) => Reply::Json(
+                200,
+                json!({"coin":"io:SNDK","leverage":{"type":"isolated","value":5}}),
+            ),
+            _ => Reply::Json(404, json!({})),
+        })
+        .await;
+        let broker = mocked_broker(&other);
+        broker
+            .warm_reads(&order.symbol, Some(dec!(3)))
+            .await
+            .unwrap();
+        assert!(other.writes().is_empty(), "预热只读");
+        assert!(!broker.verified_leverage.is_fresh(&(
+            "io:SNDK".to_string(),
+            3,
+            crate::MarginMode::Isolated
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_order_drops_the_cached_meta() {
+        let mock = Mock::start(sndk_script(0, None)).await;
+        let broker = mocked_broker(&mock);
+        let err = broker.place_for_hedge(&sndk_buy()).await.unwrap_err();
+        assert!(err.to_string().contains("rejected"), "{err}");
+        assert!(broker.meta.get(META_TTL).is_none(), "下一次重新拉 meta");
+        assert_eq!(mock.count("info:userFillsByTime"), 0);
+    }
+
+    /// 下单请求在处理前就被拒（限频 429、其它 4xx、顶层 `status: err`）：这张单没进撮合，读回给「被拒」，
+    /// 不再是永远「查不到、不能当没成交」。5xx 仍然是结果不明。
+    #[tokio::test]
+    async fn an_order_refused_before_processing_reads_back_as_rejected() {
+        for (status, body) in [
+            (429, json!({})),
+            (422, json!({})),
+            (
+                200,
+                json!({"status":"err","response":"User or API Wallet does not exist."}),
+            ),
+        ] {
+            let script = sndk_script(usize::MAX, None);
+            let mock = Mock::start(move |path, body_in, nth| match path {
+                "/exchange" => Reply::Json(status, body.clone()),
+                _ => script(path, body_in, nth),
+            })
+            .await;
+            let broker = mocked_broker(&mock);
+            let order = sndk_buy();
+            let err = broker.place(&order).await.unwrap_err();
+            assert!(
+                err.to_string().contains("refused before processing"),
+                "{status}: {err}"
+            );
+            assert_eq!(mock.count("exchange"), 1, "只发一次");
+            let state = broker
+                .order_state(&order.client_order_id)
+                .await
+                .unwrap()
+                .expect("被拒的单有结局");
+            assert_eq!(state.status, OrderStatus::Rejected, "{status}");
+        }
+        let mock = Mock::start({
+            let script = sndk_script(usize::MAX, None);
+            move |path, body, nth| match path {
+                "/exchange" => Reply::Json(502, json!({})),
+                _ => script(path, body, nth),
+            }
+        })
+        .await;
+        let broker = mocked_broker(&mock);
+        let order = sndk_buy();
+        assert!(broker.place(&order).await.is_err());
+        assert!(
+            broker.order_state(&order.client_order_id).await.is_err(),
+            "5xx 可能已经下了：仍然不能当成没成交"
+        );
+    }
+
+    #[test]
+    fn order_replies_are_classified_like_margin_replies() {
+        let ok = r#"{"status":"ok","response":{"type":"order","data":{"statuses":[]}}}"#;
+        assert!(matches!(
+            classify_order_reply(200, Some(ok)),
+            OrderSend::Accepted(_)
+        ));
+        for (status, body) in [
+            (200, Some(r#"{"status":"err","response":"bad nonce"}"#)),
+            (429, None),
+            (400, None),
+            (422, Some("x")),
+        ] {
+            assert!(
+                matches!(classify_order_reply(status, body), OrderSend::Refused(_)),
+                "{status}"
+            );
+        }
+        for (status, body) in [
+            (200, Some("not json")),
+            (200, Some(r#"{"status":"?"}"#)),
+            (408, None),
+            (500, None),
+            (502, None),
+            (302, None),
+        ] {
+            assert!(
+                matches!(classify_order_reply(status, body), OrderSend::Unknown(_)),
+                "{status}"
+            );
+        }
+    }
+
+    /// 10-17 xyz:MSFT：IOC 回包已报全部成交，读节点 8 秒多还是 `unknownOid`。按回包记，不当成结果不明。
+    #[tokio::test]
+    async fn a_filled_reply_stands_in_when_the_read_node_never_catches_up() {
+        let mock = Mock::start(sndk_script(usize::MAX, Some(sndk_filled()))).await;
+        let broker = mocked_broker(&mock);
+        let order = sndk_buy();
+        let acked = broker.place(&order).await.unwrap();
+        assert_eq!(acked.venue_order_id, SNDK_OID.to_string());
+        assert_eq!(acked.status, OrderStatus::Filled);
+        assert_eq!(
+            mock.count("info:orderStatus"),
+            1 + ORDER_READBACK_POLLS,
+            "下单前查一次，下单后照常轮询完"
+        );
+        let state = broker
+            .order_state(&order.client_order_id)
+            .await
+            .unwrap()
+            .expect("回包给过成交：不是结果不明");
+        assert_eq!(state.order, order);
+        assert_eq!(state.status, OrderStatus::Filled);
+        assert_eq!(state.venue_order_id.as_deref(), Some("100000000001"));
+        // 同第一腿的待核实状态：均价往不利方向放一位，手续费按吃单费率估。
+        assert_eq!(state.average_price, Some(dec!(1623.76)));
+        assert_eq!(state.filled_usdt, dec!(0.4926) * dec!(1623.76));
+        assert_eq!(state.fee_usdt, state.filled_usdt * dec!(0.00045));
+        assert_eq!(mock.count("info:userFillsByTime"), 0);
+        let cloid = client_cloid(&order.client_order_id);
+        assert!(
+            broker.known_terminal(&cloid).is_none(),
+            "估算的状态不进终态缓存"
+        );
+    }
+
+    /// 订单状态先查到、逐笔成交还没追上：回包已报全部成交，就按回包记，不当成结果不明。
+    #[tokio::test]
+    async fn a_filled_reply_stands_in_when_fills_lag_behind_the_order_status() {
+        let inner = sndk_script(0, Some(sndk_filled()));
+        let mock = Mock::start(move |path: &str, body: &Value, nth: usize| {
+            if path == "/info" && body["type"].as_str() == Some("userFillsByTime") {
+                return Reply::Json(200, json!([]));
+            }
+            inner(path, body, nth)
+        })
+        .await;
+        let broker = mocked_broker(&mock);
+        let order = sndk_buy();
+        let acked = broker.place(&order).await.unwrap();
+        assert_eq!(acked.status, OrderStatus::Filled);
+        assert!(
+            mock.count("info:userFillsByTime") > 0,
+            "查过成交明细、是空的"
+        );
+        let state = broker
+            .order_state(&order.client_order_id)
+            .await
+            .unwrap()
+            .expect("回包给过成交：不是结果不明");
+        assert_eq!(state.status, OrderStatus::Filled);
+        // 回包的数（均价往不利方向放一位），不是逐笔成交算出来的。
+        assert_eq!(state.filled_usdt, dec!(0.4926) * dec!(1623.76));
+    }
+
+    #[tokio::test]
+    async fn once_the_read_node_catches_up_the_readback_replaces_the_reply() {
+        // 下单前 1 次 + 轮询 ORDER_READBACK_POLLS 次都查不到，之后的 order_state 查到了。
+        let mock = Mock::start(sndk_script(ORDER_READBACK_POLLS, Some(sndk_filled()))).await;
+        let broker = mocked_broker(&mock);
+        let order = sndk_buy();
+        broker.place(&order).await.unwrap();
+        let state = broker
+            .order_state(&order.client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.fee_usdt, dec!(0.3599), "实收手续费，不是估的");
+        assert_eq!(
+            state.filled_usdt,
+            dec!(0.3) * dec!(1623.7) + dec!(0.1926) * dec!(1623.8)
+        );
+        let cloid = client_cloid(&order.client_order_id);
+        assert!(
+            broker.replied_state(&cloid).is_none(),
+            "读到了就清掉回包的结局"
+        );
+        assert!(broker.known_terminal(&cloid).is_some());
+    }
+
+    /// 10-16 xyz:CRWV：第二腿 IOC 没有对手盘被拒，读节点 4 秒多才查得到，强制补腿因此晚了 4.5 秒。
+    #[tokio::test]
+    async fn an_error_reply_is_a_definite_rejection_before_the_read_node_knows_the_order() {
+        let mock = Mock::start(sndk_script(usize::MAX, None)).await;
+        let broker = mocked_broker(&mock);
+        let order = sndk_buy();
+        let err = broker.place(&order).await.unwrap_err();
+        assert!(err.to_string().contains("rejected"), "{err}");
+        let state = broker
+            .order_state(&order.client_order_id)
+            .await
+            .unwrap()
+            .expect("回包明确拒绝：没成交，不是结果不明");
+        assert_eq!(state.order, order);
+        assert_eq!(state.status, OrderStatus::Rejected);
+        assert_eq!(state.filled_usdt, Decimal::ZERO);
+        assert!(state.venue_order_id.is_none());
+        assert!(
+            state
+                .reject_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("could not immediately match")),
+            "{:?}",
+            state.reject_reason
+        );
+        // 被拒不轮询：下单前 1 次 + order_state 1 次。
+        assert_eq!(mock.count("info:orderStatus"), 2);
+        // 快速下单（第一腿）被拒同样记下。
+        let mut first = sndk_buy();
+        first.client_order_id = ClientOrderId("live-2-buy-0".into());
+        broker.place_for_hedge(&first).await.unwrap_err();
+        let state = broker
+            .order_state(&first.client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, OrderStatus::Rejected);
+    }
+
+    /// 安全底线：回包没给出能用的结局（字段缺失、读不懂、根本没收到回包）时，查不到仍然是结果不明，
+    /// 绝不能当成没发出去或没成交。
+    #[tokio::test]
+    async fn without_a_usable_reply_an_unqueryable_order_stays_unknown() {
+        for reply in [
+            Some(json!({"filled":{"totalSz":"0.4926","oid":SNDK_OID}})),
+            Some(json!({"filled":{"totalSz":"0","avgPx":"1623.75","oid":SNDK_OID}})),
+            Some(json!({"resting":{"oid":SNDK_OID}})),
+        ] {
+            let mock = Mock::start(sndk_script(usize::MAX, reply.clone())).await;
+            let broker = mocked_broker(&mock);
+            let order = sndk_buy();
+            let err = broker.place(&order).await.unwrap_err();
+            assert!(
+                err.to_string().contains("not yet queryable"),
+                "{reply:?}: {err}"
+            );
+            let err = broker
+                .order_state(&order.client_order_id)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("no longer queryable"),
+                "{reply:?}: {err}"
+            );
+        }
+        // 下单请求本身没拿到回包（5xx）：同样是结果不明。
+        let lost = Mock::start(|path, body, nth| match (path, body["type"].as_str()) {
+            ("/exchange", _) => Reply::Json(502, json!({})),
+            _ => sndk_script(usize::MAX, None)(path, body, nth),
+        })
+        .await;
+        let broker = mocked_broker(&lost);
+        let order = sndk_buy();
+        broker.place(&order).await.unwrap_err();
+        let err = broker
+            .order_state(&order.client_order_id)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no longer queryable"), "{err}");
+    }
+
+    #[test]
+    fn the_provisional_fill_is_conservative_and_only_taken_from_a_fill_reply() {
+        let broker = test_broker(HyperliquidDex::Io, 2, true, Duration::from_secs(1));
+        let buy = sndk_buy();
+        let quantity = dec!(0.4926);
+        let limit = dec!(1623.8);
+        let state = |status: Value, order: &NewOrder, limit| {
+            broker
+                .provisional(order, &status, quantity, limit, 4)
+                .unwrap()
+        };
+        // 部分成交：IOC 剩下的已撤。
+        let partial = state(
+            json!({"filled":{"totalSz":"0.2","avgPx":"1623.8","oid":1}}),
+            &buy,
+            limit,
+        )
+        .unwrap();
+        assert_eq!(partial.status, OrderStatus::Cancelled);
+        assert_eq!(
+            partial.average_price,
+            Some(dec!(1623.8)),
+            "放一位也不越过限价"
+        );
+        // 卖单往下放，同样不越过限价。
+        let mut sell = sndk_buy();
+        sell.side = Side::Sell;
+        let sold = state(
+            json!({"filled":{"totalSz":"0.4926","avgPx":"1623.712","oid":1}}),
+            &sell,
+            dec!(1623.5),
+        )
+        .unwrap();
+        assert_eq!(sold.average_price, Some(dec!(1623.711)));
+        for status in [
+            json!({"resting":{"oid":1}}),
+            json!({"error":"no match"}),
+            json!({"filled":{"totalSz":"0.5","avgPx":"1623.8","oid":1}}),
+            json!({"filled":{"totalSz":"0.4926","avgPx":"0","oid":1}}),
+            json!({"filled":{"totalSz":"0.4926","avgPx":"1623.8"}}),
+        ] {
+            assert!(state(status.clone(), &buy, limit).is_none(), "{status}");
+        }
+
+        // 低价合约：回包 "5.36" 是去掉了末尾 0 的 5.3600，放一个 tick（0.0001），不是 0.01。
+        let mut near = sndk_buy();
+        near.limit_price = Some(dec!(5.3707));
+        let low = broker
+            .provisional(
+                &near,
+                &json!({"filled":{"totalSz":"149","avgPx":"5.36","oid":1}}),
+                dec!(149),
+                dec!(5.3707),
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(low.average_price, Some(dec!(5.3601)));
+        assert_eq!(tick_decimals(dec!(5.36), 1), 4);
+        assert_eq!(tick_decimals(dec!(1623.75), 4), 1);
+        assert_eq!(tick_decimals(dec!(0.012345), 0), 6);
+        assert_eq!(tick_decimals(dec!(0.012345), 2), 4);
+        assert_eq!(tick_decimals(dec!(123456), 0), 0);
+    }
+
+    /// 没人监听的本地端口：连接立刻被拒绝，证明这条路径确实去联网了，又不碰任何真实服务。
+    const DEAD_INFO: &str = "http://127.0.0.1:1/info";
+
+    fn live_test_asset(name: &str) -> Asset {
+        serde_json::from_value(json!({"name":name, "szDecimals":2, "maxLeverage":10})).unwrap()
+    }
+
+    #[tokio::test]
+    // 测试之间靠这把锁串行（实时顶档缓存是进程内全局的）；每个测试各有线程和运行时，不会死锁。
+    #[allow(clippy::await_holding_lock)]
+    async fn market_style_orders_are_priced_from_the_live_top_without_a_book_request() {
+        let _guard = arb_venues::live_book::test_lock();
+        let venue = Venue::Hyperliquid;
+        arb_venues::live_book::heartbeat(venue, std::time::Instant::now());
+        arb_venues::live_book::set_top(
+            venue,
+            "TESTBBO",
+            Some((dec!(99), dec!(5))),
+            Some((dec!(101), dec!(5))),
+            None,
+        );
+        let mut broker = test_broker(HyperliquidDex::Main, 0, true, Duration::from_secs(1));
+        broker.info_url = DEAD_INFO.to_string();
+        broker.options.market_slippage = Some(dec!(0.01));
+        let asset = live_test_asset("TESTBBO");
+        let mut buy = order();
+        buy.symbol = Symbol::perp("TESTBBO", "USDT");
+        buy.limit_price = None;
+        buy.side = Side::Buy;
+        // 买：对手方是卖一 101，上浮滑点上限 1% = 102.01（取整到合法价位）。
+        let price = broker.price(&buy, &asset).await.unwrap();
+        assert!(price >= dec!(101) && price <= dec!(102.01), "{price}");
+        let mut sell = buy.clone();
+        sell.side = Side::Sell;
+        // 卖：对手方是买一 99，下浮 1% = 98.01。
+        let price = broker.price(&sell, &asset).await.unwrap();
+        assert!(price >= dec!(98.01) && price <= dec!(99), "{price}");
+        // 显式限价永远优先于缓存。
+        let mut limit = buy.clone();
+        limit.limit_price = Some(dec!(100.5));
+        assert_eq!(broker.price(&limit, &asset).await.unwrap(), dec!(100.5));
+        arb_venues::live_book::remove_venue(venue);
+    }
+
+    #[tokio::test]
+    // 测试之间靠这把锁串行（实时顶档缓存是进程内全局的）；每个测试各有线程和运行时，不会死锁。
+    #[allow(clippy::await_holding_lock)]
+    async fn a_dead_connection_or_one_sided_top_falls_back_to_the_rest_book() {
+        let _guard = arb_venues::live_book::test_lock();
+        let mut broker = test_broker(HyperliquidDex::Main, 0, true, Duration::from_millis(300));
+        broker.info_url = DEAD_INFO.to_string();
+        broker.options.market_slippage = Some(dec!(0.01));
+        let venue = Venue::Hyperliquid;
+        let mut buy = order();
+        buy.limit_price = None;
+        buy.side = Side::Buy;
+        // 心跳太旧（连接静默死了）：顶档再「新」也不用。测试里 REST 连不上，走到 REST 就是 Err。
+        buy.symbol = Symbol::perp("TESTSTALE", "USDT");
+        arb_venues::live_book::set_top(
+            venue,
+            "TESTSTALE",
+            Some((dec!(99), dec!(5))),
+            Some((dec!(101), dec!(5))),
+            None,
+        );
+        arb_venues::live_book::heartbeat(
+            venue,
+            std::time::Instant::now() - Duration::from_secs(60),
+        );
+        assert!(
+            broker
+                .price(&buy, &live_test_asset("TESTSTALE"))
+                .await
+                .is_err()
+        );
+        // 买单要卖一，卖一那侧没有挂单：不用缓存。
+        arb_venues::live_book::heartbeat(venue, std::time::Instant::now());
+        buy.symbol = Symbol::perp("TESTONESIDE", "USDT");
+        arb_venues::live_book::set_top(venue, "TESTONESIDE", Some((dec!(99), dec!(5))), None, None);
+        assert!(
+            broker
+                .price(&buy, &live_test_asset("TESTONESIDE"))
+                .await
+                .is_err()
+        );
+        arb_venues::live_book::remove_venue(venue);
+    }
+
+    #[test]
+    fn a_new_verified_leverage_retires_the_older_one_of_the_same_coin_only() {
+        let broker = test_broker(HyperliquidDex::Main, 0, true, Duration::from_millis(300));
+        let key =
+            |coin: &str, leverage: u32| (coin.to_string(), leverage, crate::MarginMode::Isolated);
+        broker.mark_verified(key("BTC", 3));
+        broker.mark_verified(key("ETH", 3));
+        assert!(broker.verified_leverage.is_fresh(&key("BTC", 3)));
+        // BTC 改成 5x 并读回确认：BTC 的 3x 不能再算「核对过」（20 秒内又要 3x 必须重新去查、去改），ETH 不受影响。
+        broker.mark_verified(key("BTC", 5));
+        assert!(broker.verified_leverage.is_fresh(&key("BTC", 5)));
+        assert!(!broker.verified_leverage.is_fresh(&key("BTC", 3)));
+        assert!(broker.verified_leverage.is_fresh(&key("ETH", 3)));
     }
 }

@@ -10,7 +10,9 @@
 //!   contractSize is base per contract; priceUnit/volUnit/minVol define rounding.
 //! - <https://www.mexc.com/api-docs/futures/account-and-trading-endpoints/place-order>:
 //!   `/order/create`, type=3 IOC, openType=1 isolated / 2 cross, positionMode=2 one-way;
-//!   sides 1=open long, 2=close short, 3=open short, 4=close long.
+//!   sides 1=open long, 2=close short, 3=open short, 4=close long. In one-way mode a close is
+//!   side 1/3 with `reduceOnly:true`: side 2/4 together with `reduceOnly` is refused (2001,
+//!   probed 10-22), and MEXC itself rewrites side 2/4 to 1/3 + `reduceOnly:true`.
 //! - <https://www.mexc.com/api-docs/futures/account-and-trading-endpoints/get-order-by-external-id>
 //! - <https://www.mexc.com/api-docs/futures/account-and-trading-endpoints/get-order-information-by-order-id>
 //! - <https://www.mexc.com/api-docs/futures/account-and-trading-endpoints/get-trade-records-by-order-id>
@@ -46,24 +48,26 @@
 //! tests pin independently computed synthetic GET and POST HMAC fixtures.
 //! Requires serde_json's local `raw_value` feature to preserve numeric decimals.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arb_core::{ArbError, ArbResult, Decimal, Side, Symbol, Venue};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use crate::broker::{Broker, VenuePosition};
+use crate::broker::{Broker, FundingTotal, MarginOutcome, VenuePosition};
 use crate::live_common::{
-    JournalEntry, LiveOptions, OrderJournal, hex_lower, hmac_sha256, order_units, round_price,
-    transport_error, venue_client_id,
+    Cached, JournalEntry, LiveOptions, OrderJournal, Verified, hex_lower, hmac_sha256, order_units,
+    round_price, transport_error, venue_client_id,
 };
+use crate::settlement::{FillEffect, VenueFill};
 use crate::types::{ClientOrderId, NewOrder, OrderAck, OrderState, OrderStatus};
 
 const BASE: &str = "https://api.mexc.com";
@@ -72,15 +76,43 @@ const POSITION_MODE: &str = "/api/v1/private/position/position_mode";
 const POSITIONS: &str = "/api/v1/private/position/open_positions";
 const LEVERAGE: &str = "/api/v1/private/position/leverage";
 const CHANGE_LEVERAGE: &str = "/api/v1/private/position/change_leverage";
+/// <https://www.mexc.com/api-docs/futures/account-and-trading-endpoints/modify-position-margin>：
+/// `positionId`、`amount`、`type`（ADD / SUB），要「下单」权限，限频 20 次 / 2 秒，成功 `{"success":true,"code":0}`。
+const CHANGE_MARGIN: &str = "/api/v1/private/position/change_margin";
 const CREATE: &str = "/api/v1/private/order/create";
 const CANCEL: &str = "/api/v1/private/order/cancel";
 const OPEN_ORDERS: &str = "/api/v1/private/order/list/open_orders";
 const FEES: &str = "/api/v1/private/account/tiered_fee_rate/v2";
+const ASSET_USDT: &str = "/api/v1/private/account/asset/USDT";
+const FUNDING_RECORDS: &str = "/api/v1/private/position/funding_records";
+const ORDER_DEALS: &str = "/api/v1/private/order/list/order_deals";
+/// 成交明细读不到 / 对不上时，每次重读前等多久（共约 2 秒）。
+const DEAL_REREADS: [Duration; 3] = [
+    Duration::from_millis(300),
+    Duration::from_millis(600),
+    Duration::from_millis(1200),
+];
+
+/// 合约规格与标准名 10 分钟内不重读（找不到的合约再读一次）。规格整表约 1.2 MB、0.7 秒，原来每笔单都读。
+const CONTRACTS_TTL: Duration = Duration::from_secs(600);
+/// 停牌 / 休市判断要 1 分钟内的合约状态。
+const STATUS_TTL: Duration = Duration::from_secs(60);
+/// 目录刷新失败（限频 510、超时）时，规格与名字最多退回这么老的一份；停牌判断不退。
+const CATALOG_FALLBACK: Duration = Duration::from_secs(3600);
+/// 持仓模式、杠杆核对过后这么久内不再读：只省读，下单体里照样写死单向、保证金模式和杠杆，
+/// 回来的订单照样逐项核对。
+const SETTINGS_TTL: Duration = Duration::from_secs(20);
+/// 成交查询每段最长 30 天（2026-10-21 实测 89 天可以、100 天报 6003）。
+const DEALS_WINDOW_MS: i64 = 30 * 86_400_000;
+const HISTORY_PAGE: usize = 100;
+const HISTORY_MAX_PAGES: usize = 100;
 
 /// 文档标注为「稍后重试 / 结果未知」的码（<https://www.mexc.com/api-docs/futures/error-code>）：
 /// 500 内部错误、501 系统繁忙、510 请求过于频繁、513 无效请求、3016 下单超时。
 /// 这些必须先去交易所查询，绝不能当成拒单。
 const AMBIGUOUS_CODES: [i64; 5] = [500, 501, 510, 513, 3016];
+/// 510「请求过于频繁」：东京共用出口 IP 上实测出现过（见 `catalog`）。
+const CODE_TOO_FREQUENT: i64 = 510;
 
 /// Secrets intentionally implement neither Debug nor Serialize.
 pub struct MexcCredentials {
@@ -95,6 +127,49 @@ pub struct MexcBroker {
     journal: Mutex<OrderJournal>,
     clock_offset: i64,
     fee: Decimal,
+    /// 合约规格与标准名（见 [`Self::catalog`]）。
+    catalog: Cached<Arc<Catalog>>,
+    /// 刚核对过是单向持仓。
+    mode_ok: Verified<()>,
+    /// 刚核对过的杠杆：（合约名, positionType, openType, 杠杆）。
+    leverage_ok: Verified<(String, i64, i64, Decimal)>,
+}
+
+/// 合约规格（`/detail/country`）与标准名（[`arb_venues::mexc::fetch_bases`]：股票类按显示名里的代码，
+/// `NVIDIA_USDT` → `NVDA`；和扫描、价差监控同一套，台账、对账里的标的才对得上）。
+struct Catalog {
+    contracts: HashMap<String, Contract>,
+    names: HashMap<String, String>,
+}
+
+impl Catalog {
+    /// 合约名对应的标准标的；不是 USDT 线性永续、或合约名和 `baseCoin` 对不上（倍数合约之类）为 `None`。
+    fn symbol_of(&self, native: &str) -> Option<Symbol> {
+        let contract = self.contracts.get(native)?;
+        let base = native.strip_suffix("_USDT")?;
+        (contract.quote_coin == "USDT"
+            && contract.settle_coin == "USDT"
+            && contract.future_type == 1
+            && !base.is_empty()
+            && base == contract.base_coin)
+            .then_some(())?;
+        Some(Symbol::perp(self.names.get(native)?, "USDT"))
+    }
+
+    /// 标准标的对应的合约（一个都没有为 `None`，不止一个是错）。
+    fn find(&self, symbol: &Symbol) -> ArbResult<Option<Contract>> {
+        let mut matches = self
+            .contracts
+            .keys()
+            .filter(|native| self.symbol_of(native).as_ref() == Some(symbol));
+        let Some(native) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(err("ambiguous contract mapping"));
+        }
+        Ok(self.contracts.get(native).cloned())
+    }
 }
 
 impl MexcBroker {
@@ -121,6 +196,9 @@ impl MexcBroker {
             journal: Mutex::new(journal),
             clock_offset: 0,
             fee: Decimal::ZERO,
+            catalog: Cached::new(),
+            mode_ok: Verified::new(SETTINGS_TTL),
+            leverage_ok: Verified::new(SETTINGS_TTL),
         };
         let before = Utc::now().timestamp_millis();
         let started = Instant::now();
@@ -133,6 +211,7 @@ impl MexcBroker {
         broker.clock_offset = server - (before + Utc::now().timestamp_millis()) / 2;
         broker.check_mode().await?;
         let fees: Fees = broker.get(FEES, &[]).await?;
+        check_deduction(&fees)?;
         if fees.real_taker_fee.0 < Decimal::ZERO {
             return Err(err(
                 "negative account taker fee is unsupported for cost estimates",
@@ -203,6 +282,40 @@ impl MexcBroker {
         decode(data.get())
     }
 
+    /// A signed GET whose success may carry no `data`: MEXC's answer for an order it has no
+    /// record of (`get-order-by-external-id`).
+    async fn get_optional<T: DeserializeOwned>(&self, path: &str) -> ArbResult<Option<T>> {
+        let timestamp = (Utc::now().timestamp_millis() + self.clock_offset).to_string();
+        let signature = sign(
+            &self.credentials.api_secret,
+            &self.credentials.api_key,
+            &timestamp,
+            "",
+        );
+        let response = self
+            .client
+            .get(format!("{BASE}{path}"))
+            .timeout(Duration::from_secs(10))
+            .header("ApiKey", sensitive(&self.credentials.api_key)?)
+            .header("Request-Time", timestamp)
+            .header("Signature", sensitive(&signature)?)
+            .header("Recv-Window", "10")
+            .send()
+            .await
+            .map_err(|e| transport_error(Venue::Mexc, "MEXC request", e))?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| transport_error(Venue::Mexc, "MEXC response", e))?;
+        let envelope: Envelope = serde_json::from_slice(&bytes)
+            .map_err(|_| err(format!("HTTP {status}; invalid response envelope")))?;
+        if !status.is_success() || !envelope.success || envelope.code != 0 {
+            return Err(err(format!("HTTP {status}; API code {}", envelope.code)));
+        }
+        envelope.data.map(|data| decode(data.get())).transpose()
+    }
+
     async fn get<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -250,41 +363,80 @@ impl MexcBroker {
     }
 
     async fn check_mode(&self) -> ArbResult<()> {
+        if self.mode_ok.is_fresh(&()) {
+            return Ok(());
+        }
         let mode: PositionMode = self.get(POSITION_MODE, &[]).await?;
         if mode.value() != 2 {
             return Err(err(
                 "configure One-way position mode in MEXC UI first; broker never changes account-wide settings",
             ));
         }
+        self.mode_ok.mark(());
         Ok(())
     }
 
-    async fn contracts(&self) -> ArbResult<Vec<Contract>> {
-        self.get(CONTRACTS, &[]).await
-    }
-
-    async fn contract(&self, native: &str) -> ArbResult<Contract> {
-        let contract: Contract = self.get(CONTRACTS, &[("symbol", native.into())]).await?;
-        if contract.symbol != native {
-            return Err(err("contract metadata identity mismatch"));
+    /// 合约规格与标准名，不比 `max_age` 老。
+    async fn catalog(&self, max_age: Duration) -> ArbResult<Arc<Catalog>> {
+        if let Some(catalog) = self.catalog.get(max_age) {
+            return Ok(catalog);
         }
-        contract.validate_units()?;
-        Ok(contract)
+        let (rows, names) = tokio::join!(
+            self.get::<Vec<Contract>>(CONTRACTS, &[]),
+            arb_venues::mexc::fetch_bases(&self.client)
+        );
+        let catalog = Arc::new(Catalog {
+            contracts: rows?
+                .into_iter()
+                .map(|contract| (contract.symbol.clone(), contract))
+                .collect(),
+            names: names?,
+        });
+        self.catalog.put(Arc::clone(&catalog));
+        Ok(catalog)
     }
 
+    /// 规格目录；刷新失败时退回 [`CATALOG_FALLBACK`] 内的上一份：规格和名字很少变，不能因为一次
+    /// 限频让持仓、挂单、对账整家失败（和扫描器共用东京的 IP，510 实测出现过）。
+    async fn catalog_lenient(&self, max_age: Duration) -> ArbResult<Arc<Catalog>> {
+        match self.catalog(max_age).await {
+            Ok(catalog) => Ok(catalog),
+            Err(error) => match self.catalog.get(CATALOG_FALLBACK) {
+                Some(catalog) => {
+                    tracing::warn!(%error, "MEXC 合约目录刷新失败，沿用一小时内的上一份");
+                    Ok(catalog)
+                }
+                None => Err(error),
+            },
+        }
+    }
+
+    /// 合约名对应的规格和标准标的（缓存里没有就重读一次）。
+    async fn contract(&self, native: &str) -> ArbResult<(Contract, Option<Symbol>)> {
+        for max_age in [CONTRACTS_TTL, Duration::ZERO] {
+            let catalog = self.catalog_lenient(max_age).await?;
+            if let Some(contract) = catalog.contracts.get(native) {
+                contract.validate_units()?;
+                return Ok((contract.clone(), catalog.symbol_of(native)));
+            }
+        }
+        Err(err("contract metadata missing"))
+    }
+
+    /// 标准标的对应的合约，不看状态（查历史用；缓存里没有就重读一次）。
+    async fn find(&self, symbol: &Symbol) -> ArbResult<Contract> {
+        for max_age in [CONTRACTS_TTL, Duration::ZERO] {
+            if let Some(contract) = self.catalog_lenient(max_age).await?.find(symbol)? {
+                contract.validate_units()?;
+                return Ok(contract);
+            }
+        }
+        Err(err("no matching USDT linear perpetual metadata"))
+    }
+
+    /// 下单用的合约：要在交易、允许 API 下单。
     async fn resolve(&self, symbol: &Symbol) -> ArbResult<Contract> {
-        let mut matches = self
-            .contracts()
-            .await?
-            .into_iter()
-            .filter(|c| c.scanner_symbol().as_ref() == Some(symbol));
-        let contract = matches
-            .next()
-            .ok_or_else(|| err("no matching USDT linear perpetual metadata"))?;
-        if matches.next().is_some() {
-            return Err(err("ambiguous contract mapping"));
-        }
-        contract.validate_units()?;
+        let contract = self.find(symbol).await?;
         if contract.state != 0
             || !contract.api_allowed
             || !matches!(contract.position_open_type, 1..=3)
@@ -306,10 +458,7 @@ impl MexcBroker {
                 )
                 .await?;
             let now = Utc::now().timestamp_millis() + self.clock_offset;
-            if started.elapsed() > Duration::from_secs(2)
-                || now - book.timestamp > 5000
-                || book.timestamp > now + 1000
-            {
+            if !book_fresh(now, book.timestamp, started.elapsed()) {
                 return Err(err("stale order book"));
             }
             let best = |rows: &[Vec<Number>], buy: bool| -> ArbResult<Decimal> {
@@ -347,6 +496,20 @@ impl MexcBroker {
         Ok(rows)
     }
 
+    /// 这个合约这一边（`kind`）现在是不是已经是这个保证金模式和杠杆。
+    async fn leverage_in_force(
+        &self,
+        native: &str,
+        kind: i64,
+        open_type: i64,
+        leverage: Decimal,
+    ) -> ArbResult<bool> {
+        let rows: Vec<Leverage> = self.get(LEVERAGE, &[("symbol", native.into())]).await?;
+        Ok(leverage_matches(&rows, kind, open_type, leverage))
+    }
+
+    /// 设好这一边的保证金模式和杠杆。先读：已经是了就不写（刚核对过的 20 秒内连读都省）；
+    /// 写了就读回核对，对不上不下单。
     async fn configure(
         &self,
         contract: &Contract,
@@ -359,6 +522,17 @@ impl MexcBroker {
             return Err(err("合约不支持所选保证金模式"));
         }
         let kind = if side == Side::Buy { 1 } else { 2 };
+        let key = (contract.symbol.clone(), kind, open_type, leverage);
+        if self.leverage_ok.is_fresh(&key) {
+            return Ok(());
+        }
+        if self
+            .leverage_in_force(&contract.symbol, kind, open_type, leverage)
+            .await?
+        {
+            self.leverage_ok.mark(key);
+            return Ok(());
+        }
         let positions = self.raw_positions().await?;
         let position = positions
             .iter()
@@ -380,31 +554,25 @@ impl MexcBroker {
             )
         };
         self.post(CHANGE_LEVERAGE, body).await?;
-        let rows: Vec<Leverage> = self
-            .get(LEVERAGE, &[("symbol", contract.symbol.clone())])
-            .await?;
-        let mut matches = rows
-            .iter()
-            .filter(|row| row.position_type == kind && row.open_type == open_type);
-        let row = matches
-            .next()
-            .ok_or_else(|| err("missing leverage readback"))?;
-        if matches.next().is_some() || row.open_type != open_type || row.leverage.0 != leverage {
+        if !self
+            .leverage_in_force(&contract.symbol, kind, open_type, leverage)
+            .await?
+        {
             return Err(err(
                 "selected margin mode/leverage readback mismatch; no order submitted",
             ));
         }
+        self.leverage_ok.mark(key);
         Ok(())
     }
 
-    async fn remote(&self, entry: &JournalEntry) -> ArbResult<RemoteOrder> {
-        self.get(
-            &format!(
-                "/api/v1/private/order/external/{}/{}",
-                entry.instrument, entry.venue_client_id
-            ),
-            &[],
-        )
+    /// The order behind a reserved ID; `None` = MEXC has no record of it. Orders it did create
+    /// stay queryable here, even an IOC cancelled with nothing filled (probed 10-22).
+    async fn remote(&self, entry: &JournalEntry) -> ArbResult<Option<RemoteOrder>> {
+        self.get_optional(&format!(
+            "/api/v1/private/order/external/{}/{}",
+            entry.instrument, entry.venue_client_id
+        ))
         .await
     }
 
@@ -424,15 +592,30 @@ impl MexcBroker {
         row: RemoteOrder,
         entry: Option<&JournalEntry>,
         contract: &Contract,
+        symbol: Option<&Symbol>,
     ) -> ArbResult<OrderState> {
-        let order = verified_order(&row, entry, contract)?;
-        let deals: Vec<Deal> = self
-            .get(
-                &format!("/api/v1/private/order/deal_details/{}", row.order_id),
-                &[],
-            )
-            .await?;
-        let (filled, notional, fees) = aggregate(&deals, &row, contract.contract_size.0)?;
+        let order = verified_order(&row, entry, contract, symbol)?;
+        // 订单已成交、成交明细还没出齐（数量对不上）或这一次没读到：隔一会儿再读，几次都不行才报「不明」。
+        // 以前读一次失败就让整张单「结果不明」，开仓 / 平仓跟着中断。
+        let mut attempt = 0;
+        let (filled, notional, fees) = loop {
+            let read = self
+                .get::<Vec<Deal>>(
+                    &format!("/api/v1/private/order/deal_details/{}", row.order_id),
+                    &[],
+                )
+                .await
+                .and_then(|deals| aggregate(&deals, &row, contract.contract_size.0));
+            match read {
+                Ok(totals) => break totals,
+                Err(error) if attempt < DEAL_REREADS.len() => {
+                    tracing::debug!(order = %row.order_id, %error, "MEXC 成交明细还没对上，稍后再读");
+                    tokio::time::sleep(DEAL_REREADS[attempt]).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let status = map_status(row.state, row.vol.0, row.deal_vol.0)?;
         Ok(OrderState {
             order,
@@ -445,6 +628,7 @@ impl MexcBroker {
                 Some(divide(notional, filled)?)
             },
             fee_usdt: fees,
+            fee_estimated: false,
             reject_reason: (status == OrderStatus::Rejected)
                 .then(|| format!("MEXC errorCode={}", row.error_code)),
         })
@@ -462,9 +646,13 @@ impl MexcBroker {
             return Ok(Some(state));
         }
         // Never map missing/expired remote history to None for a durable intent.
-        let row = self.remote(&entry).await?;
-        let contract = self.contract(&entry.instrument).await?;
-        let state = self.state(row, Some(&entry), &contract).await?;
+        let row = self.remote(&entry).await?.ok_or_else(|| {
+            err("MEXC has no order for this reserved ID (refused, or not visible yet); reconcile")
+        })?;
+        let (contract, symbol) = self.contract(&entry.instrument).await?;
+        let state = self
+            .state(row, Some(&entry), &contract, symbol.as_ref())
+            .await?;
         if !state.status.is_live() {
             journal.record_terminal(&state)?;
         }
@@ -526,7 +714,179 @@ impl Broker for MexcBroker {
         self.fee
     }
 
+    fn supports_add_margin(&self) -> bool {
+        true
+    }
+
+    /// 下单按 [`order_units`] 把标的数量换成张数、向下取整到 `volUnit` 张：标的数量的步长 = 每张面值 × `volUnit`。
+    async fn quantity_step(&self, symbol: &Symbol) -> ArbResult<Option<Decimal>> {
+        let contract = self.resolve(symbol).await?;
+        quantity_step_of(&contract).map(Some)
+    }
+
+    /// `change_margin`（`type=ADD`）往这个合约已有的逐仓持仓补保证金。最多发一次请求、绝不重试：没有幂等键，
+    /// 重发会补两次。请求发出之前的任何失败（只读模式、没有持仓、不是逐仓……）都是 `Err`，没动钱。
+    async fn add_margin(&self, symbol: &Symbol, amount_usdt: Decimal) -> ArbResult<MarginOutcome> {
+        self.options.authorize(Venue::Mexc)?;
+        let _guard = self.journal.lock().await;
+        let contract = self.resolve(symbol).await?;
+        let body = add_margin_body(&self.raw_positions().await?, &contract.symbol, amount_usdt)?;
+        Ok(margin_outcome(self.post(CHANGE_MARGIN, body).await))
+    }
+
+    /// 开仓前预热：合约规格、持仓模式、杠杆读一遍（只读）；已经是目标杠杆的记下来，紧接着的下单不用再读。
+    async fn warm_reads(&self, symbol: &Symbol, leverage: Option<Decimal>) -> ArbResult<()> {
+        let contract = self.resolve(symbol).await?;
+        self.check_mode().await?;
+        // 杠杆不合法由准备那一步拒，这里不管。
+        let Some(leverage) = leverage
+            .and_then(|value| crate::margin::leverage(Venue::Mexc, Some(value)).ok())
+            .filter(|value| *value >= contract.min_leverage.0 && *value <= contract.max_leverage.0)
+        else {
+            return Ok(());
+        };
+        let rows: Vec<Leverage> = self
+            .get(LEVERAGE, &[("symbol", contract.symbol.clone())])
+            .await?;
+        for row in &rows {
+            if leverage_matches(&rows, row.position_type, row.open_type, leverage) {
+                self.leverage_ok.mark((
+                    contract.symbol.clone(),
+                    row.position_type,
+                    row.open_type,
+                    leverage,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 停牌（`state` 不是 0）或不许 API 下单。
+    ///
+    /// 股票 / 商品类合约**周末照常交易**，不按美股休市挡：2026-10-24 12:00 至 10-26 12:00 UTC 每 3 分钟记录
+    /// NVIDIA、AAPL、TESLA、某合约、QQQ、某合约、XAU（95 上 `bgweekend/mexc-weekend.jsonl`），整个周末 `state` 0、
+    /// `apiAllowed` true，盘口与指数价一直在动，买卖价差 0.1～7bp。和 Bitget（周末真停）不同。
+    async fn trading_halted(
+        &self,
+        symbol: &Symbol,
+        reduce_only: bool,
+    ) -> ArbResult<Option<String>> {
+        let _ = reduce_only;
+        let Some(contract) = self.catalog(STATUS_TTL).await?.find(symbol)? else {
+            return Ok(Some(format!("MEXC 合约列表里没有 {}", symbol.base)));
+        };
+        if contract.state != 0 || !contract.api_allowed {
+            return Ok(Some(format!(
+                "MEXC {} 现在不能交易（state {}，API 下单{}）",
+                contract.symbol,
+                contract.state,
+                if contract.api_allowed {
+                    "允许"
+                } else {
+                    "不允许"
+                }
+            )));
+        }
+        Ok(None)
+    }
+
+    /// USDT 可开仓余额（`availableOpen`）。
+    async fn free_collateral(&self) -> ArbResult<Option<Decimal>> {
+        let asset: Asset = self.get(ASSET_USDT, &[]).await?;
+        if asset.currency != "USDT" {
+            return Err(err("asset currency mismatch"));
+        }
+        Ok(Some(asset.available_open.0.max(Decimal::ZERO)))
+    }
+
+    /// 这个合约 `since` 起实际结算的资金费（按合约分页查，正 = 收到）。
+    async fn funding_since(
+        &self,
+        symbol: &Symbol,
+        since: DateTime<Utc>,
+    ) -> ArbResult<Option<FundingTotal>> {
+        let native = self.find(symbol).await?.symbol;
+        let start = since.timestamp_millis();
+        let mut rows = Vec::new();
+        let mut seen = HashSet::new();
+        for page in 1..=HISTORY_MAX_PAGES {
+            let reply: FundingPage = self
+                .get(
+                    FUNDING_RECORDS,
+                    &[
+                        ("symbol", native.clone()),
+                        ("page_num", page.to_string()),
+                        ("page_size", HISTORY_PAGE.to_string()),
+                    ],
+                )
+                .await?;
+            let (entries, done) = funding_page(&reply, &native, start, page)?;
+            for (id, at, amount) in entries {
+                if seen.insert(id) {
+                    rows.push((at, amount));
+                }
+            }
+            if done {
+                return Ok(Some(FundingTotal::from_rows(rows, since)));
+            }
+        }
+        Err(err(
+            "funding history needs more pages than allowed; refusing a partial total",
+        ))
+    }
+
+    /// 这个合约 `[since, until]` 的成交（30 天一段，每段翻到最后一页）。
+    async fn fills_between(
+        &self,
+        symbol: &Symbol,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> ArbResult<Option<Vec<VenueFill>>> {
+        let contract = self.find(symbol).await?;
+        let (start, end) = (since.timestamp_millis(), until.timestamp_millis());
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut from = start;
+        while from <= end {
+            let to = from.saturating_add(DEALS_WINDOW_MS - 1).min(end);
+            let mut page = 1;
+            loop {
+                let rows: Vec<Deal> = self
+                    .get(
+                        ORDER_DEALS,
+                        &[
+                            ("symbol", contract.symbol.clone()),
+                            ("start_time", from.to_string()),
+                            ("end_time", to.to_string()),
+                            ("page_num", page.to_string()),
+                            ("page_size", HISTORY_PAGE.to_string()),
+                        ],
+                    )
+                    .await?;
+                let full = rows.len() >= HISTORY_PAGE;
+                for deal in &rows {
+                    if seen.insert(deal.id.clone()) {
+                        out.push(venue_fill(deal, &contract)?);
+                    }
+                }
+                if !full {
+                    break;
+                }
+                if page >= HISTORY_MAX_PAGES {
+                    return Err(err(
+                        "fill history needs more pages than allowed; refusing a partial history",
+                    ));
+                }
+                page += 1;
+            }
+            from = to + 1;
+        }
+        out.sort_by_key(|fill| fill.at);
+        Ok(Some(out))
+    }
+
     async fn place(&self, order: &NewOrder) -> ArbResult<OrderAck> {
+        crate::broker::refuse_post_only(order)?;
         self.options.authorize(Venue::Mexc)?;
         if order.venue != Venue::Mexc
             || order.client_order_id.0.is_empty()
@@ -622,7 +982,7 @@ impl Broker for MexcBroker {
         let body = format!(
             "{{\"symbol\":{},\"price\":{price},\"vol\":{units},\"side\":{},\"type\":3,\"openType\":{open_type},\"positionMode\":2,\"reduceOnly\":{},\"externalOid\":{}{}{}}}",
             quote(&contract.symbol)?,
-            side_code(order.side, order.reduce_only),
+            side_code(order.side),
             order.reduce_only,
             quote(&entry.venue_client_id)?,
             leverage
@@ -640,32 +1000,66 @@ impl Broker for MexcBroker {
             && let Ok(created) = decode::<Created>(data.get())
             && let Ok(row) = self.by_id(&created.order_id).await
         {
-            let state = self.state(row, Some(&entry), &contract).await?;
+            let state = self
+                .state(row, Some(&entry), &contract, Some(&order.symbol))
+                .await?;
             if !state.status.is_live() {
                 journal.record_terminal(&state)?;
             }
             return ack(&state);
         }
+        if let Err(failure) = &submission {
+            // The executor only reports the read-back after this, so the venue's own answer is
+            // logged here (codes only, see `classify_write`).
+            let failure = match failure {
+                WriteError::Api { message, .. } => message.clone(),
+                WriteError::Unknown(error) | WriteError::Throttled(error) => error.to_string(),
+            };
+            tracing::warn!(order = %order.client_order_id, %failure, "MEXC 下单请求没被接受，读回核实");
+        }
+        // Every poll answering "no such order" proves the venue never created it.
+        let mut absent = true;
         for attempt in 0..10 {
             if attempt != 0 {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            if let Ok(row) = self.remote(&entry).await {
-                let state = self.state(row, Some(&entry), &contract).await?;
-                if !state.status.is_live() {
-                    journal.record_terminal(&state)?;
+            match self.remote(&entry).await {
+                Ok(Some(row)) => {
+                    let state = self
+                        .state(row, Some(&entry), &contract, Some(&order.symbol))
+                        .await?;
+                    if !state.status.is_live() {
+                        journal.record_terminal(&state)?;
+                    }
+                    return ack(&state);
                 }
-                return ack(&state);
+                Ok(None) => {}
+                Err(_) => absent = false,
             }
         }
         match submission {
             Ok(_) => Err(err(
                 "submitted order not queryable; durable intent retained, do not resubmit",
             )),
-            Err(WriteError::Api { code, message }) => {
-                Err(settle_failure(&mut journal, order, Some(code), message)?)
-            }
+            Err(WriteError::Api { code, message }) => Err(settle_failure(
+                &mut journal,
+                order,
+                Some(code),
+                absent,
+                message,
+            )?),
             Err(WriteError::Unknown(error)) => Err(error),
+            // 被限频、随后 10 次读回每次都查无此单：交易所没建这张单，记成拒单。以前一律当结果不明，
+            // 订单号从此永远查不到、不得重发，做第二腿时第一腿就一直裸着。读回出过错（`absent` 为假）不下结论。
+            Err(WriteError::Throttled(error)) => {
+                if absent {
+                    let mut rejected = OrderState::new(order.clone());
+                    rejected.status = OrderStatus::Rejected;
+                    rejected.reject_reason = Some(format!("{error}; never created on the venue"));
+                    journal.record_terminal(&rejected)?;
+                }
+                Err(error)
+            }
         }
     }
 
@@ -688,8 +1082,10 @@ impl Broker for MexcBroker {
             return Err(err("cancel not confirmed; order remains live"));
         }
         if let Some(entry) = journal.by_venue_client_id(&after.external_oid).cloned() {
-            let contract = self.contract(&after.symbol).await?;
-            let state = self.state(after, Some(&entry), &contract).await?;
+            let (contract, symbol) = self.contract(&after.symbol).await?;
+            let state = self
+                .state(after, Some(&entry), &contract, symbol.as_ref())
+                .await?;
             journal.record_terminal(&state)?;
         }
         Ok(())
@@ -716,17 +1112,19 @@ impl Broker for MexcBroker {
                 if !row.symbol.ends_with("_USDT") {
                     continue;
                 }
-                let contract = self.contract(&row.symbol).await?;
-                if contract.scanner_symbol().is_none() {
+                let (contract, symbol) = self.contract(&row.symbol).await?;
+                let Some(symbol) = symbol else {
                     continue;
-                }
+                };
                 let entry = self
                     .journal
                     .lock()
                     .await
                     .by_venue_client_id(&row.external_oid)
                     .cloned();
-                let state = self.state(row, entry.as_ref(), &contract).await?;
+                let state = self
+                    .state(row, entry.as_ref(), &contract, Some(&symbol))
+                    .await?;
                 if state.status.is_live() {
                     states.push(state);
                 }
@@ -747,8 +1145,8 @@ impl Broker for MexcBroker {
             if row.hold_vol.0 == Decimal::ZERO {
                 continue;
             }
-            let contract = self.contract(&row.symbol).await?;
-            let symbol = contract.scanner_symbol().ok_or_else(|| {
+            let (contract, symbol) = self.contract(&row.symbol).await?;
+            let symbol = symbol.ok_or_else(|| {
                 err("nonzero unsupported position; reconcile outside this broker")
             })?;
             if row.hold_avg_price.0 <= Decimal::ZERO {
@@ -786,15 +1184,18 @@ fn decode<T: DeserializeOwned>(raw: &str) -> ArbResult<T> {
 enum WriteError {
     /// 响应可解析且 `success=false` / `code!=0`：`code` 是结构化的交易所业务码。
     Api { code: i64, message: String },
-    /// 传输失败、超时、HTTP 5xx/429、无法解析的响应：结果未知，绝不能记成拒单。
+    /// 传输失败、超时、HTTP 5xx、无法解析的响应：结果未知，绝不能记成拒单。
     Unknown(ArbError),
+    /// 限频（HTTP 429、业务码 510「请求过于频繁」）：多半没被受理，但单凭回包不能下结论；
+    /// 下单路径只在随后的读回**每次都查无此单**时才记成拒单（见 `place`）。其余调用方按 `Unknown` 对待。
+    Throttled(ArbError),
 }
 
 impl From<WriteError> for ArbError {
     fn from(failure: WriteError) -> Self {
         match failure {
             WriteError::Api { message, .. } => err(message),
-            WriteError::Unknown(error) => error,
+            WriteError::Unknown(error) | WriteError::Throttled(error) => error,
         }
     }
 }
@@ -802,8 +1203,69 @@ impl From<WriteError> for ArbError {
 /// 解析写请求的响应。文档 place-order：失败时 `success=false` 且 `data=null`
 /// （<https://www.mexc.com/api-docs/futures/account-and-trading-endpoints/place-order>）。
 /// 429/5xx 与 [`AMBIGUOUS_CODES`] 一律归为「结果未知」，交给操作者按日志对账。
+/// 公开盘口（`contract/depth`）的 `timestamp` 最多落后多久还算新鲜。它是服务端快照的生成时刻，不是我们收到的时刻：
+/// 2026-10-26 实测快照每 5～6 秒才换一次，NVIDIA 这种活跃合约也会落后 5.4 秒。原来卡 5 秒，没带限价的单（平仓单）
+/// 就会随机被自己拒掉（0G 往返的第一张平仓单「stale order book」，规则轮一分钟后重试才平掉，期间一条腿裸着）。
+const DEPTH_MAX_AGE_MS: i64 = 15_000;
+
+/// 拉来定保护价的盘口能不能用：请求本身不超过 2 秒，快照不比 [`DEPTH_MAX_AGE_MS`] 更旧，也不在未来。
+fn book_fresh(now_ms: i64, book_ms: i64, elapsed: Duration) -> bool {
+    elapsed <= Duration::from_secs(2)
+        && now_ms - book_ms <= DEPTH_MAX_AGE_MS
+        && book_ms <= now_ms + 1000
+}
+
+/// 标的数量的下单步长（见 [`Broker::quantity_step`]）。
+fn quantity_step_of(contract: &Contract) -> ArbResult<Decimal> {
+    contract.validate_units()?;
+    multiply(contract.contract_size.0, contract.vol_unit.0)
+}
+
+/// 补保证金的请求体：这个合约上正在持有的那一笔逐仓仓位（单向持仓下只有一笔）。
+fn add_margin_body(rows: &[Position], native: &str, amount: Decimal) -> ArbResult<String> {
+    let amount = crate::bitget_broker::margin_amount_text(amount)?;
+    let held: Vec<&Position> = rows
+        .iter()
+        .filter(|p| p.symbol == native && p.hold_vol.0 > Decimal::ZERO)
+        .collect();
+    let [position] = held.as_slice() else {
+        return Err(err(if held.is_empty() {
+            "no open position to add margin to"
+        } else {
+            "more than one position on this contract; reconcile first"
+        }));
+    };
+    if position.open_type != 1 {
+        return Err(err("margin can only be added to an isolated position"));
+    }
+    if position.state != 1 {
+        return Err(err("position is not in normal holding state"));
+    }
+    Ok(format!(
+        "{{\"positionId\":{},\"amount\":{amount},\"type\":\"ADD\"}}",
+        position.position_id
+    ))
+}
+
+/// 补保证金请求发出之后的结局：交易所明确拒绝（业务码）没动钱；传输失败、超时、5xx、「稍后重试」类的码
+/// 都可能已经到账。
+fn margin_outcome(result: Result<Box<RawValue>, WriteError>) -> MarginOutcome {
+    match result {
+        Ok(_) => MarginOutcome::Applied,
+        Err(WriteError::Api { message, .. }) => MarginOutcome::Refused(message),
+        Err(WriteError::Unknown(error) | WriteError::Throttled(error)) => MarginOutcome::Unknown(
+            format!("{error}; the request may have arrived and the margin may have been added"),
+        ),
+    }
+}
+
 fn classify_write(status: StatusCode, bytes: &[u8]) -> Result<Box<RawValue>, WriteError> {
-    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Err(WriteError::Throttled(err(format!(
+            "HTTP {status}; rate limited; reconcile intent"
+        ))));
+    }
+    if status.is_server_error() {
         // 请求可能已经落到交易所：不能当成拒单。
         return Err(WriteError::Unknown(err(format!(
             "HTTP {status}; outcome unknown; reconcile intent"
@@ -827,6 +1289,9 @@ fn classify_write(status: StatusCode, bytes: &[u8]) -> Result<Box<RawValue>, Wri
     }
     // Codes only: even an error message could contain reflected credentials.
     let message = format!("HTTP {status}; API code {}", envelope.code);
+    if envelope.code == CODE_TOO_FREQUENT {
+        return Err(WriteError::Throttled(err(message)));
+    }
     if AMBIGUOUS_CODES.contains(&envelope.code) {
         return Err(WriteError::Unknown(err(message)));
     }
@@ -837,23 +1302,27 @@ fn classify_write(status: StatusCode, bytes: &[u8]) -> Result<Box<RawValue>, Wri
 }
 
 /// 文档明确列为「下单前拒绝」的业务码
-/// （<https://www.mexc.com/api-docs/futures/error-code>）：2005 余额不足、
+/// （<https://www.mexc.com/api-docs/futures/error-code>）：2001 订单方向错误、2005 余额不足、
 /// 2011 下单数量错误、2015 价格/数量精度错误、2028 超过单笔最大数量、
-/// 2070 价格与 bid1/ask1 距离超过 5%。其余码结果未知，必须保留未决意图。
+/// 2070 价格与 bid1/ask1 距离超过 5%。其余码要靠读回确认没建单（见 [`settle_failure`]）。
 fn definitive_rejection(code: i64) -> bool {
-    matches!(code, 2005 | 2011 | 2015 | 2028 | 2070)
+    matches!(code, 2001 | 2005 | 2011 | 2015 | 2028 | 2070)
 }
 
-/// 提交失败后的统一收尾（`place` 调用）：只有明确的业务拒单才记终态 `Rejected`，
-/// 之后 `order_state` 如实返回；其余情况不写日志，意图保持未决等待对账。
+/// 提交失败后的统一收尾（`place` 调用）：明确的业务拒单，或业务码报错且按外部单号
+/// 每次都查无此单（`absent`，交易所建过的单哪怕 0 成交撤掉也查得到），记终态 `Rejected`，
+/// 之后 `order_state` 如实返回、下一轮可以重发；其余情况意图保持未决等待对账。
+/// 某次实盘：平仓单被 2001 拒、不在白名单里，意图未决，规则每轮「上一张退出单读不到、
+/// 本轮不重发」卡住。
 fn settle_failure(
     journal: &mut OrderJournal,
     order: &NewOrder,
     code: Option<i64>,
+    absent: bool,
     message: String,
 ) -> ArbResult<ArbError> {
     if let Some(code) = code
-        && definitive_rejection(code)
+        && (definitive_rejection(code) || absent)
     {
         let mut rejected = OrderState::new(order.clone());
         rejected.status = OrderStatus::Rejected;
@@ -934,12 +1403,20 @@ fn validate_id(id: &str) -> ArbResult<()> {
     }
     Ok(())
 }
-fn side_code(side: Side, reduce: bool) -> i64 {
-    match (side, reduce) {
-        (Side::Buy, false) => 1,
-        (Side::Buy, true) => 2,
-        (Side::Sell, false) => 3,
-        (Side::Sell, true) => 4,
+/// One-way mode: buy 1, sell 3; reduce-only travels in `reduceOnly` (see the module docs).
+fn side_code(side: Side) -> i64 {
+    match side {
+        Side::Buy => 1,
+        Side::Sell => 3,
+    }
+}
+
+/// Direction of an order/deal side code; 2/4 are the hedge-mode closes.
+fn side_of(code: i64) -> ArbResult<Side> {
+    match code {
+        1 | 2 => Ok(Side::Buy),
+        3 | 4 => Ok(Side::Sell),
+        _ => Err(err("unknown order side")),
     }
 }
 fn map_status(code: i64, requested: Decimal, filled: Decimal) -> ArbResult<OrderStatus> {
@@ -979,37 +1456,35 @@ fn ack(state: &OrderState) -> ArbResult<OrderAck> {
             .ok_or_else(|| err("missing venue order ID"))?,
     })
 }
+/// `symbol` 是合约的标准标的（[`Catalog::symbol_of`]）；`None` = 不支持的合约。
 fn verified_order(
     row: &RemoteOrder,
     entry: Option<&JournalEntry>,
     c: &Contract,
+    symbol: Option<&Symbol>,
 ) -> ArbResult<NewOrder> {
     validate_id(&row.order_id)?;
     if row.symbol != c.symbol {
         return Err(err("order contract mismatch"));
     }
-    let symbol = c
-        .scanner_symbol()
+    let symbol = symbol
+        .cloned()
         .ok_or_else(|| err("unsupported order contract"))?;
-    let side = match row.side {
-        1 | 2 => Side::Buy,
-        3 | 4 => Side::Sell,
-        _ => return Err(err("unknown order side")),
-    };
+    let side = side_of(row.side)?;
     if let Some(e) = entry {
         if e.instrument != row.symbol
             || e.venue_client_id != row.external_oid
             || e.units != row.vol.0
             || e.order.symbol != symbol
-            || side_code(e.order.side, e.order.reduce_only) != row.side
+            || side != e.order.side
             || row.open_type != if e.order.margin_mode.is_cross() { 2 } else { 1 }
             || row.position_mode != 2
             || row.order_type != 3
-            // 两个单笔查询端点（get-order-by-external-id、get-order-information-by-order-id，
-            // https://www.mexc.com/api-docs/futures/account-and-trading-endpoints/）的文档与
-            // 示例都没有 reduceOnly 字段。因此缺失视为未知（接受），只有明确返回 false 才是冲突；
-            // side 编码 1-4 + positionId + units + externalOid 已经把意图锁死。
-            || (e.order.reduce_only && row.reduce_only == Some(false))
+            // 单向持仓下买卖都只回 1/3，只减仓看 reduceOnly：两个单笔查询端点文档示例没有
+            // 这个字段，但 10-22 实测都会返回（开仓 false、平仓 true）。缺失按未知接受，
+            // 明确返回且与意图不符才是冲突；2/4 只可能是平仓。
+            || row.reduce_only.is_some_and(|reduce| reduce != e.order.reduce_only)
+            || (matches!(row.side, 2 | 4) && !e.order.reduce_only)
         {
             return Err(err(
                 "remote order does not match intent/margin mode/one-way mode; reconcile exposure",
@@ -1022,6 +1497,7 @@ fn verified_order(
     }
     let quantity = multiply(row.vol.0, c.contract_size.0)?;
     Ok(NewOrder {
+        post_only: false,
         margin_mode: if row.open_type == 2 {
             crate::MarginMode::Cross
         } else {
@@ -1052,7 +1528,8 @@ fn aggregate(
     for fill in deals {
         if fill.order_id != row.order_id
             || fill.symbol != row.symbol
-            || fill.side != row.side
+            // 平仓单的成交可能记成 1/3 也可能记成 2/4：只核方向。
+            || side_of(fill.side)? != side_of(row.side)?
             || !ids.insert(&fill.id)
             || fill.fee_currency != "USDT"
             || fill.vol.0 <= Decimal::ZERO
@@ -1095,6 +1572,80 @@ fn validate_positions(rows: &[Position]) -> ArbResult<()> {
     Ok(())
 }
 
+/// 这一边（`kind`：1 多 / 2 空）恰好有一行、是这个保证金模式（`open_type`：1 逐仓 / 2 全仓）和杠杆。
+fn leverage_matches(rows: &[Leverage], kind: i64, open_type: i64, leverage: Decimal) -> bool {
+    let mut side = rows.iter().filter(|row| row.position_type == kind);
+    match (side.next(), side.next()) {
+        (Some(row), None) => row.open_type == open_type && row.leverage.0 == leverage,
+        _ => false,
+    }
+}
+
+fn millis(at: i64) -> ArbResult<DateTime<Utc>> {
+    DateTime::from_timestamp_millis(at).ok_or_else(|| err("invalid timestamp"))
+}
+
+/// 一条资金费流水：（id, 结算时间, 金额）。
+type FundingEntry = (String, DateTime<Utc>, Decimal);
+
+/// 一页资金费流水与是否读完。按结算时间从新到旧排时，这一页最早的已早于 `start`
+/// 就不必再往后翻；顺序对不上就一直翻到最后一页。
+fn funding_page(
+    reply: &FundingPage,
+    native: &str,
+    start: i64,
+    page: usize,
+) -> ArbResult<(Vec<FundingEntry>, bool)> {
+    let mut rows = Vec::with_capacity(reply.result_list.len());
+    for record in &reply.result_list {
+        if record.symbol != native {
+            return Err(err("funding record for another contract"));
+        }
+        rows.push((
+            record.id.clone(),
+            millis(record.settle_time)?,
+            record.funding.0,
+        ));
+    }
+    let times: Vec<i64> = reply.result_list.iter().map(|r| r.settle_time).collect();
+    let newest_first = times.windows(2).all(|pair| pair[0] >= pair[1]);
+    let done = reply.result_list.is_empty()
+        || page as i64 >= reply.total_page
+        || (newest_first && times.last().is_some_and(|oldest| *oldest < start));
+    Ok((rows, done))
+}
+
+/// 成交列表的一行：数量是张数 × 面值，手续费正 = 付出（返佣为负），side 1 开多 / 2 平空 / 3 开空 / 4 平多。
+fn venue_fill(deal: &Deal, contract: &Contract) -> ArbResult<VenueFill> {
+    if deal.symbol != contract.symbol
+        || deal.fee_currency != "USDT"
+        || deal.vol.0 <= Decimal::ZERO
+        || deal.price.0 <= Decimal::ZERO
+    {
+        return Err(err("invalid/foreign-currency deal"));
+    }
+    // 单向持仓下 1/3 既可能开仓也可能是只减仓的平仓（MEXC 把平仓单记成 1/3 +
+    // reduceOnly），只有 2/4 确定是平仓。
+    let (side, effect) = match deal.side {
+        1 => (Side::Buy, FillEffect::Unknown),
+        2 => (Side::Buy, FillEffect::Close),
+        3 => (Side::Sell, FillEffect::Unknown),
+        4 => (Side::Sell, FillEffect::Close),
+        _ => return Err(err("unknown deal side")),
+    };
+    Ok(VenueFill {
+        at: millis(
+            deal.timestamp
+                .ok_or_else(|| err("deal without timestamp"))?,
+        )?,
+        side,
+        quantity: multiply(deal.vol.0, contract.contract_size.0)?,
+        price: deal.price.0,
+        fee_usdt: deal.fee.0,
+        effect,
+    })
+}
+
 #[derive(Deserialize)]
 struct Envelope {
     success: bool,
@@ -1125,7 +1676,7 @@ impl PositionMode {
 }
 
 /// Preserve every digit of numeric JSON: never pass financial fields through f64.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Number(Decimal);
 impl<'de> Deserialize<'de> for Number {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
@@ -1154,7 +1705,7 @@ fn id<'de, D: Deserializer<'de>>(de: D) -> Result<String, D::Error> {
     Ok(result)
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Contract {
     symbol: String,
@@ -1174,16 +1725,6 @@ struct Contract {
     max_leverage: Number,
 }
 impl Contract {
-    fn scanner_symbol(&self) -> Option<Symbol> {
-        // Scanner strips only the native quote suffix, never multiplier prefixes.
-        let base = self.symbol.strip_suffix("_USDT")?;
-        (self.quote_coin == "USDT"
-            && self.settle_coin == "USDT"
-            && self.future_type == 1
-            && !base.is_empty()
-            && base == self.base_coin)
-            .then(|| Symbol::perp(base, "USDT"))
-    }
     fn validate_units(&self) -> ArbResult<()> {
         if self.contract_size.0 <= Decimal::ZERO
             || self.price_unit.0 <= Decimal::ZERO
@@ -1208,6 +1749,20 @@ struct Book {
 #[serde(rename_all = "camelCase")]
 struct Fees {
     real_taker_fee: Number,
+    /// MX 抵扣手续费开着（2026-10-21 实测：网页上关掉后由 true 变 false；`joinDeduct` 是资格，不变）。
+    #[serde(default)]
+    enjoy_deduct: Option<bool>,
+}
+
+/// MX 抵扣开着就不连：手续费按 MX 扣时成交明细的 `feeCurrency` 不是 USDT，单子成交了却记不进账，
+/// 这条腿悬着（`aggregate` 只认 USDT）。字段没给不拦（成交那一步仍会拒非 USDT 的手续费）。
+fn check_deduction(fees: &Fees) -> ArbResult<()> {
+    if fees.enjoy_deduct == Some(true) {
+        return Err(err(
+            "MX fee deduction is on: turn it off in the MEXC UI (fees paid in MX cannot be booked)",
+        ));
+    }
+    Ok(())
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1226,11 +1781,11 @@ struct Position {
     state: i64,
     hold_vol: Number,
     frozen_vol: Number,
-    hold_avg_price: Number,
+    hold_avg_price: Derived,
     #[serde(default)]
-    liquidate_price: Option<Number>,
+    liquidate_price: Option<Derived>,
     #[serde(default)]
-    im: Option<Number>,
+    im: Option<Derived>,
 }
 /// `/order/create` 成功时的 data：`orderId`（文档示例是字符串，数字也接受）与 `ts`。
 #[derive(Deserialize)]
@@ -1270,8 +1825,56 @@ struct Deal {
     side: i64,
     vol: Number,
     price: Number,
-    fee: Number,
+    /// 交易所算出来的手续费：派生数值，见 [`Derived`]。
+    fee: Derived,
     fee_currency: String,
+    /// 成交时刻（毫秒）。按订单查的明细不一定带，按合约查的成交列表带。
+    #[serde(default)]
+    timestamp: Option<i64>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Asset {
+    currency: String,
+    available_open: Derived,
+}
+/// 交易所算出来的派生数值（余额、持仓均价、保证金、强平价）：MEXC 会给出 40 位有效数字（实测
+/// `availableOpen` 为 `412.3456789012345000000000000000029946341`），超出 `Decimal` 的 28 位，[`Number`]
+/// 的精确解析会拒 —— 持仓读不出来，整家对账就失败。小数截到 18 位再解析（余额只会少算一点点）。
+/// 下单数量、价格、成交这些原始数值仍用 [`Number`] 精确解析。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Derived(Decimal);
+impl<'de> Deserialize<'de> for Derived {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let raw = Box::<RawValue>::deserialize(de)?;
+        let text = raw.get().trim_matches('"');
+        let cut = match text.split_once('.') {
+            Some((whole, fraction)) if fraction.len() > 18 => {
+                format!("{whole}.{}", &fraction[..18])
+            }
+            _ => text.to_string(),
+        };
+        Decimal::from_str_exact(&cut)
+            .map(Self)
+            .map_err(|_| serde::de::Error::custom("invalid derived decimal"))
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FundingPage {
+    #[serde(default)]
+    result_list: Vec<FundingRecord>,
+    total_page: i64,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FundingRecord {
+    #[serde(deserialize_with = "id")]
+    id: String,
+    symbol: String,
+    /// 正 = 收到，负 = 付出（实测 某次实盘 多仓、费率 +0.0093% 时为 −1.108）。派生数值，见 [`Derived`]。
+    funding: Derived,
+    settle_time: i64,
 }
 
 #[cfg(test)]
@@ -1281,6 +1884,7 @@ mod tests {
 
     fn order() -> NewOrder {
         NewOrder {
+            post_only: false,
             margin_mode: crate::MarginMode::Isolated,
             client_order_id: ClientOrderId("pair-buy-0".into()),
             venue: Venue::Mexc,
@@ -1334,6 +1938,109 @@ mod tests {
         assert_eq!(fee.real_taker_fee.0, dec!(0.000000000000000123456789));
         assert_eq!(decode::<Number>("1e-12").unwrap().0, dec!(0.000000000001));
     }
+    /// 报给执行器的步长（面值 × volUnit）和下单换算（[`order_units`]）是同一份规格：步长整数倍的数量原样下出去。
+    #[test]
+    fn a_quantity_on_the_reported_step_goes_out_unchanged() {
+        let nvda = nvidia();
+        let step = quantity_step_of(&nvda).unwrap();
+        assert_eq!(step, dec!(0.01));
+        let mut order = order();
+        order.quantity = Some(step * Decimal::from(183));
+        let units = order_units(
+            Venue::Mexc,
+            &order,
+            dec!(218.95),
+            nvda.contract_size.0,
+            nvda.vol_unit.0,
+            nvda.min_vol.0,
+        )
+        .unwrap();
+        assert_eq!(units * nvda.contract_size.0, dec!(1.83));
+        let mut lots = nvda;
+        lots.vol_unit = Number(dec!(10));
+        assert_eq!(quantity_step_of(&lots).unwrap(), dec!(0.1));
+    }
+
+    fn position(json: &str) -> Position {
+        decode(json).unwrap()
+    }
+
+    /// 补保证金只对这个合约上那一笔正常持有的逐仓仓位发；没有、不是逐仓、不正常、金额不合法都不发（`Err`）。
+    #[test]
+    fn margin_goes_only_to_the_one_isolated_position_held() {
+        let isolated = r#"{"positionId":4242,"symbol":"NVIDIA_USDT","positionType":2,"openType":1,"state":1,"holdVol":9,"frozenVol":0,"holdAvgPrice":218.95}"#;
+        let other = r#"{"positionId":7,"symbol":"BTC_USDT","positionType":1,"openType":1,"state":1,"holdVol":3,"frozenVol":0,"holdAvgPrice":80000}"#;
+        let rows = vec![position(other), position(isolated)];
+        assert_eq!(
+            add_margin_body(&rows, "NVIDIA_USDT", dec!(12.5)).unwrap(),
+            r#"{"positionId":4242,"amount":12.5,"type":"ADD"}"#
+        );
+        assert!(
+            add_margin_body(&rows, "TESLA_USDT", dec!(10)).is_err(),
+            "没有持仓"
+        );
+        assert!(add_margin_body(&rows, "NVIDIA_USDT", dec!(0)).is_err());
+        assert!(
+            add_margin_body(&rows, "NVIDIA_USDT", dec!(1.234)).is_err(),
+            "最多两位小数"
+        );
+        let cross = position(&isolated.replace(r#""openType":1"#, r#""openType":2"#));
+        assert!(
+            add_margin_body(&[cross], "NVIDIA_USDT", dec!(10)).is_err(),
+            "全仓不补"
+        );
+        let closing = position(&isolated.replace(r#""state":1"#, r#""state":2"#));
+        assert!(add_margin_body(&[closing], "NVIDIA_USDT", dec!(10)).is_err());
+        let twice = vec![position(isolated), position(isolated)];
+        assert!(add_margin_body(&twice, "NVIDIA_USDT", dec!(10)).is_err());
+    }
+
+    /// 补保证金发出之后：成功是 Applied；交易所明确的业务码是 Refused（没动钱）；5xx、限频、「稍后重试」类码、
+    /// 解析不了的都是 Unknown（可能已经到账，不能当拒绝）。
+    #[test]
+    fn margin_replies_separate_refused_from_maybe_applied() {
+        let outcome = |status: u16, body: &str| {
+            margin_outcome(classify_write(
+                StatusCode::from_u16(status).unwrap(),
+                body.as_bytes(),
+            ))
+        };
+        assert_eq!(
+            outcome(200, r#"{"success":true,"code":0}"#),
+            MarginOutcome::Applied
+        );
+        assert!(matches!(
+            outcome(200, r#"{"success":false,"code":2005}"#),
+            MarginOutcome::Refused(_)
+        ));
+        for (status, body) in [
+            (200, r#"{"success":false,"code":510}"#),
+            (500, r#"{"success":false,"code":0}"#),
+            (429, ""),
+            (200, "not json"),
+        ] {
+            assert!(
+                matches!(outcome(status, body), MarginOutcome::Unknown(_)),
+                "{status} {body}"
+            );
+        }
+    }
+
+    /// 公开盘口快照本来就落后几秒（实测到 5.4 秒）：15 秒内都能用来定保护价；更旧、在未来、请求太慢的不用。
+    #[test]
+    fn depth_snapshots_a_few_seconds_old_are_still_usable() {
+        let now = 1_793_008_500_000;
+        let fast = Duration::from_millis(30);
+        assert!(book_fresh(now, now - 5_400, fast), "实测落后 5.4 秒的快照");
+        assert!(book_fresh(now, now - 15_000, fast));
+        assert!(!book_fresh(now, now - 15_001, fast));
+        assert!(!book_fresh(now, now + 1_001, fast), "时间戳在未来");
+        assert!(
+            !book_fresh(now, now, Duration::from_millis(2_001)),
+            "请求本身太慢"
+        );
+    }
+
     #[test]
     fn contract_conversion_and_exact_exits() {
         let mut order = order();
@@ -1374,15 +2081,13 @@ mod tests {
             )
             .is_err()
         );
+        // 10-22 实测：单向持仓下 side 2 + reduceOnly 被拒（2001），平仓 = 1/3 + reduceOnly。
+        assert_eq!((side_code(Side::Buy), side_code(Side::Sell)), (1, 3));
         assert_eq!(
-            (
-                side_code(Side::Buy, false),
-                side_code(Side::Buy, true),
-                side_code(Side::Sell, false),
-                side_code(Side::Sell, true)
-            ),
-            (1, 2, 3, 4)
+            [1, 2, 3, 4].map(|code| side_of(code).unwrap()),
+            [Side::Buy, Side::Buy, Side::Sell, Side::Sell]
         );
+        assert!(side_of(5).is_err());
         let cid = venue_client_id("mexc", &order.client_order_id, 32);
         assert_eq!(cid.len(), 32);
         assert!(cid.bytes().all(|b| b.is_ascii_alphanumeric()));
@@ -1440,18 +2145,40 @@ mod tests {
             terminal: None,
         };
         assert_eq!(
-            verified_order(&row, Some(&entry), &contract())
-                .unwrap()
-                .client_order_id,
+            verified_order(
+                &row,
+                Some(&entry),
+                &contract(),
+                Some(&Symbol::perp("BTC", "USDT"))
+            )
+            .unwrap()
+            .client_order_id,
             entry.order.client_order_id
         );
         let mut cross = remote();
         cross.open_type = 2;
-        assert!(verified_order(&cross, Some(&entry), &contract()).is_err());
+        assert!(
+            verified_order(
+                &cross,
+                Some(&entry),
+                &contract(),
+                Some(&Symbol::perp("BTC", "USDT"))
+            )
+            .is_err()
+        );
         let mut mismatch = remote();
         mismatch.external_oid = "other".into();
-        assert!(verified_order(&mismatch, Some(&entry), &contract()).is_err());
-        let external = verified_order(&row, None, &contract()).unwrap();
+        assert!(
+            verified_order(
+                &mismatch,
+                Some(&entry),
+                &contract(),
+                Some(&Symbol::perp("BTC", "USDT"))
+            )
+            .is_err()
+        );
+        let external =
+            verified_order(&row, None, &contract(), Some(&Symbol::perp("BTC", "USDT"))).unwrap();
         assert_eq!(external.client_order_id.0, "mexc-external-10");
         assert_eq!(external.quantity, Some(dec!(0.02)));
     }
@@ -1519,10 +2246,11 @@ mod tests {
             }
             _ => panic!("2005 must be a structured business refusal"),
         }
-        for code in [2011, 2015, 2028, 2070] {
+        // 2001：10-22 实测（单向持仓 side 2 + reduceOnly）回包后按外部单号查无此单。
+        for code in [2001, 2011, 2015, 2028, 2070] {
             assert!(definitive_rejection(code));
         }
-        assert!(!definitive_rejection(2001));
+        assert!(!definitive_rejection(2009));
         // 成功响应里的 orderId 供 `place` 按 id 直查（文档示例是字符串，数字也接受）。
         assert_eq!(
             decode::<Created>(r#"{"orderId":"739113577038255616","ts":1761888808839}"#)
@@ -1543,6 +2271,7 @@ mod tests {
             &mut journal,
             &order,
             Some(2005),
+            false,
             "HTTP 200; API code 2005".into(),
         )
         .unwrap();
@@ -1581,11 +2310,34 @@ mod tests {
         ];
         for (status, body) in cases {
             match classify_write(status, body) {
-                Err(WriteError::Unknown(_)) => {}
+                Err(WriteError::Unknown(_) | WriteError::Throttled(_)) => {}
                 Err(WriteError::Api { code, .. }) => panic!("{code} must stay unknown"),
                 Ok(_) => panic!("HTTP {status} error body must not be accepted"),
             }
         }
+        // 限频单独归一类：下单路径要靠读回「每次都查无此单」才敢记拒单，5xx 永远不记。
+        for (status, body) in [
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                &br#"{"success":false,"code":510}"#[..],
+            ),
+            (
+                StatusCode::OK,
+                &br#"{"success":false,"code":510,"data":null}"#[..],
+            ),
+        ] {
+            assert!(matches!(
+                classify_write(status, body),
+                Err(WriteError::Throttled(_))
+            ));
+        }
+        assert!(matches!(
+            classify_write(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                br#"{"success":false,"code":500}"#
+            ),
+            Err(WriteError::Unknown(_))
+        ));
         assert!(AMBIGUOUS_CODES.contains(&3016));
         assert!(!definitive_rejection(510) && !definitive_rejection(500));
         let (mut journal, path) = test_journal("unknown");
@@ -1596,6 +2348,7 @@ mod tests {
             &mut journal,
             &order,
             None,
+            true,
             "MEXC write 超时（结果未知）".into(),
         )
         .unwrap();
@@ -1610,6 +2363,75 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// 某次实盘 平仓单：业务码不在白名单、但按外部单号每次都查无此单 = 交易所没建单，
+    /// 记成拒单让下一轮重发；读回出过错（`absent` = false）就不能下结论。
+    #[test]
+    fn a_refused_order_the_venue_has_no_record_of_is_settled_as_rejected() {
+        assert!(definitive_rejection(2001), "order direction error");
+        for (absent, settled) in [(true, true), (false, false)] {
+            let (mut journal, path) = test_journal(if absent { "absent" } else { "unread" });
+            let order = order();
+            journal.reserve(test_entry(&order)).unwrap();
+            settle_failure(
+                &mut journal,
+                &order,
+                Some(9999),
+                absent,
+                "HTTP 200 OK; API code 9999".into(),
+            )
+            .unwrap();
+            let terminal = journal
+                .get(&order.client_order_id)
+                .unwrap()
+                .terminal
+                .clone();
+            assert_eq!(
+                terminal.map(|state| state.status),
+                settled.then_some(OrderStatus::Rejected),
+                "absent={absent}"
+            );
+            drop(journal);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// 单向持仓下平仓单回的是 1/3 + reduceOnly:true（10-22 实测 diagD 的原样字段）。
+    #[test]
+    fn a_one_way_close_reads_back_as_side_one_or_three_with_reduce_only() {
+        let row = |side: i64, reduce: &str| -> RemoteOrder {
+            decode(&format!(
+                r#"{{"orderId":"100000000000000001","symbol":"BTC_USDT","externalOid":"abc","side":{side},"state":4,"errorCode":18,"vol":2,"dealVol":0,"price":100,"leverage":2,"openType":1,"positionMode":2,"orderType":3{reduce}}}"#
+            ))
+            .unwrap()
+        };
+        let check = |intent: &NewOrder, remote: &RemoteOrder| {
+            verified_order(
+                remote,
+                Some(&test_entry(intent)),
+                &contract(),
+                Some(&Symbol::perp("BTC", "USDT")),
+            )
+        };
+        let mut close = order();
+        close.side = Side::Buy;
+        close.reduce_only = true;
+        let mut open = close.clone();
+        open.reduce_only = false;
+        let reduce = r#","reduceOnly":true"#;
+        assert!(check(&close, &row(1, reduce)).is_ok());
+        assert!(check(&close, &row(2, "")).is_ok());
+        assert!(check(&open, &row(1, r#","reduceOnly":false"#)).is_ok());
+        assert!(
+            check(&open, &row(1, reduce)).is_err(),
+            "an open must not read back reduce-only"
+        );
+        assert!(
+            check(&open, &row(2, "")).is_err(),
+            "2/4 is only ever a close"
+        );
+        assert!(check(&close, &row(3, reduce)).is_err(), "wrong direction");
+    }
+
     /// 两个单笔查询端点都不返回 `reduceOnly`：缺失按未知接受，明确 false 才是冲突。
     #[test]
     fn verified_order_treats_missing_reduce_only_as_unknown() {
@@ -1622,15 +2444,28 @@ mod tests {
         )
         .unwrap();
         assert!(
-            verified_order(&missing, Some(&entry), &contract())
-                .unwrap()
-                .reduce_only
+            verified_order(
+                &missing,
+                Some(&entry),
+                &contract(),
+                Some(&Symbol::perp("BTC", "USDT"))
+            )
+            .unwrap()
+            .reduce_only
         );
         let explicit_false: RemoteOrder = decode(
             r#"{"orderId":"10","symbol":"BTC_USDT","externalOid":"abc","side":2,"state":3,"errorCode":0,"vol":2,"dealVol":2,"price":100,"leverage":5,"openType":1,"positionMode":2,"orderType":3,"reduceOnly":false}"#,
         )
         .unwrap();
-        assert!(verified_order(&explicit_false, Some(&entry), &contract()).is_err());
+        assert!(
+            verified_order(
+                &explicit_false,
+                Some(&entry),
+                &contract(),
+                Some(&Symbol::perp("BTC", "USDT"))
+            )
+            .is_err()
+        );
     }
 
     /// MEXC 拒收距 bid1/ask1 超过 5% 的限价（2070）：slippage 配到 0.05 时也要收紧到 4.9%。
@@ -1655,5 +2490,518 @@ mod tests {
             clamp_touch_bound(Side::Sell, dec!(99.8), bid, ask).unwrap(),
             dec!(99.8)
         );
+    }
+
+    fn nvidia() -> Contract {
+        decode(r#"{"symbol":"NVIDIA_USDT","baseCoin":"NVIDIA","quoteCoin":"USDT","settleCoin":"USDT","futureType":1,"state":0,"apiAllowed":true,"positionOpenType":3,"contractSize":0.01,"priceUnit":0.01,"volUnit":1,"minVol":1,"maxVol":3000000,"minLeverage":1,"maxLeverage":200,"conceptPlate":["mc-trade-zone-Stock","mc-trade-zone-tradfi","mc-trade-zone-usstocks"]}"#).unwrap()
+    }
+
+    fn catalog(rows: Vec<Contract>) -> Catalog {
+        let names = arb_venues::mexc::canonical_bases(rows.iter().map(|c| {
+            let display = if c.symbol == "NVIDIA_USDT" {
+                "NVDA_USDT PERPETUAL"
+            } else {
+                "X"
+            };
+            (c.symbol.as_str(), Some(display), c.symbol == "NVIDIA_USDT")
+        }));
+        Catalog {
+            contracts: rows.into_iter().map(|c| (c.symbol.clone(), c)).collect(),
+            names,
+        }
+    }
+
+    #[test]
+    fn stock_contracts_trade_and_report_under_the_scanner_ticker() {
+        let book = catalog(vec![nvidia(), contract()]);
+        let nvda = Symbol::perp("NVDA", "USDT");
+        assert_eq!(book.symbol_of("NVIDIA_USDT"), Some(nvda.clone()));
+        assert_eq!(book.find(&nvda).unwrap().unwrap().symbol, "NVIDIA_USDT");
+        assert!(
+            book.find(&Symbol::perp("NVIDIA", "USDT"))
+                .unwrap()
+                .is_none(),
+            "原名不再是标的"
+        );
+        assert_eq!(
+            book.symbol_of("BTC_USDT"),
+            Some(Symbol::perp("BTC", "USDT"))
+        );
+        // 合约名和 baseCoin 对不上（倍数合约之类）：不认。
+        let mut odd = contract();
+        odd.symbol = "1000BTC_USDT".into();
+        let book = catalog(vec![odd]);
+        assert_eq!(book.symbol_of("1000BTC_USDT"), None);
+    }
+
+    #[test]
+    fn leverage_counts_only_when_this_side_has_exactly_that_mode_and_value() {
+        // 2026-10-21 实测：每个合约多空各一行，openType 2 = 全仓。
+        let rows: Vec<Leverage> = decode(r#"[{"currentMmr":0.004,"imr":0.1,"level":4,"leverage":10,"limitBySys":false,"maxLeverageView":200,"maxVol":3000000,"mmr":0.05,"openType":2,"positionType":1},{"currentMmr":0.004,"imr":0.1,"level":4,"leverage":3,"limitBySys":false,"maxLeverageView":200,"maxVol":3000000,"mmr":0.05,"openType":1,"positionType":2}]"#).unwrap();
+        assert!(leverage_matches(&rows, 1, 2, dec!(10)));
+        assert!(!leverage_matches(&rows, 1, 1, dec!(10)), "全仓不算逐仓");
+        assert!(!leverage_matches(&rows, 1, 2, dec!(3)));
+        assert!(leverage_matches(&rows, 2, 1, dec!(3)));
+        let twice: Vec<Leverage> = decode(r#"[{"leverage":3,"openType":1,"positionType":2},{"leverage":3,"openType":1,"positionType":2}]"#).unwrap();
+        assert!(!leverage_matches(&twice, 2, 1, dec!(3)), "同一边两行：不认");
+        assert!(!leverage_matches(&[], 1, 1, dec!(3)));
+    }
+
+    #[test]
+    fn funding_pages_keep_the_sign_and_stop_once_older_than_the_start() {
+        // 2026-10-21 实测的一行（BTC 多仓付出资金费）。
+        let page: FundingPage = decode(r#"{"currentPage":1,"pageSize":20,"resultList":[{"funding":-1.10000000002,"id":1951695009,"positionType":1,"positionValue":11917.65765,"rate":0.000093,"settleTime":1792454400000,"symbol":"BTC_USDT"}],"totalCount":1,"totalPage":1}"#).unwrap();
+        let (rows, done) = funding_page(&page, "BTC_USDT", 0, 1).unwrap();
+        assert_eq!(rows[0].2, dec!(-1.10000000002), "负 = 付出");
+        assert_eq!(rows[0].1.timestamp_millis(), 1792454400000);
+        assert!(done, "最后一页");
+        assert!(
+            funding_page(&page, "ETH_USDT", 0, 1).is_err(),
+            "别的合约的流水"
+        );
+        // 还有下一页：从新到旧排、这一页最早的已早于起点才停。
+        let two: FundingPage = decode(r#"{"resultList":[{"funding":1,"id":2,"settleTime":2000,"symbol":"BTC_USDT"},{"funding":1,"id":1,"settleTime":1000,"symbol":"BTC_USDT"}],"totalPage":5}"#).unwrap();
+        assert!(!funding_page(&two, "BTC_USDT", 500, 1).unwrap().1);
+        assert!(funding_page(&two, "BTC_USDT", 1500, 1).unwrap().1);
+        let unordered: FundingPage = decode(r#"{"resultList":[{"funding":1,"id":1,"settleTime":1000,"symbol":"BTC_USDT"},{"funding":1,"id":2,"settleTime":2000,"symbol":"BTC_USDT"}],"totalPage":5}"#).unwrap();
+        assert!(
+            !funding_page(&unordered, "BTC_USDT", 1500, 1).unwrap().1,
+            "顺序对不上就翻到最后一页"
+        );
+        let empty: FundingPage = decode(
+            r#"{"currentPage":1,"pageSize":3,"resultList":[],"totalCount":0,"totalPage":0}"#,
+        )
+        .unwrap();
+        assert!(funding_page(&empty, "BTC_USDT", 0, 1).unwrap().1);
+    }
+
+    #[test]
+    fn the_usdt_asset_reads_the_amount_available_to_open() {
+        // 2026-10-21 实测 `/account/asset/USDT`。
+        let raw = r#"{"availableBalance":512.34567890123,"availableCash":512.3456789012345,"availableOpen":512.3456789012345,"bonus":0,"cashBalance":512.3456789,"contributeMarginAmount":0,"currency":"USDT","debtAmount":0,"equity":1000.0,"frozenBalance":0,"positionMargin":400.0,"unrealized":10.0,"vcoinId":"00000000000000000000000000000001"}"#;
+        let asset: Asset = serde_json::from_str(raw).unwrap();
+        assert_eq!(asset.currency, "USDT");
+        assert_eq!(asset.available_open.0, dec!(512.3456789012345));
+        // 同一个接口几分钟后的原文：40 位有效数字。截到 18 位小数，只会少算。
+        let long =
+            r#"{"currency":"USDT","availableOpen":412.3456789012345000000000000000029946341}"#;
+        let asset: Asset = serde_json::from_str(long).unwrap();
+        assert_eq!(asset.available_open.0, dec!(412.345678901234500000));
+        assert!(
+            serde_json::from_str::<Asset>(r#"{"currency":"USDT","availableOpen":"x"}"#).is_err()
+        );
+        // 持仓（2026-10-21 实测的一行，均价、保证金换成超长位数）：照样读得出来，不让整家对账失败。
+        let position: Vec<Position> = decode(r#"[{"autoAddIm":false,"holdAvgPrice":5.3690000000000000000000000000000012345,"holdVol":1130,"frozenVol":0,"im":409.1237880000000000000000000000000001,"leverage":10,"liquidatePrice":4.308,"openType":2,"positionId":1000000001,"positionType":1,"state":1,"symbol":"NEAR_USDT"}]"#).unwrap();
+        assert_eq!(position[0].hold_avg_price.0, dec!(5.369));
+        assert_eq!(position[0].im.unwrap().0, dec!(409.123788));
+        assert!(validate_positions(&position).is_ok());
+    }
+
+    /// 目录刷新失败（这里用连不上的代理模拟限频 / 超时）：规格与持仓映射退回一小时内的上一份，
+    /// 停牌判断不退（要新鲜状态，读不到就报错）。
+    #[tokio::test]
+    async fn a_failed_catalog_refresh_falls_back_but_halts_do_not() {
+        let (journal, path) = test_journal("catalog-fallback");
+        let offline = Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .build()
+            .unwrap();
+        let broker = MexcBroker {
+            client: offline,
+            credentials: MexcCredentials {
+                api_key: "k".into(),
+                api_secret: "s".into(),
+            },
+            options: LiveOptions {
+                trading_enabled: false,
+                market_slippage: None,
+            },
+            journal: Mutex::new(journal),
+            clock_offset: 0,
+            fee: Decimal::ZERO,
+            catalog: Cached::new(),
+            mode_ok: Verified::new(SETTINGS_TTL),
+            leverage_ok: Verified::new(SETTINGS_TTL),
+        };
+        let nvda = Symbol::perp("NVDA", "USDT");
+        assert!(broker.find(&nvda).await.is_err(), "没有上一份：报错");
+        broker
+            .catalog
+            .put(Arc::new(catalog(vec![nvidia(), contract()])));
+        // 上一份已过 10 分钟的有效期也照样用（这里直接要求重读）。
+        assert_eq!(
+            broker
+                .catalog_lenient(Duration::ZERO)
+                .await
+                .unwrap()
+                .contracts
+                .len(),
+            2
+        );
+        assert_eq!(broker.find(&nvda).await.unwrap().symbol, "NVIDIA_USDT");
+        let (_, symbol) = broker.contract("NVIDIA_USDT").await.unwrap();
+        assert_eq!(symbol, Some(nvda.clone()));
+        assert!(broker.contract("NOPE_USDT").await.is_err());
+        assert!(
+            broker.catalog(Duration::ZERO).await.is_err(),
+            "严格读不退：停牌判断用它"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mx_fee_deduction_must_be_off_to_connect() {
+        // 2026-10-21 同一账户关抵扣前后的实测回包（节选）。
+        let on: Fees = decode(r#"{"joinDeduct":true,"enjoyDeduct":true,"deductRate":0.8,"originalTakerFee":0.0008,"realTakerFee":0.00064}"#).unwrap();
+        let off: Fees = decode(r#"{"joinDeduct":true,"enjoyDeduct":false,"deductRate":0.8,"originalTakerFee":0.0008,"realTakerFee":0.0008}"#).unwrap();
+        assert!(check_deduction(&on).is_err());
+        assert!(check_deduction(&off).is_ok());
+        let unknown: Fees = decode(r#"{"realTakerFee":0.0008}"#).unwrap();
+        assert!(check_deduction(&unknown).is_ok(), "没给不拦");
+    }
+
+    #[test]
+    fn deal_list_rows_become_fills_in_base_units() {
+        // 2026-10-21 实测（BTC 平多，挂单成交）。
+        let deal: Deal = decode(r#"{"category":1,"fee":1.18654,"feeCurrency":"USDT","id":"10000000001","orderId":"100000000000000002","positionMode":1,"price":82000,"profit":26.66821,"side":4,"symbol":"BTC_USDT","taker":false,"timestamp":1792467757000,"vol":1447}"#).unwrap();
+        let mut btc = contract();
+        btc.contract_size = Number(dec!(0.0001));
+        let fill = venue_fill(&deal, &btc).unwrap();
+        assert_eq!(fill.side, Side::Sell);
+        assert_eq!(fill.effect, FillEffect::Close);
+        assert_eq!(fill.quantity, dec!(0.1447));
+        assert_eq!(fill.price, dec!(82000));
+        assert_eq!(fill.fee_usdt, dec!(1.18654), "正 = 付出");
+        assert_eq!(fill.at.timestamp_millis(), 1792467757000);
+        let mut foreign: Deal = decode(r#"{"fee":1,"feeCurrency":"MX","id":"1","orderId":"2","price":1,"side":1,"symbol":"BTC_USDT","timestamp":1,"vol":1}"#).unwrap();
+        assert!(
+            venue_fill(&foreign, &btc).is_err(),
+            "MX 抵扣的手续费不能当 USDT"
+        );
+        foreign.fee_currency = "USDT".into();
+        foreign.timestamp = None;
+        assert!(venue_fill(&foreign, &btc).is_err(), "没有时间");
+        foreign.timestamp = Some(1);
+        let one_way = venue_fill(&foreign, &btc).unwrap();
+        assert_eq!(
+            (one_way.side, one_way.effect),
+            (Side::Buy, FillEffect::Unknown),
+            "单向持仓下 1/3 可能是只减仓的平仓"
+        );
+        foreign.symbol = "ETH_USDT".into();
+        assert!(venue_fill(&foreign, &btc).is_err(), "别的合约");
+    }
+
+    /// Read-only probe of the real account in `ARB_MEXC_API_KEY` / `ARB_MEXC_API_SECRET` (from the
+    /// environment or, failing that, the repo `.env`): trading disabled, so no write request is
+    /// possible. Runs the very `connect` the live desk runs (all-or-nothing: if it fails here the
+    /// whole live desk would fail to connect), then prints the raw shape of every read the bot
+    /// will rely on (no response carries a secret). Journal in `ARB_PROBE_DIR` (default: the
+    /// system temp dir). Run with `cargo test -p arb-exec --lib
+    /// mexc_broker::tests::live_read_only_probe -- --ignored --nocapture`.
+    /// **写操作，动真钱**：往一笔已有的逐仓持仓补保证金，前后读回 `leg_state`（保证金 im、强平价）。
+    /// 只在显式给了 `ARB_PROBE_ADD_MARGIN=合约:金额`（如 `NVDA:1`）时才发请求；只给补保证金这一件事开写权限。
+    /// `cargo test -p arb-exec --lib mexc_broker::tests::live_add_margin_probe -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "moves real money on MEXC"]
+    async fn live_add_margin_probe() {
+        let _ = dotenvy::dotenv();
+        let var = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        };
+        let Some(target) = var("ARB_PROBE_ADD_MARGIN") else {
+            println!("ARB_PROBE_ADD_MARGIN 没给：什么都不做");
+            return;
+        };
+        let (base, amount) = target.split_once(':').expect("格式 合约:金额");
+        let amount: Decimal = amount.parse().expect("金额");
+        let symbol = Symbol::perp(base, "USDT");
+        let dir = var("ARB_PROBE_DIR").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+        let broker = MexcBroker::connect(
+            Client::new(),
+            MexcCredentials {
+                api_key: var("ARB_MEXC_API_KEY").expect("ARB_MEXC_API_KEY"),
+                api_secret: var("ARB_MEXC_API_SECRET").expect("ARB_MEXC_API_SECRET"),
+            },
+            &dir.join("arb-live-mexc-margin-probe-orders.jsonl"),
+            LiveOptions {
+                trading_enabled: true,
+                market_slippage: Some(dec!(0.01)),
+            },
+        )
+        .await
+        .expect("connect");
+        let before = broker.leg_state(&symbol).await.expect("leg_state before");
+        println!("before: {before:?}");
+        let outcome = broker.add_margin(&symbol, amount).await;
+        println!("add_margin({amount}): {outcome:?}");
+        for wait in [0u64, 1000, 3000] {
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            let after = broker.leg_state(&symbol).await.expect("leg_state after");
+            println!("after +{wait}ms: {after:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs live MEXC credentials"]
+    async fn live_read_only_probe() {
+        let _ = dotenvy::dotenv();
+        let var = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        };
+        let credentials = || MexcCredentials {
+            api_key: var("ARB_MEXC_API_KEY").expect("ARB_MEXC_API_KEY"),
+            api_secret: var("ARB_MEXC_API_SECRET").expect("ARB_MEXC_API_SECRET"),
+        };
+        let dir = var("ARB_PROBE_DIR").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+        let options = || LiveOptions {
+            trading_enabled: false,
+            market_slippage: None,
+        };
+        let client = Client::new();
+        let started = Instant::now();
+        let connected = MexcBroker::connect(
+            client.clone(),
+            credentials(),
+            &dir.join("arb-live-mexc-probe-orders.jsonl"),
+            options(),
+        )
+        .await;
+        // Printed reads continue after a failed connect (they help find why); the test itself
+        // fails at the end, so `test result: ok` always means the live desk would connect.
+        let connect_failure = connected.as_ref().err().map(ToString::to_string);
+        match &connected {
+            Ok(broker) => println!(
+                "connect (what the live desk runs): OK, clock offset {} ms, account taker fee {} ({} ms)",
+                broker.clock_offset,
+                broker.fee,
+                started.elapsed().as_millis()
+            ),
+            Err(failure) => println!(
+                "connect (what the live desk runs): FAILED — the live desk would not connect: {failure} ({} ms)",
+                started.elapsed().as_millis()
+            ),
+        }
+        // ARB_PROBE_FEES=NVIDIA_USDT,BTC_USDT：按合约读账户实际费率（公开详情里的 takerFeeRate 不可信）。
+        if let (Ok(broker), Some(list)) = (&connected, var("ARB_PROBE_FEES")) {
+            for native in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                match broker
+                    .get::<serde_json::Value>(FEES, &[("symbol", native.to_string())])
+                    .await
+                {
+                    Ok(value) => println!("fees {native}: {value}"),
+                    Err(error) => println!("fees {native}: FAILED {error}"),
+                }
+            }
+        }
+        let broker = match connected {
+            Ok(broker) => broker,
+            Err(_) => MexcBroker {
+                client,
+                credentials: credentials(),
+                options: options(),
+                journal: Mutex::new(
+                    OrderJournal::open(
+                        &dir.join("arb-live-mexc-probe-raw.jsonl"),
+                        "mexc-probe-raw",
+                    )
+                    .unwrap(),
+                ),
+                clock_offset: 0,
+                fee: Decimal::ZERO,
+                catalog: Cached::new(),
+                mode_ok: Verified::new(SETTINGS_TTL),
+                leverage_ok: Verified::new(SETTINGS_TTL),
+            },
+        };
+        let raw = |path: &'static str, params: Vec<(&'static str, String)>| {
+            let broker = &broker;
+            async move {
+                let started = Instant::now();
+                // 原文（不经 f64）：数字的位数原样可见。
+                let reply: ArbResult<Box<RawValue>> = broker.get(path, &params).await;
+                let text = match reply {
+                    Ok(value) => value.get().to_string(),
+                    Err(failure) => format!("ERROR {failure}"),
+                };
+                let cut: String = text.chars().take(900).collect();
+                println!(
+                    "{path} {params:?} ({} ms): {cut}",
+                    started.elapsed().as_millis()
+                );
+            }
+        };
+        let now = Utc::now().timestamp_millis();
+        let day = 86_400_000i64;
+        raw(POSITION_MODE, vec![]).await;
+        raw(FEES, vec![]).await;
+        raw("/api/v1/private/account/assets", vec![]).await;
+        raw("/api/v1/private/account/asset/USDT", vec![]).await;
+        raw(POSITIONS, vec![]).await;
+        raw(
+            OPEN_ORDERS,
+            vec![("page_num", "1".into()), ("page_size", "20".into())],
+        )
+        .await;
+        raw(LEVERAGE, vec![("symbol", "NVIDIA_USDT".into())]).await;
+        raw(
+            "/api/v1/private/position/funding_records",
+            vec![("page_num", "1".into()), ("page_size", "20".into())],
+        )
+        .await;
+        raw(
+            "/api/v1/private/order/list/order_deals",
+            vec![
+                ("symbol", "NVIDIA_USDT".into()),
+                ("start_time", (now - 7 * day).to_string()),
+                ("end_time", now.to_string()),
+                ("page_num", "1".into()),
+                ("page_size", "20".into()),
+            ],
+        )
+        .await;
+        raw(
+            "/api/v1/private/order/list/history_orders",
+            vec![("page_num", "1".into()), ("page_size", "5".into())],
+        )
+        .await;
+        raw(CONTRACTS, vec![("symbol", "NVIDIA_USDT".into())]).await;
+        // 账户费率按合约查（不带 symbol 回的是某个默认合约的）。
+        for symbol in ["NVIDIA_USDT", "BTC_USDT", "NEAR_USDT", "AAPLSTOCK_USDT"] {
+            raw(FEES, vec![("symbol", symbol.into())]).await;
+        }
+        // 成交查询的时间窗口上限：30 天、89 天、100 天各试一次（只看是否报错和条数）。
+        for days in [30i64, 89, 100] {
+            raw(
+                "/api/v1/private/order/list/order_deals",
+                vec![
+                    ("symbol", "BTC_USDT".into()),
+                    ("start_time", (now - days * day).to_string()),
+                    ("end_time", now.to_string()),
+                    ("page_num", "1".into()),
+                    ("page_size", "100".into()),
+                ],
+            )
+            .await;
+        }
+        // 有成交的合约：成交、资金费的行长什么样。
+        for symbol in var("ARB_PROBE_DEALS").unwrap_or_default().split(',') {
+            let symbol = symbol.trim();
+            if symbol.is_empty() {
+                continue;
+            }
+            raw(
+                "/api/v1/private/order/list/order_deals",
+                vec![
+                    ("symbol", symbol.to_string()),
+                    ("start_time", (now - 7 * day).to_string()),
+                    ("end_time", now.to_string()),
+                    ("page_num", "1".into()),
+                    ("page_size", "3".into()),
+                ],
+            )
+            .await;
+            raw(
+                "/api/v1/private/position/funding_records",
+                vec![
+                    ("symbol", symbol.to_string()),
+                    ("page_num", "1".into()),
+                    ("page_size", "3".into()),
+                ],
+            )
+            .await;
+        }
+        for round in ["cold", "cached"] {
+            let started = Instant::now();
+            let catalog = broker.catalog(CONTRACTS_TTL).await;
+            println!(
+                "contract catalog ({round}): {:?} contracts, {:?} names ({} ms)",
+                catalog.as_ref().map(|c| c.contracts.len()),
+                catalog.as_ref().map(|c| c.names.len()),
+                started.elapsed().as_millis()
+            );
+        }
+        for base in ["BTC", "NVDA", "NVIDIA", "AAPL"] {
+            let found = broker.resolve(&Symbol::perp(base, "USDT")).await;
+            println!(
+                "resolve {base}: {:?}",
+                found.map(|c| (c.symbol, c.contract_size.0, c.state, c.api_allowed))
+            );
+        }
+        println!(
+            "positions: {:?}",
+            broker.positions().await.map(|rows| rows.len())
+        );
+        println!(
+            "open orders: {:?}",
+            broker.open_orders().await.map(|rows| rows.len())
+        );
+        println!(
+            "leg state NVDA: {:?}",
+            broker
+                .leg_state(&Symbol::perp("NVDA", "USDT"))
+                .await
+                .map(|state| state.is_some())
+        );
+        let nvda = Symbol::perp("NVDA", "USDT");
+        for round in ["first", "second"] {
+            let started = Instant::now();
+            let warmed = broker.warm_reads(&nvda, Some(dec!(3))).await;
+            println!(
+                "warm_reads(NVDA, 3x) {round}: {warmed:?} ({} ms)",
+                started.elapsed().as_millis()
+            );
+        }
+        for base in ["NVDA", "XAU", "BTC", "NOPE"] {
+            let symbol = Symbol::perp(base, "USDT");
+            println!(
+                "{base} halted now (open / close): {:?} / {:?}",
+                broker.trading_halted(&symbol, false).await,
+                broker.trading_halted(&symbol, true).await
+            );
+        }
+        println!("free collateral: {:?}", broker.free_collateral().await);
+        let since = Utc::now() - chrono::Duration::days(30);
+        for base in var("ARB_PROBE_FILLS")
+            .unwrap_or_else(|| "BTC".into())
+            .split(',')
+        {
+            let symbol = Symbol::perp(base.trim(), "USDT");
+            let started = Instant::now();
+            println!(
+                "{base} funding since 30 days: {:?} ({} ms)",
+                broker.funding_since(&symbol, since).await,
+                started.elapsed().as_millis()
+            );
+            let started = Instant::now();
+            match broker.fills_between(&symbol, since, Utc::now()).await {
+                Ok(Some(fills)) => {
+                    for fill in fills.iter().rev().take(4) {
+                        println!(
+                            "  {base} fill {} {:?} {} @ {} fee {} {:?}",
+                            fill.at,
+                            fill.side,
+                            fill.quantity,
+                            fill.price,
+                            fill.fee_usdt,
+                            fill.effect
+                        );
+                    }
+                    println!(
+                        "{base}: {} fill(s) in 30 days ({} ms)",
+                        fills.len(),
+                        started.elapsed().as_millis()
+                    );
+                }
+                other => println!("{base} fills: {other:?}"),
+            }
+        }
+        if let Some(failure) = connect_failure {
+            panic!("connect FAILED — the live desk would not connect: {failure}");
+        }
     }
 }

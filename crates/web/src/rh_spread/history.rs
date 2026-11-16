@@ -12,6 +12,10 @@ use super::session::Session;
 
 /// 「正常水平」回看多少天。
 pub const WINDOW_DAYS: i64 = 7;
+/// 近期可成交价差在内存里留多久（[`History::recent_entry`] 的窗口不超过它）。
+pub const RECENT_KEEP_HOURS: i64 = 24;
+/// 近期可成交价差的中位数至少要这么多分钟样本，不够就当不知道。
+pub const RECENT_MIN_MINUTES: usize = 60;
 /// 同一时段至少攒够多少分钟才给「正常水平」：太少的样本只会把一时的偏离当成常态。
 pub const MIN_MINUTES: usize = 120;
 /// 文件保留多少天。
@@ -52,6 +56,20 @@ pub struct Normal {
 #[derive(Debug, Default)]
 pub struct History {
     rows: HashMap<String, VecDeque<(i64, Session, f64)>>,
+    /// 最近 [`RECENT_KEEP_HOURS`] 每分钟的可成交价差（多 a 空 b、多 b 空 a 的分钟最大值，缺盘口为 NaN）。
+    recent: HashMap<String, VecDeque<(i64, f32, f32)>>,
+}
+
+/// 一个合约近期（最近几小时）两个方向「可成交价差」的分钟最大值的中位数（%）。样本不够的方向为 `None`。
+///
+/// 和 7 天的「正常水平」不同：价差整体换了水平（某次实盘 从 1.7% 跳到 2.7%）之后，7 天中位要等
+/// 新水平攒够一半才跟上，这段时间里每个读数都显得「远高于正常」。近期中位几个小时就跟上了。
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub struct RecentEntry {
+    /// 回看了几小时。
+    pub hours: i64,
+    pub long_a_pct: Option<f64>,
+    pub long_b_pct: Option<f64>,
 }
 
 impl History {
@@ -62,6 +80,14 @@ impl History {
             return;
         }
         series.push_back((row.t, row.k, row.b));
+        if row.ea.is_some() || row.el.is_some() {
+            let as_f32 = |value: Option<f64>| value.map_or(f32::NAN, |v| v as f32);
+            self.recent.entry(row.s.clone()).or_default().push_back((
+                row.t,
+                as_f32(row.ea),
+                as_f32(row.el),
+            ));
+        }
     }
 
     /// 丢掉窗口之外的旧行。
@@ -73,6 +99,46 @@ impl History {
             }
         }
         self.rows.retain(|_, series| !series.is_empty());
+        let recent_cutoff = (now - Duration::hours(RECENT_KEEP_HOURS)).timestamp();
+        for series in self.recent.values_mut() {
+            while series.front().is_some_and(|(t, ..)| *t < recent_cutoff) {
+                series.pop_front();
+            }
+        }
+        self.recent.retain(|_, series| !series.is_empty());
+    }
+
+    /// 这个合约最近 `hours` 小时（不超过 [`RECENT_KEEP_HOURS`]）两个方向可成交价差的中位数，见 [`RecentEntry`]。
+    /// 两个方向都不够 [`RECENT_MIN_MINUTES`] 分钟样本时为 `None`。
+    pub fn recent_entry(
+        &self,
+        symbol: &str,
+        hours: i64,
+        now: DateTime<Utc>,
+    ) -> Option<RecentEntry> {
+        let hours = hours.clamp(1, RECENT_KEEP_HOURS);
+        let cutoff = (now - Duration::hours(hours)).timestamp();
+        let series = self.recent.get(symbol)?;
+        let median = |pick: fn(&(i64, f32, f32)) -> f32| {
+            let mut values: Vec<f64> = series
+                .iter()
+                .filter(|row| row.0 >= cutoff)
+                .map(pick)
+                .filter(|value| value.is_finite())
+                .map(f64::from)
+                .collect();
+            if values.len() < RECENT_MIN_MINUTES {
+                return None;
+            }
+            values.sort_by(f64::total_cmp);
+            Some((percentile(&values, 0.5) * 1e5).round() / 1e5)
+        };
+        let entry = RecentEntry {
+            hours,
+            long_a_pct: median(|row| row.1),
+            long_b_pct: median(|row| row.2),
+        };
+        (entry.long_a_pct.is_some() || entry.long_b_pct.is_some()).then_some(entry)
     }
 
     /// 这个合约在这个时段的正常水平；样本不够 [`MIN_MINUTES`] 为 `None`。
@@ -168,6 +234,21 @@ pub async fn append(
     rows: &[Row],
     now: DateTime<Utc>,
 ) -> std::io::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    write_rows(dir, prefix, rows, now).await?;
+    remove_expired(dir, prefix, now).await;
+    Ok(())
+}
+
+/// 只追加到当天文件，不清理旧文件（清理要扫整个目录，见 [`Writer`]）。
+pub async fn write_rows(
+    dir: &Path,
+    prefix: &str,
+    rows: &[Row],
+    now: DateTime<Utc>,
+) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     if rows.is_empty() {
         return Ok(());
@@ -185,6 +266,11 @@ pub async fn append(
         .await?;
     file.write_all(text.as_bytes()).await?;
     file.flush().await?;
+    Ok(())
+}
+
+/// 删掉这一组超过 [`KEEP_DAYS`] 的旧文件。
+pub async fn remove_expired(dir: &Path, prefix: &str, now: DateTime<Utc>) {
     let oldest = file_for(dir, prefix, (now - Duration::days(KEEP_DAYS)).date_naive());
     let head = format!("{prefix}-");
     if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
@@ -201,5 +287,56 @@ pub async fn append(
             }
         }
     }
-    Ok(())
+}
+
+/// 后台写分钟历史：价差监控主循环换分钟时把各组的行丢进来就走，不在主循环里等文件读写。
+///
+/// 以前主循环逐组 `append`（约 48 组，每组还要扫一遍几百个文件的目录删旧文件），
+/// 线上换分钟那一轮要 0.3～0.8 秒，期间各家盘口更新都在排队。
+/// 这里按收到的顺序写；旧文件每组每天只清一次。
+/// 一次换分钟要写的：各组（文件前缀, 行），以及时刻。
+type WriteBatch = (Vec<(String, Vec<Row>)>, DateTime<Utc>);
+
+pub struct Writer {
+    tx: tokio::sync::mpsc::UnboundedSender<WriteBatch>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Writer {
+    pub fn spawn(dir: std::path::PathBuf) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WriteBatch>();
+        let task = tokio::spawn(async move {
+            let mut cleaned: HashMap<String, NaiveDate> = HashMap::new();
+            while let Some((batch, now)) = rx.recv().await {
+                for (prefix, rows) in batch {
+                    if let Err(error) = write_rows(&dir, &prefix, &rows, now).await {
+                        warn!(prefix = %prefix, "价差历史写不进去：{error}");
+                    }
+                    let today = now.date_naive();
+                    if cleaned.get(&prefix) != Some(&today) {
+                        remove_expired(&dir, &prefix, now).await;
+                        cleaned.insert(prefix, today);
+                    }
+                }
+            }
+        });
+        Self { tx, task }
+    }
+
+    /// 交给后台写；空的组不发。
+    pub fn send(&self, batch: Vec<(String, Vec<Row>)>, now: DateTime<Utc>) {
+        let batch: Vec<_> = batch
+            .into_iter()
+            .filter(|(_, rows)| !rows.is_empty())
+            .collect();
+        if !batch.is_empty() {
+            let _ = self.tx.send((batch, now));
+        }
+    }
+
+    /// 停机：等已经交出去的写完（最多 `wait`）。
+    pub async fn finish(self, wait: std::time::Duration) {
+        drop(self.tx);
+        let _ = tokio::time::timeout(wait, self.task).await;
+    }
 }

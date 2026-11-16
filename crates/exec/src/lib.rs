@@ -25,12 +25,15 @@ pub mod arcus_broker;
 pub mod aster_broker;
 pub mod binance_broker;
 pub mod bitget_broker;
+pub mod bitget_uta_broker;
+pub mod breakdown;
 pub mod broker;
 pub mod bybit_broker;
 pub mod cli;
 pub mod desk;
 pub mod executor;
 pub mod gate_broker;
+pub mod hl_ws;
 pub mod hyperliquid_broker;
 pub mod ledger;
 pub mod lighter_broker;
@@ -44,10 +47,14 @@ pub mod preflight;
 pub mod reconcile;
 pub mod report;
 pub mod settlement;
+pub mod sizing;
 pub mod types;
 
 pub use broker::{Broker, FundingTotal, PaperBroker, VenueLegState, VenuePosition};
-pub use executor::{ExecutionOutcome, Executor, PositionSetup};
+pub use executor::{
+    AddSettle, BALANCED_HEDGE_NOTE, ExecutionOutcome, Executor, ExitGuard, FORCED_HEDGE_NOTE,
+    GuardedExit, MAKER_DUST_NOTE, PositionSetup, RESUME_HEDGE_TOLERANCE, RESUMED_NOTE, Resume,
+};
 pub use ledger::{Ledger, Record, Replayed, replay_file};
 pub use monitor::{
     Action, Evaluation, ExitCheck, ExitQuote, Observation, basis_exit_triggered, evaluate,

@@ -75,6 +75,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+mod fill_feed;
+mod order_feed;
+
 use crate::broker::{Broker, FundingTotal, MarginOutcome, VenueLegState, VenuePosition};
 use crate::live_common::Verified;
 use crate::types::{ClientOrderId, NewOrder, OrderAck, OrderState, OrderStatus};
@@ -102,6 +105,14 @@ impl LighterDeployment {
         }
     }
 
+    /// 推送（WebSocket）地址：与 [`Self::base_url`] 同一个主机。
+    pub const fn stream_url(self) -> &'static str {
+        match self {
+            Self::Mainnet => "wss://mainnet.zklighter.elliot.ai/stream",
+            Self::Robinhood => "wss://api.rh.lighter.xyz/stream",
+        }
+    }
+
     pub const fn chain_id(self) -> u32 {
         match self {
             Self::Mainnet => 304,
@@ -118,11 +129,44 @@ const LEVERAGE_VERIFIED_TTL: Duration = Duration::from_secs(20);
 /// 下单后等订单可查的轮询间隔：前 3 次快一点，之后放慢（读请求和扫描、预检共用同一个出口 IP 的限频）。
 const ORDER_POLL_FAST: Duration = Duration::from_millis(100);
 const ORDER_POLL_SLOW: Duration = Duration::from_millis(250);
+/// 只减仓单核对持仓对不上时的重读间隔（共约 1.5 秒）：账户持仓可能比推送晚一点跟上刚成交的单。
+const POSITION_REREADS: [Duration; 4] = [
+    Duration::from_millis(250),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_millis(500),
+];
+/// 第一腿最多等账户成交推送多久（和 REST 轮询的总时长相当；REST 先有结果就不等了）。
+const PUSH_WAIT: Duration = Duration::from_secs(10);
+/// 平仓 / 回滚定价时盘口往返超过它就算慢（见 `bound_price`）：重拉一次，还慢就按 [`SLOW_BOOK_WIDEN`] 倍的价格保护照样平。
+const SLOW_BOOK: Duration = Duration::from_secs(2);
+const SLOW_BOOK_WIDEN: Decimal = Decimal::TWO;
+/// 刚发出的 IOC 查到还活着时最多再轮询几次等它到终态（见 `poll_placed`）。
+const LIVE_REPOLLS: u32 = 8;
+/// 按成交推送记下终态（[`LighterBroker::submit_order`]）之后这么久内，`order_state` 直接给那个终态、不去读
+/// REST：`accountOrders` 要到撮合后约 1.1 秒才查得到这张单，这时读只是白白多一个往返。过了这个时间
+/// 再查，就读 REST 核对并换成读回的终态（[`LighterBroker::verify_pushed`]）。
+const PUSHED_VERIFY_AFTER: Duration = Duration::from_secs(3);
+/// 上一次预留的 nonce 过了这么久，服务器的下一个 nonce 还停在它身上，就当那笔交易没被执行（sendTx 收下了、
+/// 序列器之后丢了）。某次实盘 补仓单就这样占着一个 nonce 不放，之后 Lighter 上所有写（含平仓）
+/// 都被「上一个 nonce 未决」拦了近 5 小时。真有迟到的旧交易也不会重复成交：同一个 nonce 只能有一笔被执行，
+/// 输的那笔照常按订单读回/持仓对比处理。
+const NONCE_STALE_AFTER: Duration = Duration::from_secs(30);
 const READ_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
     Duration::from_secs(4),
     Duration::from_secs(8),
+];
+/// 订单行已显示成交、但 `trades` 明细还没出齐（成交量小于订单已成交量）时，重读明细的间隔（共约 4.5 秒）。
+/// 2026-10-15 东京 某合约 平仓：lighter-rh 买回单已成交，立刻回读时明细对不上，报「状态不明」，
+/// 平仓卡在 Closing、对账连续不干净（期间所有规则暂停），30 分钟后重读才一致 —— 是读后短暂的不一致。
+/// 只在「明细比订单少」时重读；明细比订单多、或数量对得上而金额对不上，是真不一致，立即拒绝。
+const TRADES_SETTLE_DELAYS: [Duration; 4] = [
+    Duration::from_millis(300),
+    Duration::from_millis(600),
+    Duration::from_millis(1200),
+    Duration::from_millis(2400),
 ];
 /// `add_margin` 发出 `sendTx` 之后回读分配保证金的次数与间隔（共约 3 秒）。读请求和扫描共用同一个
 /// 出口 IP 的限频，所以少读几次；窗口内没看到保证金增加就按「结果不明」处理。
@@ -198,6 +242,12 @@ pub struct LighterBroker {
     verified_leverage: Verified<(i32, i32, crate::MarginMode)>,
     /// 预热时按（合约, 杠杆）记下「已经是目标杠杆」：`prepare_open` 据此不必再读市场列表与账户。
     warmed: Verified<(Symbol, Decimal)>,
+    /// 刚按成交推送记下终态的订单（客户订单序号）：[`PUSHED_VERIFY_AFTER`] 内 `order_state` 不读 REST。
+    pushed_recently: Verified<i64>,
+    /// 账户成交推送（[`fill_feed`]）：第一腿撮合后几十毫秒就知道成交。只在能下单时开；没有就全走 REST。
+    fills: Option<Arc<fill_feed::FillFeed>>,
+    /// 账户订单状态推送（[`order_feed`]，影子阶段：只记录、在日志里和 REST 对比，不参与下单判断）。
+    orders: Option<Arc<order_feed::OrderFeed>>,
     _registration: Registration,
 }
 
@@ -253,6 +303,9 @@ impl LighterBroker {
             fee: Decimal::ZERO,
             verified_leverage: Verified::new(LEVERAGE_VERIFIED_TTL),
             warmed: Verified::new(LEVERAGE_VERIFIED_TTL),
+            pushed_recently: Verified::new(PUSHED_VERIFY_AFTER),
+            fills: None,
+            orders: None,
             _registration: registration,
         };
         let _: Orders = broker
@@ -273,6 +326,28 @@ impl LighterBroker {
             return Err(err("negative account taker fee"));
         }
         broker.fee = Decimal::from(fees.current_taker_fee_tick) / Decimal::from(1_000_000);
+        // 后台连，连不上只是第一腿慢一点（照旧 REST 确认），不拖累交易台连接。
+        if broker.enabled {
+            let feed = fill_feed::FillFeed::new(broker.account, broker.fee);
+            feed.spawn(
+                broker.deployment.stream_url().to_string(),
+                broker.deployment.venue(),
+            );
+            broker.fills = Some(feed);
+            let orders = order_feed::OrderFeed::new(broker.account);
+            let signer = Arc::clone(&broker.signer);
+            let (key, account) = (broker.key, broker.account);
+            orders.spawn(
+                broker.deployment.stream_url().to_string(),
+                broker.deployment.venue(),
+                Arc::new(move |deadline| {
+                    signer
+                        .auth(deadline, key, account)
+                        .map_err(|error| error.to_string())
+                }),
+            );
+            broker.orders = Some(orders);
+        }
         Ok(broker)
     }
 
@@ -305,7 +380,21 @@ impl LighterBroker {
         query: &[(&str, String)],
         auth: bool,
     ) -> ArbResult<T> {
+        self.get_timed(endpoint, query, auth)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// 同 [`Self::get`]，另外给出**成功的那一次请求**自己的往返时长：限频重试前的等待不算在内
+    /// （平仓保护价看的是盘口新不新，不是这次读一共等了多久）。
+    async fn get_timed<T: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        query: &[(&str, String)],
+        auth: bool,
+    ) -> ArbResult<(T, Duration)> {
         for delay in READ_RETRY_DELAYS.iter().map(Some).chain([None]) {
+            let attempt = Instant::now();
             let mut request = self
                 .client
                 .get(self.url(endpoint))
@@ -315,7 +404,7 @@ impl LighterBroker {
                 request = request.header(reqwest::header::AUTHORIZATION, self.auth()?);
             }
             match fetch(request, endpoint).await {
-                Ok(value) => return Ok(value),
+                Ok(value) => return Ok((value, attempt.elapsed())),
                 Err(Failure::Transient(error)) => match delay {
                     Some(delay) => tokio::time::sleep(*delay).await,
                     None => return Err(error),
@@ -423,6 +512,11 @@ impl LighterBroker {
     /// Persist each reservation before sending. A timeout or unconsumed reservation
     /// blocks further writes instead of guessing whether reusing it is safe.
     async fn reserve_nonce(&self, journal: &mut Journal) -> ArbResult<i64> {
+        self.reserve_nonce_from(journal, None).await
+    }
+
+    /// 服务端给的下一个 nonce（只读，不预留）。
+    async fn next_nonce(&self) -> ArbResult<i64> {
         let next: NextNonce = self
             .get(
                 "nextNonce",
@@ -433,24 +527,55 @@ impl LighterBroker {
                 false,
             )
             .await?;
+        Ok(next.nonce)
+    }
+
+    /// [`Self::reserve_nonce`]，`prefetched` 是同一把 journal 锁内、之后没发过任何交易时提前读到的
+    /// `nextNonce`（下单时和「订单号是否已被占用」并发读，省一个往返）；`None` 就现读。校验与落盘不变。
+    async fn reserve_nonce_from(
+        &self,
+        journal: &mut Journal,
+        prefetched: Option<i64>,
+    ) -> ArbResult<i64> {
+        let next = NextNonce {
+            nonce: match prefetched {
+                Some(nonce) => nonce,
+                None => self.next_nonce().await?,
+            },
+        };
+        if next.nonce >= 0 && journal.last_nonce.is_some_and(|last| next.nonce <= last) {
+            let stuck = journal.last_nonce;
+            if journal.release_if_unconsumed(next.nonce, NONCE_STALE_AFTER)? {
+                tracing::warn!(
+                    nonce = ?stuck,
+                    "Lighter 上一次预留的 nonce 一直没被服务器用掉（交易被收下后没执行），已把预留还回去，写操作恢复"
+                );
+            }
+        }
         if next.nonce < 0 || journal.last_nonce.is_some_and(|last| next.nonce <= last) {
+            tracing::error!(
+                server_next = next.nonce,
+                journal_last = ?journal.last_nonce,
+                "Lighter nonce 卡住：上一个 nonce 未决，这把 key 暂时不能下单（含平仓）"
+            );
             return Err(err(
                 "previous nonce is unresolved; reconcile before another transaction",
             ));
         }
-        journal.append(&JournalRecord::Nonce { nonce: next.nonce })?;
-        journal.last_nonce = Some(next.nonce);
+        journal.reserve(next.nonce)?;
         Ok(next.nonce)
     }
 
     /// Bounded IOC price for orders without an explicit limit. Never widens past `s`.
     async fn bound_price(&self, market: &Market, side: Side) -> ArbResult<Decimal> {
-        let slippage = self
+        let mut slippage = self
             .slippage
             .ok_or_else(|| err("orders without a limit price require explicit market_slippage"))?;
-        let started = Instant::now();
-        let book: Book = self
-            .get(
+        // 只看拿到盘口的那一次请求：限频重试前的等待（1、2、4、8 秒）不说明盘口旧，以前算进去会让限频时的平仓、
+        // 回滚被自己拒掉（10-31 审查）。往返超过 2 秒（盘口可能已经旧了）：重拉一次；还慢就照样平，价格保护放宽
+        // 一倍 —— 没有限价的都是平仓 / 回滚 / 减仓，拒单只会让单腿一直裸着（11-07 审查）。
+        let fetch = || async {
+            self.get_timed::<Book>(
                 "orderBookOrders",
                 &[
                     ("market_id", market.market_id.to_string()),
@@ -458,11 +583,19 @@ impl LighterBroker {
                 ],
                 false,
             )
-            .await?;
-        if started.elapsed() > Duration::from_secs(2) {
-            return Err(err(
-                "order book round trip exceeded 2s; refusing a stale price bound",
-            ));
+            .await
+        };
+        let (mut book, mut round_trip) = fetch().await?;
+        if round_trip > SLOW_BOOK {
+            (book, round_trip) = fetch().await?;
+            if round_trip > SLOW_BOOK {
+                slippage *= SLOW_BOOK_WIDEN;
+                tracing::warn!(
+                    market = market.market_id,
+                    ms = round_trip.as_millis() as u64,
+                    "盘口往返两次都超过 2 秒：照样平，价格保护放宽一倍"
+                );
+            }
         }
         let best = |rows: &[BookOrder], ask: bool| -> ArbResult<Option<Decimal>> {
             let mut best: Option<Decimal> = None;
@@ -497,23 +630,29 @@ impl LighterBroker {
         }
     }
 
-    async fn submit(&self, signed: SignedTx) -> ArbResult<()> {
+    /// 发出这一笔（也是唯一一次）`sendTx`。`Ok(None)` = API 收下了；`Ok(Some(原因))` = API 服务器明确拒绝
+    /// （限频、业务码），交易没有排队、nonce 没被用掉，已把预留还回去；`Err` = 结果不明（超时、5xx、回包看不懂），
+    /// nonce 留着等自动释放或对账。
+    ///
+    /// 以前所有失败都走 `Err`：被限频拒掉的下单意图永远没有终态，之后每次读回都报「不许重发」，开仓腿就此裸着、
+    /// 平仓单永远发不出（与补保证金的分类不一致，见 [`classify_send`]）。
+    async fn submit(
+        &self,
+        journal: &mut Journal,
+        nonce: i64,
+        signed: SignedTx,
+    ) -> ArbResult<Option<String>> {
         self.authorize_write()?;
-        let ack: SendAck = response(
-            self.client
-                .post(self.url("sendTx"))
-                .timeout(Duration::from_secs(15))
-                .form(&[
-                    ("tx_type", signed.kind.to_string()),
-                    ("tx_info", signed.info),
-                ]),
-            "sendTx",
-        )
-        .await?;
-        if ack.tx_hash != signed.hash {
-            return Err(err("sendTx hash does not match signed transaction"));
+        match self.send_tx(&signed, "nothing was executed").await {
+            MarginSend::Accepted => Ok(None),
+            MarginSend::Refused(reason) => Ok(Some(match journal.hand_back(nonce) {
+                Ok(()) => reason,
+                Err(release) => format!("{reason} (nonce reservation not released: {release})"),
+            })),
+            MarginSend::Unknown(reason) => Err(err(format!(
+                "{reason}; nonce {nonce} stays reserved until reconciled"
+            ))),
         }
-        Ok(())
     }
 
     /// 把这个市场设成所选保证金模式 + 指定杠杆，并读回确认。`known` 是刚读到的账户（预热时和市场列表并发读），
@@ -549,9 +688,18 @@ impl LighterBroker {
         }
         let nonce = self.reserve_nonce(journal).await?;
         let signed =
-            self.signer
-                .leverage(market.market_id, imf, mode, nonce, self.key, self.account)?;
-        self.submit(signed).await?;
+            match self
+                .signer
+                .leverage(market.market_id, imf, mode, nonce, self.key, self.account)
+            {
+                Ok(signed) => signed,
+                Err(error) => return Err(released(journal, nonce, error)),
+            };
+        if let Some(reason) = self.submit(journal, nonce, signed).await? {
+            return Err(err(format!(
+                "leverage update refused: {reason}; order was not submitted"
+            )));
+        }
         // Read back the selected margin mode and leverage, not just the tx ack.
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -577,6 +725,12 @@ impl LighterBroker {
                 return Err(err("client index collision in journal"));
             }
             if let Some(state) = &intent.terminal {
+                // 按成交推送记的终态（带 `fee_estimated`）：REST 查得到之后核对一次、换成读回的。
+                if state.fee_estimated && !self.pushed_recently.is_fresh(&index) {
+                    return Ok(Some(
+                        self.verify_pushed(journal, index, intent, state).await,
+                    ));
+                }
                 return Ok(Some(state.clone()));
             }
         }
@@ -597,6 +751,62 @@ impl LighterBroker {
         }
         self.save_terminal(journal, index, &state)?;
         Ok(Some(state))
+    }
+
+    /// 按成交推送记下的终态（第二腿、平仓、回滚：[`Self::submit_order`]）用 REST 读回核对：读得到终态就换成
+    /// 读回的（`fee_estimated` 清掉）并落盘，和推送的数不一样就告警；读不到、读不全就照旧给推送的那个，
+    /// 下次再核。只读，不发单。
+    async fn verify_pushed(
+        &self,
+        journal: &mut Journal,
+        index: i64,
+        intent: &Intent,
+        pushed: &OrderState,
+    ) -> OrderState {
+        let read = async {
+            let Some(row) = self.remote_order(index).await? else {
+                return Ok(None);
+            };
+            let markets = self.markets().await?;
+            self.convert_order(&row, Some(intent), &markets)
+                .await
+                .map(Some)
+        };
+        let read: ArbResult<Option<OrderState>> = read.await;
+        match read {
+            Ok(Some(state)) if !state.status.is_live() && state.order == pushed.order => {
+                if let Some(diff) = pushed_differs(pushed, &state) {
+                    tracing::warn!(
+                        order = %pushed.order.client_order_id,
+                        venue = %self.deployment.venue(),
+                        "Lighter 按成交推送记的终态与 REST 读回不一致（{diff}）：已换成读回的"
+                    );
+                }
+                match self.save_terminal(journal, index, &state) {
+                    Ok(()) => state,
+                    Err(error) => {
+                        tracing::warn!(order = %pushed.order.client_order_id, %error,
+                            "Lighter 读回核对过的终态没落成盘，照旧用成交推送的");
+                        pushed.clone()
+                    }
+                }
+            }
+            Ok(Some(state)) => {
+                tracing::warn!(
+                    order = %pushed.order.client_order_id,
+                    venue = %self.deployment.venue(),
+                    status = ?state.status,
+                    "Lighter 成交推送报了全部成交，REST 读回却不是同一张已结束的单：照旧用推送的，下次再核"
+                );
+                pushed.clone()
+            }
+            Ok(None) => pushed.clone(),
+            Err(error) => {
+                tracing::debug!(order = %pushed.order.client_order_id, %error,
+                    "Lighter 按成交推送记的终态这次没核对成，下次再核");
+                pushed.clone()
+            }
+        }
     }
 
     fn save_terminal(
@@ -661,6 +871,7 @@ impl LighterBroker {
         } else {
             // Expose unknown exchange orders for reconciliation, never hide them.
             NewOrder {
+                post_only: false,
                 margin_mode: crate::MarginMode::Isolated,
                 client_order_id: ClientOrderId(format!(
                     "{}-external-{}",
@@ -697,6 +908,7 @@ impl LighterBroker {
                 None
             },
             fee_usdt: fee,
+            fee_estimated: false,
             reject_reason: row
                 .status
                 .starts_with("canceled-")
@@ -704,12 +916,44 @@ impl LighterBroker {
         })
     }
 
+    /// 订单的成交手续费，按 `trades` 明细逐笔算。明细暂时比订单已成交量少（读后短暂不一致）时重读几次
+    /// （[`TRADES_SETTLE_DELAYS`]）；重读之后仍对不上就和以前一样拒绝下结论 —— 绝不编造费用或成交。
     async fn order_fees(
         &self,
         order: &RemoteOrder,
         filled: Decimal,
         quote: Decimal,
     ) -> ArbResult<Decimal> {
+        self.order_fees_after(order, filled, quote, &TRADES_SETTLE_DELAYS)
+            .await
+    }
+
+    /// [`Self::order_fees`]，重读间隔可指定（测试用短间隔）。
+    async fn order_fees_after(
+        &self,
+        order: &RemoteOrder,
+        filled: Decimal,
+        quote: Decimal,
+        delays: &[Duration],
+    ) -> ArbResult<Decimal> {
+        for delay in delays {
+            if let Some(fees) = self.order_fees_once(order, filled, quote).await? {
+                return Ok(fees);
+            }
+            tokio::time::sleep(*delay).await;
+        }
+        self.order_fees_once(order, filled, quote)
+            .await?
+            .ok_or_else(|| err("fills/trades not yet consistent; refusing invented fee or fill"))
+    }
+
+    /// 读一遍明细。`Ok(None)` = 明细比订单少（可能还没出齐，可以重读）；其余对不上的情况直接 `Err`。
+    async fn order_fees_once(
+        &self,
+        order: &RemoteOrder,
+        filled: Decimal,
+        quote: Decimal,
+    ) -> ArbResult<Option<Decimal>> {
         let mut cursor = String::new();
         let mut cursors = HashSet::new();
         let mut ids = HashSet::new();
@@ -764,12 +1008,15 @@ impl LighterBroker {
                 None => break,
             }
         }
+        if size < filled {
+            return Ok(None);
+        }
         if size != filled || value != quote {
             return Err(err(
                 "fills/trades not yet consistent; refusing invented fee or fill",
             ));
         }
-        Ok(fees)
+        Ok(Some(fees))
     }
 
     /// `Broker::add_margin` 的实现。`polls` / `interval` 是 `sendTx` 之后回读分配保证金的次数与
@@ -803,34 +1050,26 @@ impl LighterBroker {
         let mut journal = self.journal.lock().await;
         let account = self.account().await?;
         let target = margin_target(&account, symbol)?;
-        let previous = journal.last_nonce;
         let nonce = self.reserve_nonce(&mut journal).await?;
         let signed = match self
             .signer
             .margin(target.market_id, usdc, nonce, self.key, self.account)
         {
             Ok(signed) => signed,
-            Err(error) => {
-                // Nothing was sent: the reservation is safe to hand back.
-                return Err(match journal.release_nonce(nonce, previous) {
-                    Ok(()) => error,
-                    Err(release) => err(format!(
-                        "{error}; nonce reservation also could not be released: {release}"
-                    )),
-                });
-            }
+            // Nothing was sent: the reservation is safe to hand back.
+            Err(error) => return Err(released(&mut journal, nonce, error)),
         };
-        match self.send_margin(&signed).await {
+        match self.send_tx(&signed, "no margin moved").await {
             MarginSend::Accepted => {}
             MarginSend::Refused(reason) => {
-                return Ok(MarginOutcome::Refused(
-                    match journal.release_nonce(nonce, previous) {
-                        Ok(()) => reason,
-                        Err(release) => format!(
-                            "{reason} (nonce reservation not released, further writes stay blocked until reconciled: {release})"
-                        ),
-                    },
-                ));
+                // 归还时用预留那一刻记下的上一个 nonce：`reserve_nonce` 可能刚自动释放过一个卡住的预留，
+                // 调用前抓的 `last_nonce` 已经不对了。
+                return Ok(MarginOutcome::Refused(match journal.hand_back(nonce) {
+                    Ok(()) => reason,
+                    Err(release) => format!(
+                        "{reason} (nonce reservation not released, further writes stay blocked until reconciled: {release})"
+                    ),
+                }));
             }
             MarginSend::Unknown(reason) => {
                 return Ok(MarginOutcome::Unknown(format!(
@@ -855,7 +1094,7 @@ impl LighterBroker {
 
     /// 发出这一次（也是唯一一次）补保证金的 `sendTx`，把响应分成三类。从不重试；错误文本里
     /// 只有 HTTP 状态与 API 码，不回显响应体（网关可能把鉴权头或签名内容原样带回）。
-    async fn send_margin(&self, signed: &SignedTx) -> MarginSend {
+    async fn send_tx(&self, signed: &SignedTx, nothing: &str) -> MarginSend {
         let response = match self.margin_request(signed).send().await {
             Ok(response) => response,
             Err(error) => {
@@ -871,7 +1110,7 @@ impl LighterBroker {
         };
         let status = response.status();
         match response.bytes().await {
-            Ok(body) => classify_margin_send(status, &body, &signed.hash),
+            Ok(body) => classify_send(status, &body, &signed.hash, nothing),
             Err(_) => MarginSend::Unknown(format!(
                 "sendTx HTTP {status}: response body unavailable; outcome unknown"
             )),
@@ -908,16 +1147,11 @@ impl LighterBroker {
     }
 }
 
-#[async_trait]
-impl Broker for LighterBroker {
-    fn venue(&self) -> Venue {
-        self.deployment.venue()
-    }
-    fn fee_per_side(&self) -> Decimal {
-        self.fee
-    }
-
-    async fn place(&self, order: &NewOrder) -> ArbResult<OrderAck> {
+impl LighterBroker {
+    /// 下单（[`Broker::place`]、[`Broker::place_for_hedge`] 共用）。`quick`：账户成交推送（[`fill_feed`]）
+    /// 先报出全部成交就先返回待核实状态，不等 REST 查得到这张单。
+    async fn submit_order(&self, order: &NewOrder, quick: bool) -> ArbResult<Submitted> {
+        crate::broker::refuse_post_only(order)?;
         self.authorize_write()?;
         if order.venue != self.deployment.venue() {
             return Err(ArbError::venue(
@@ -941,12 +1175,16 @@ impl Broker for LighterBroker {
                 .as_ref()
                 .map(ack)
                 .transpose()?
+                .map(Submitted::Ack)
                 .ok_or_else(|| err("recorded order is not queryable"));
         }
         // Check the exchange too: another journal/process may have used the index.
         // The market list does not depend on that answer, so read both in one round trip;
-        // the index check still decides first.
-        let (existing, markets) = tokio::join!(self.remote_order(index), self.markets());
+        // the index check still decides first. 下一个 nonce 也一起读（只读，不预留）：
+        // 之后要是调杠杆用掉了一个 nonce（`last_nonce` 变了），就作废、现读。
+        let nonce_before = journal.last_nonce;
+        let (existing, markets, next_nonce) =
+            tokio::join!(self.remote_order(index), self.markets(), self.next_nonce());
         if existing?.is_some() {
             return Err(err(
                 "client index already exists without this journal's intent",
@@ -974,22 +1212,36 @@ impl Broker for LighterBroker {
             )
             .await?;
         } else {
-            let account = self.account().await?;
-            let position = account
-                .positions
-                .iter()
-                .find(|p| p.market_id == market.market_id)
-                .ok_or_else(|| err("reduce-only order has no position"))?;
-            let quantity = decimal(&position.position)?;
-            if quantity < prepared.quantity
-                || !matches!(
-                    (position.sign, order.side),
-                    (1, Side::Sell) | (-1, Side::Buy)
-                )
-            {
-                return Err(err(
-                    "reduce-only direction/quantity does not reduce the current position",
-                ));
+            // 第一腿按推送确认之后马上回滚 / 退零头时，账户持仓可能还没跟上刚成交的那张单：
+            // 对不上就隔一会儿重读几次（只读），仍对不上才拒绝。
+            let mut rereads = POSITION_REREADS.iter();
+            loop {
+                let account = self.account().await?;
+                let reduces = match account
+                    .positions
+                    .iter()
+                    .find(|p| p.market_id == market.market_id)
+                {
+                    Some(position) => {
+                        decimal(&position.position)? >= prepared.quantity
+                            && matches!(
+                                (position.sign, order.side),
+                                (1, Side::Sell) | (-1, Side::Buy)
+                            )
+                    }
+                    None => false,
+                };
+                if reduces {
+                    break;
+                }
+                match rereads.next() {
+                    Some(delay) => tokio::time::sleep(*delay).await,
+                    None => {
+                        return Err(err(
+                            "reduce-only direction/quantity does not reduce the current position",
+                        ));
+                    }
+                }
             }
         }
         let intent = Intent {
@@ -1003,8 +1255,16 @@ impl Broker for LighterBroker {
             intent: intent.clone(),
         })?;
         journal.orders.insert(index, intent);
-        let nonce = self.reserve_nonce(&mut journal).await?;
-        let signed = self.signer.order(
+        let prefetched = next_nonce
+            .ok()
+            .filter(|_| journal.last_nonce == nonce_before);
+        // 到 sendTx 之前出错 = 这张单没有发出过：把意图记成被拒，读回时才不会永远「读不到、不许重发」
+        // （2026-10-28 nonce 卡住那几个小时，某合约 / 某合约 的退出单就是这样被冻住的）。
+        let nonce = match self.reserve_nonce_from(&mut journal, prefetched).await {
+            Ok(nonce) => nonce,
+            Err(error) => return Err(self.abandon_unsent(&mut journal, index, error)),
+        };
+        let signed = match self.signer.order(
             market.market_id,
             index,
             prepared.base,
@@ -1014,13 +1274,90 @@ impl Broker for LighterBroker {
             nonce,
             self.key,
             self.account,
-        )?;
-        self.submit(signed).await?;
-        // IOC can still be pending after sendTx. Wait for an observable order;
-        // a terminal fill is only reported from its cumulative executed quantities.
+        ) {
+            Ok(signed) => signed,
+            Err(error) => {
+                let error = released(&mut journal, nonce, error);
+                return Err(self.abandon_unsent(&mut journal, index, error));
+            }
+        };
+        let sent_at = Instant::now();
+        if let Some(reason) = self.submit(&mut journal, nonce, signed).await? {
+            return Err(self.abandon_unsent(&mut journal, index, err(reason)));
+        }
+        let market_id = market.market_id;
+        // 账户成交推送和 REST 轮询同时等，谁先给出结果用谁。推送只在全部成交时才算数（部分成交、没成交
+        // 都等 REST 定）。标准账户的吃单发出后约 0.3 秒撮合，推送几十毫秒就到，`accountOrders` 要再过
+        // 约 1.1 秒才查得到（11-07～11-14 第二腿中位 1375ms，其中 1 秒多是在等 REST）。
+        // - 第一腿（`quick`）：给待核实状态，落账靠之后的 `settle_hedge`。
+        // - 第二腿、平仓、回滚：全部成交的 IOC 已经是终态，按推送里逐笔的准数落盘（打上 `fee_estimated`，
+        //   意思是「还没和 REST 核对过」），之后 `order_state` / 后台的 `correct_estimated_fees` 读回核对。
+        if let Some(feed) = self.fills.as_ref().filter(|feed| feed.is_connected()) {
+            let pushed =
+                feed.wait_filled(index, market_id, order.side, prepared.quantity, PUSH_WAIT);
+            let raced = tokio::select! {
+                polled = self.poll_placed(&mut journal, index, &markets, Some(sent_at)) => Raced::Polled(Box::new(polled)),
+                Some(pushed) = pushed => Raced::Pushed(pushed),
+            };
+            return match raced {
+                Raced::Polled(polled) => ack(&(*polled)?).map(Submitted::Ack),
+                Raced::Pushed(pushed) => {
+                    let mut state = pushed_state(order, market_id, &pushed);
+                    if quick {
+                        return Ok(Submitted::Provisional(Box::new(state)));
+                    }
+                    state.fee_estimated = true;
+                    self.save_terminal(&mut journal, index, &state)?;
+                    self.pushed_recently.mark(index);
+                    tracing::info!(
+                        order = %order.client_order_id,
+                        venue = %self.deployment.venue(),
+                        waited_ms = sent_at.elapsed().as_millis() as u64,
+                        "Lighter 下单后按成交推送确认到终态"
+                    );
+                    ack(&state).map(Submitted::Ack)
+                }
+            };
+        }
+        let state = self
+            .poll_placed(&mut journal, index, &markets, Some(sent_at))
+            .await?;
+        ack(&state).map(Submitted::Ack)
+    }
+
+    /// 这张单在 `sendTx` 之前就失败了（没拿到 nonce、签名失败）：意图记成被拒终态，返回原错误。
+    /// 记不下来就把两个错误一起带出去，意图仍是未决，照旧 fail closed。
+    fn abandon_unsent(&self, journal: &mut Journal, index: i64, error: ArbError) -> ArbError {
+        let Some(intent) = journal.orders.get(&index) else {
+            return error;
+        };
+        let mut state = OrderState::new(intent.order.clone());
+        state.status = OrderStatus::Rejected;
+        state.reject_reason = Some(format!("not sent: {error}"));
+        match self.save_terminal(journal, index, &state) {
+            Ok(()) => error,
+            Err(save) => err(format!(
+                "{error}; also could not record the unsent order: {save}"
+            )),
+        }
+    }
+
+    /// 发单之后轮询到这张单查得到为止，换成终态并落盘。
+    ///
+    /// IOC 在 `sendTx` 之后仍可能未决：等到查得到，成交只按订单的累计成交量报。标准账户的吃单发出后
+    /// 约 0.3 秒撮合，`accountOrders` 要到撮合后约 1.1 秒才查得到（2026-10 东京实测）；前几次快一点，
+    /// 之后放慢（每次读都占同一个出口 IP 的限频）。
+    async fn poll_placed(
+        &self,
+        journal: &mut Journal,
+        index: i64,
+        markets: &[Market],
+        sent_at: Option<Instant>,
+    ) -> ArbResult<OrderState> {
+        // 查到了、但还是 pending / in-progress（IOC 刚进撮合）：再等几次到终态。马上返回的话执行器会去撤这张 IOC，
+        // 白占一个 nonce，撤单报错整条腿就算中断。等满 [`LIVE_REPOLLS`] 次还活着才照旧返回（交给执行器撤）。
+        let mut live_polls = 0;
         for attempt in 0..40 {
-            // A fresh IOC order is normally queryable within ~100ms; poll fast for the first few
-            // tries only (every read costs rate-limit budget on a shared IP), then back off.
             tokio::time::sleep(if attempt < 3 {
                 ORDER_POLL_FAST
             } else {
@@ -1029,15 +1366,79 @@ impl Broker for LighterBroker {
             .await;
             if let Some(row) = self.remote_order(index).await? {
                 let state = self
-                    .convert_order(&row, journal.orders.get(&index), &markets)
+                    .convert_order(&row, journal.orders.get(&index), markets)
                     .await?;
-                self.save_terminal(&mut journal, index, &state)?;
-                return ack(&state);
+                if state.status.is_live() && live_polls < LIVE_REPOLLS && attempt + 1 < 40 {
+                    live_polls += 1;
+                    continue;
+                }
+                self.save_terminal(journal, index, &state)?;
+                // 订单推送影子：REST 读到结局的这一刻，和推送比早了多少、对不对得上（只对刚发出的单比）。
+                if let (Some(feed), Some(sent_at)) = (&self.orders, sent_at)
+                    && let Some(line) = feed.compare(index, &state, sent_at, Instant::now())
+                {
+                    tracing::info!(order = %state.order.client_order_id, venue = %self.deployment.venue(), "Lighter 订单推送影子：{line}");
+                }
+                return Ok(state);
             }
         }
         Err(err(
             "submission acknowledged but order not yet queryable; reconcile journal, do not resubmit",
         ))
+    }
+}
+
+#[async_trait]
+impl Broker for LighterBroker {
+    fn venue(&self) -> Venue {
+        self.deployment.venue()
+    }
+    fn fee_per_side(&self) -> Decimal {
+        self.fee
+    }
+
+    async fn place(&self, order: &NewOrder) -> ArbResult<OrderAck> {
+        match self.submit_order(order, false).await? {
+            Submitted::Ack(ack) => Ok(ack),
+            Submitted::Provisional(state) => ack(&state),
+        }
+    }
+
+    async fn place_for_hedge(&self, order: &NewOrder) -> ArbResult<Option<OrderState>> {
+        match self.submit_order(order, true).await? {
+            Submitted::Ack(_) => Ok(None),
+            Submitted::Provisional(state) => Ok(Some(*state)),
+        }
+    }
+
+    async fn settle_hedge(&self, provisional: &OrderState) -> ArbResult<Option<OrderState>> {
+        // 推送比 `accountOrders` 早约 1 秒：这时多半还查不到，按下单后的节奏轮询到查得到为止。
+        let mut journal = self.journal.lock().await;
+        let id = &provisional.order.client_order_id;
+        let index = client_index(self.deployment, self.account, id);
+        match journal.orders.get(&index) {
+            Some(intent) if intent.order.client_order_id != *id => {
+                return Err(err("client index collision in journal"));
+            }
+            Some(intent) if intent.terminal.is_some() => return Ok(intent.terminal.clone()),
+            Some(_) => {}
+            None => return Err(err("no recorded intent for the order being settled")),
+        }
+        let markets = self.markets().await?;
+        self.poll_placed(&mut journal, index, &markets, None)
+            .await
+            .map(Some)
+    }
+
+    /// 下单（[`prepare`]）先按 `supported_size_decimals` 向零取整，编码时还要能按 `size_decimals` 精确表示：
+    /// 步长取两者里较粗的那个。
+    async fn quantity_step(&self, symbol: &Symbol) -> ArbResult<Option<Decimal>> {
+        let markets = self.markets().await?;
+        let market = markets
+            .iter()
+            .find(|m| Symbol::perp(&m.symbol, "USDT") == *symbol && m.market_type == "perp")
+            .ok_or_else(|| err("no matching perpetual market on this deployment"))?;
+        quantity_step_of(market).map(Some)
     }
 
     async fn warm_reads(&self, symbol: &Symbol, leverage: Option<Decimal>) -> ArbResult<()> {
@@ -1140,11 +1541,16 @@ impl Broker for LighterBroker {
             return Ok(());
         }
         let nonce = self.reserve_nonce(&mut journal).await?;
-        self.submit(
-            self.signer
-                .cancel(market, index, nonce, self.key, self.account)?,
-        )
-        .await?;
+        let signed = match self
+            .signer
+            .cancel(market, index, nonce, self.key, self.account)
+        {
+            Ok(signed) => signed,
+            Err(error) => return Err(released(&mut journal, nonce, error)),
+        };
+        if let Some(reason) = self.submit(&mut journal, nonce, signed).await? {
+            return Err(err(format!("cancel refused: {reason}")));
+        }
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(250)).await;
             let active: Orders = self
@@ -1199,14 +1605,10 @@ impl Broker for LighterBroker {
         Ok(Some(leg_state_from(&position)))
     }
 
-    /// `account` 里的 `available_balance`；响应里没有就返回 `None`（不知道，不当成 0）。
+    /// 开新逐仓 / 补逐仓保证金能用的钱，见 [`Account::free_for_isolated`]。响应里没有就返回 `None`
+    /// （不知道，不当成 0）。
     async fn free_collateral(&self) -> ArbResult<Option<Decimal>> {
-        self.account()
-            .await?
-            .available_balance
-            .as_deref()
-            .map(decimal)
-            .transpose()
+        self.account().await?.free_for_isolated()
     }
 
     fn supports_add_margin(&self) -> bool {
@@ -1415,6 +1817,56 @@ fn checked_mul(a: Decimal, b: Decimal) -> ArbResult<Decimal> {
 fn checked_add(a: Decimal, b: Decimal) -> ArbResult<Decimal> {
     a.checked_add(b).ok_or_else(|| err("decimal sum overflow"))
 }
+/// 下单的两种结果（同 Hyperliquid / Arcus 券商）。
+enum Submitted {
+    Ack(OrderAck),
+    /// 推送给出的待核实终态（[`Broker::place_for_hedge`]）。
+    Provisional(Box<OrderState>),
+}
+
+/// 下单后推送与 REST 轮询谁先给出结果。
+enum Raced {
+    Polled(Box<ArbResult<OrderState>>),
+    Pushed(fill_feed::Pushed),
+}
+
+/// 按成交推送记的终态和 REST 读回的哪里不一样（一样就是 `None`）。
+fn pushed_differs(pushed: &OrderState, read: &OrderState) -> Option<String> {
+    let same = pushed.status == read.status
+        && pushed.filled_usdt == read.filled_usdt
+        && pushed.average_price == read.average_price
+        && pushed.fee_usdt == read.fee_usdt
+        && pushed.venue_order_id == read.venue_order_id;
+    (!same).then(|| {
+        format!(
+            "推送 {:?} 成交额 {} 手续费 {} 订单号 {:?} / 读回 {:?} 成交额 {} 手续费 {} 订单号 {:?}",
+            pushed.status,
+            pushed.filled_usdt,
+            pushed.fee_usdt,
+            pushed.venue_order_id,
+            read.status,
+            read.filled_usdt,
+            read.fee_usdt,
+            read.venue_order_id
+        )
+    })
+}
+
+/// 推送合起来的成交 → 待核实的终态。数量、成交额、手续费都是推送里逐笔的准数；落账以之后
+/// `settle_hedge` 的 REST 读回为准。
+fn pushed_state(order: &NewOrder, market: i32, pushed: &fill_feed::Pushed) -> OrderState {
+    OrderState {
+        order: order.clone(),
+        venue_order_id: Some(format!("{market}:{}", pushed.order_index)),
+        status: OrderStatus::Filled,
+        filled_usdt: pushed.value,
+        average_price: Some(pushed.value / pushed.size),
+        fee_usdt: pushed.fee,
+        fee_estimated: false,
+        reject_reason: None,
+    }
+}
+
 fn ack(state: &OrderState) -> ArbResult<OrderAck> {
     Ok(OrderAck {
         client_order_id: state.order.client_order_id.clone(),
@@ -1441,6 +1893,43 @@ enum Failure {
     Other(ArbError),
 }
 
+/// 本进程最近一次碰到 Lighter HTTP 429 的时刻（Unix 毫秒，0 = 没碰到过）。主网与 RH 两个部署、价差监控都走同一个
+/// 出口 IP，所以全进程共用一个。按文章说法 REST 429 会封 IP 约 60 秒（连 WebSocket 一起），但 10-31 实测也见过隔 1 秒
+/// 重读就好的：这里不硬停请求（平仓、回滚、查单照旧重试），只让自动交易在这之后 [`RATE_LIMIT_HOLD`] 内不开带
+/// Lighter 腿的新仓 —— 别在限频的时候开一笔两腿单，第二腿发不出去就是单腿裸露。
+static RATE_LIMITED_AT_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// 碰到 429 之后多久内不开带 Lighter 腿的新仓。
+pub const RATE_LIMIT_HOLD: Duration = Duration::from_secs(60);
+
+fn note_rate_limited(endpoint: &str) {
+    let now = Utc::now().timestamp_millis();
+    let before = RATE_LIMITED_AT_MS.swap(now, std::sync::atomic::Ordering::Relaxed);
+    // 同一波限频只记一条（上一次在一分钟之前才记）。
+    if now - before >= RATE_LIMIT_HOLD.as_millis() as i64 {
+        tracing::warn!(
+            endpoint,
+            "Lighter 返回 429 限频：{} 秒内自动交易不开带 Lighter 腿的新仓（平仓、回滚照常重试）",
+            RATE_LIMIT_HOLD.as_secs()
+        );
+    }
+}
+
+/// 最近 [`RATE_LIMIT_HOLD`] 内碰到过 Lighter 429：还要等多少秒（给自动交易的开仓闸门）。
+pub fn rate_limited_for(now: chrono::DateTime<Utc>) -> Option<u64> {
+    let at = RATE_LIMITED_AT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if at == 0 {
+        return None;
+    }
+    let left = RATE_LIMIT_HOLD.as_millis() as i64 - (now.timestamp_millis() - at);
+    (left > 0).then(|| (left as u64).div_ceil(1000))
+}
+
+/// 测试用：直接设最近一次 429 的时刻（0 = 清掉）。web 的测试也要用，所以不能只在本 crate 的测试里编译。
+#[doc(hidden)]
+pub fn set_rate_limited_at(ms: i64) {
+    RATE_LIMITED_AT_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
 async fn fetch<T: DeserializeOwned>(request: RequestBuilder, endpoint: &str) -> Result<T, Failure> {
     let response = request.send().await.map_err(|e| {
         Failure::Other(err(format!(
@@ -1449,6 +1938,9 @@ async fn fetch<T: DeserializeOwned>(request: RequestBuilder, endpoint: &str) -> 
         )))
     })?;
     let status = response.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        note_rate_limited(endpoint);
+    }
     let bytes = response
         .bytes()
         .await
@@ -1471,6 +1963,9 @@ async fn fetch<T: DeserializeOwned>(request: RequestBuilder, endpoint: &str) -> 
         ));
     };
     let code = value.get("code").and_then(serde_json::Value::as_i64);
+    if code == Some(23000) {
+        note_rate_limited(endpoint);
+    }
     if !status.is_success() || code != Some(200) {
         // Do not echo response bodies: gateways can reflect auth headers/signed payloads.
         let shown = code.map_or_else(|| "missing".to_string(), |code| code.to_string());
@@ -1630,6 +2125,13 @@ fn prepare(order: &NewOrder, market: &Market, price: Decimal) -> ArbResult<Prepa
         quantity,
     })
 }
+/// 一个市场的下单数量步长（见 [`Broker::quantity_step`]）：[`prepare`] 先按 `supported_size_decimals` 向零取整，
+/// 编码时还要能按 `size_decimals` 精确表示，取两者里较粗的那个。
+fn quantity_step_of(market: &Market) -> ArbResult<Decimal> {
+    let decimals = market.supported_size_decimals.min(market.size_decimals);
+    Ok(Decimal::ONE / scale(decimals)?)
+}
+
 fn scale(decimals: u32) -> ArbResult<Decimal> {
     if decimals > 18 {
         return Err(err("unsupported market precision"));
@@ -1749,8 +2251,39 @@ struct Account {
     index: i64,
     positions: Vec<AccountPosition>,
     /// 可用于开新仓的余额。字段名以官方 `account` 响应为准；缺了就当不知道。
+    /// **含逐仓持仓的浮盈**：逐仓的浮盈划不出来，不能拿它给新的逐仓仓位当保证金。
     #[serde(default)]
     available_balance: Option<String>,
+    /// 全仓账户里的现金（不含逐仓仓位分到的保证金与浮盈）。新逐仓仓位的保证金从这里划。
+    #[serde(default)]
+    collateral: Option<String>,
+    /// 全仓持仓占用的初始保证金。
+    #[serde(default)]
+    cross_initial_margin_requirement: Option<String>,
+}
+
+impl Account {
+    /// 新逐仓仓位（或给逐仓补保证金）实际能划走的钱：`available_balance` 与
+    /// `collateral − 全仓初始保证金占用` 取小。
+    ///
+    /// 某次实盘：`available_balance` 比全仓现金多出一截，多出的是逐仓空单的浮盈；
+    /// 全仓现金不够划。开 800 × 3x（要划 266.67）时下单前核对按 `available_balance` 放行，交易所按现金拒单
+    /// `canceled-margin-not-allowed`。
+    fn free_for_isolated(&self) -> ArbResult<Option<Decimal>> {
+        let parse = |raw: &Option<String>| raw.as_deref().map(decimal).transpose();
+        let available = parse(&self.available_balance)?;
+        let cash = parse(&self.collateral)?.map(|cash| {
+            let used = parse(&self.cross_initial_margin_requirement)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            (cash - used).max(Decimal::ZERO)
+        });
+        Ok(match (available, cash) {
+            (Some(available), Some(cash)) => Some(available.min(cash)),
+            (available, cash) => available.or(cash),
+        })
+    }
 }
 #[derive(Deserialize)]
 struct AccountPosition {
@@ -1887,7 +2420,17 @@ fn margin_wire_amount(amount: Decimal) -> ArbResult<i64> {
         .ok_or_else(|| err("margin amount exceeds the venue limit"))
 }
 
-/// 补保证金那一次 `sendTx` 的结果分类。
+/// 预留了 nonce、交易却没发出去：把预留还回去，还不回去就把原因接在错误后面。
+fn released(journal: &mut Journal, nonce: i64, error: ArbError) -> ArbError {
+    match journal.hand_back(nonce) {
+        Ok(()) => error,
+        Err(release) => err(format!(
+            "{error}; nonce reservation also could not be released: {release}"
+        )),
+    }
+}
+
+/// 一次 `sendTx` 的结果分类（下单、撤单、改杠杆、补保证金共用）。
 #[derive(Debug, PartialEq, Eq)]
 enum MarginSend {
     /// API 收下了（`code: 200` 且 `tx_hash` 与签名的一致）；序列器之后仍可能拒绝。
@@ -1906,15 +2449,17 @@ enum MarginSend {
 /// - 2xx/4xx 且带非 200 的 API 码 → `Refused`；29500..=29999（内部错误 / 处理超时，
 ///   <https://apidocs.lighter.xyz/docs/data-structures-constants-and-errors>）除外 → `Unknown`；
 /// - 其它（缺 `code`、3xx、4xx 却 `code == 200`）→ `Unknown`。
-fn classify_margin_send(
+fn classify_send(
     status: reqwest::StatusCode,
     body: &[u8],
     expected_hash: &str,
+    nothing: &str,
 ) -> MarginSend {
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return MarginSend::Refused(
-            "sendTx rate limited (HTTP 429) before processing; no margin moved".into(),
-        );
+        note_rate_limited("sendTx");
+        return MarginSend::Refused(format!(
+            "sendTx rate limited (HTTP 429) before processing; {nothing}"
+        ));
     }
     if status.is_server_error() {
         return MarginSend::Unknown(format!(
@@ -1943,10 +2488,10 @@ fn classify_margin_send(
         {
             MarginSend::Refused(match margin_refusal_label(code) {
                 Some(label) => format!(
-                    "sendTx rejected by the API server: HTTP {status}, API code {code} ({label}); no margin moved"
+                    "sendTx rejected by the API server: HTTP {status}, API code {code} ({label}); {nothing}"
                 ),
                 None => format!(
-                    "sendTx rejected by the API server: HTTP {status}, API code {code}; no margin moved"
+                    "sendTx rejected by the API server: HTTP {status}, API code {code}; {nothing}"
                 ),
             })
         }
@@ -1995,10 +2540,6 @@ struct AccountFees {
 struct NextNonce {
     nonce: i64,
 }
-#[derive(Deserialize)]
-struct SendAck {
-    tx_hash: String,
-}
 /// `trades` 最多翻几页（每页 100 条）。
 const TRADES_PAGES: usize = 30;
 
@@ -2036,12 +2577,18 @@ struct Trades {
     trades: Vec<Trade>,
     next_cursor: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Trade {
     trade_id: i64,
     market_id: i32,
     ask_id: i64,
     bid_id: i64,
+    /// 双方的客户订单号（我们下单时给的 `client_order_index`）。账户成交推送里有（[`fill_feed`] 靠它
+    /// 认出自己的单）；REST 明细不靠它。
+    #[serde(default)]
+    ask_client_id: Option<i64>,
+    #[serde(default)]
+    bid_client_id: Option<i64>,
     ask_account_id: i64,
     bid_account_id: i64,
     is_maker_ask: bool,
@@ -2082,6 +2629,13 @@ struct Journal {
     file: File,
     orders: HashMap<i64, Intent>,
     last_nonce: Option<i64>,
+    /// `last_nonce` 是怎么预留来的（预留前的值 + 本进程里的预留时刻）。重放得到的预留没有时刻（`at` 为空）：
+    /// 进程刚起来，按「已经够久」算。手工写 `last_nonce` 或释放之后为空，自动释放就不动它。
+    reservation: Option<Reservation>,
+}
+struct Reservation {
+    previous: Option<i64>,
+    at: Option<Instant>,
 }
 impl Journal {
     fn open(path: &Path, deployment: LighterDeployment, account: i64, key: u8) -> ArbResult<Self> {
@@ -2099,6 +2653,7 @@ impl Journal {
             file,
             orders: HashMap::new(),
             last_nonce: None,
+            reservation: None,
         };
         let mut identity = false;
         for line in BufReader::new(journal.file.try_clone()?).split(b'\n') {
@@ -2133,6 +2688,10 @@ impl Journal {
                     if journal.last_nonce.is_some_and(|prior| prior >= nonce) {
                         return Err(err("non-monotonic journal nonce"));
                     }
+                    journal.reservation = Some(Reservation {
+                        previous: journal.last_nonce,
+                        at: None,
+                    });
                     journal.last_nonce = Some(nonce);
                 }
                 JournalRecord::Terminal { index, state } if identity => {
@@ -2155,6 +2714,7 @@ impl Journal {
                         return Err(err("invalid nonce release in order journal"));
                     }
                     journal.last_nonce = previous;
+                    journal.reservation = None;
                 }
                 _ => {
                     return Err(err(
@@ -2188,7 +2748,44 @@ impl Journal {
         }
         self.append(&JournalRecord::NonceReleased { nonce, previous })?;
         self.last_nonce = previous;
+        self.reservation = None;
         Ok(())
+    }
+
+    /// 把最近一次预留的 nonce 还回去：交易没发出去（签名失败），或 API 服务器明确拒绝了它。用预留那一刻记下的
+    /// 上一个值，不用调用方早先抓的 `last_nonce`（中间可能自动释放过一次卡住的预留）。
+    fn hand_back(&mut self, nonce: i64) -> ArbResult<()> {
+        let previous = self
+            .reservation
+            .as_ref()
+            .ok_or_else(|| err("no nonce reservation to hand back"))?
+            .previous;
+        self.release_nonce(nonce, previous)
+    }
+
+    /// 预留一个 nonce：先落盘再改内存，并记下预留前的值与时刻（自动释放要用）。
+    fn reserve(&mut self, nonce: i64) -> ArbResult<()> {
+        self.append(&JournalRecord::Nonce { nonce })?;
+        self.reservation = Some(Reservation {
+            previous: self.last_nonce,
+            at: Some(Instant::now()),
+        });
+        self.last_nonce = Some(nonce);
+        Ok(())
+    }
+
+    /// 服务器的下一个 nonce 恰好等于最近一次预留、而且这次预留已经超过 `after`：那笔交易没被执行，把预留
+    /// 还回去，返回 `true`。其余情况（服务器已经往前走、落后于 journal、时间还没到、预留来源不明）都不动。
+    fn release_if_unconsumed(&mut self, server_next: i64, after: Duration) -> ArbResult<bool> {
+        let (Some(last), Some(reservation)) = (self.last_nonce, self.reservation.as_ref()) else {
+            return Ok(false);
+        };
+        if server_next != last || reservation.at.is_some_and(|at| at.elapsed() < after) {
+            return Ok(false);
+        }
+        let previous = reservation.previous;
+        self.release_nonce(last, previous)?;
+        Ok(true)
     }
 }
 
@@ -2574,8 +3171,68 @@ mod tests {
     }
 
     #[test]
+    fn a_long_breakeven_limit_rounds_to_the_tick_without_getting_worse() {
+        // 某次实盘 api.rh.lighter.xyz/api/v1/orderBookDetails?market_id=7（某合约，原样字段）。
+        let market: Market = serde_json::from_str(
+            r#"{"market_id":7,"symbol":"NEAR","market_type":"perp","status":"active","supported_size_decimals":2,"supported_price_decimals":4,"size_decimals":2,"price_decimals":4,"min_base_amount":"4.00","min_quote_amount":"10.000000","multiplier":"1.000000000000000000","quote_multiplier":1,"min_initial_margin_fraction":1000}"#,
+        )
+        .unwrap();
+        let order = |side| NewOrder {
+            post_only: false,
+            client_order_id: ClientOrderId("live-1791648010637-sell-0".into()),
+            venue: Venue::LighterRh,
+            symbol: Symbol::perp("NEAR", "USDT"),
+            side,
+            notional_usdt: dec!(800),
+            quantity: Some(dec!(148.892611)),
+            // 第二腿的保本价（`Plan::hedged_after`）有十几位小数。
+            limit_price: Some(dec!(5.364712345678)),
+            reduce_only: false,
+            leverage: Some(dec!(3)),
+            margin_mode: crate::MarginMode::Isolated,
+        };
+        let sell = prepare(&order(Side::Sell), &market, dec!(5.364712345678)).unwrap();
+        assert_eq!(sell.price, 53648, "卖单向上取整：不低于保本价");
+        assert_eq!(sell.quantity, dec!(148.89));
+        let buy = prepare(&order(Side::Buy), &market, dec!(5.364712345678)).unwrap();
+        assert_eq!(buy.price, 53647, "买单向下取整：不高于保本价");
+    }
+
+    /// 报给执行器的步长和下单取整是同一份规格：步长整数倍的数量原样下出去（两腿同时下靠这个对齐数量）。
+    #[test]
+    fn a_quantity_on_the_reported_step_goes_out_unchanged() {
+        let near = r#"{"market_id":7,"symbol":"NEAR","market_type":"perp","status":"active","supported_size_decimals":2,"supported_price_decimals":4,"size_decimals":2,"price_decimals":4,"min_base_amount":"4.00","min_quote_amount":"10.000000","multiplier":"1.000000000000000000","quote_multiplier":1,"min_initial_margin_fraction":1000}"#;
+        let market: Market = serde_json::from_str(near).unwrap();
+        let step = quantity_step_of(&market).unwrap();
+        assert_eq!(step, dec!(0.01));
+        let quantity = step * Decimal::from(14880);
+        let order = NewOrder {
+            post_only: false,
+            client_order_id: ClientOrderId("live-1-sell-0".into()),
+            venue: Venue::LighterRh,
+            symbol: Symbol::perp("NEAR", "USDT"),
+            side: Side::Sell,
+            notional_usdt: quantity * dec!(5.3577),
+            quantity: Some(quantity),
+            limit_price: Some(dec!(5.3577)),
+            reduce_only: false,
+            leverage: Some(dec!(3)),
+            margin_mode: crate::MarginMode::Isolated,
+        };
+        assert_eq!(
+            prepare(&order, &market, dec!(5.3577)).unwrap().quantity,
+            quantity
+        );
+        // 编码精度比报价精度粗时按粗的报（细的数量编码不出来）。
+        let coarse: Market =
+            serde_json::from_str(&near.replace(r#""size_decimals":2"#, r#""size_decimals":1"#))
+                .unwrap();
+        assert_eq!(quantity_step_of(&coarse).unwrap(), dec!(0.1));
+    }
+
+    #[test]
     fn robinhood_markets_without_is_frozen_still_parse() {
-        // 2026-09-29 GET api.rh.lighter.xyz/api/v1/orderBookDetails 的一行（原样，删掉了无关字段）。
+        // 某次实盘 api.rh.lighter.xyz/api/v1/orderBookDetails 的一行（原样，删掉了无关字段）。
         let market: Market = serde_json::from_str(
             r#"{"market_id":38,"symbol":"ANTHROPIC","market_type":"perp","status":"active","supported_size_decimals":5,"supported_price_decimals":1,"size_decimals":5,"price_decimals":1,"min_base_amount":"0.00320","min_quote_amount":"10.000000","multiplier":"1.000000000000000000","quote_multiplier":1,"min_initial_margin_fraction":2000}"#,
         )
@@ -2704,6 +3361,7 @@ mod tests {
         for deployment in [LighterDeployment::Mainnet, LighterDeployment::Robinhood] {
             let path = dir.join(format!("{}.jsonl", deployment.venue()));
             let order = NewOrder {
+                post_only: false,
                 margin_mode: crate::MarginMode::Isolated,
                 client_order_id: ClientOrderId("test-order-1".into()),
                 venue: deployment.venue(),
@@ -2805,6 +3463,9 @@ mod tests {
     type SignCall = (i32, i64, i32, u8, i64, i32, i64);
     static MARGIN_SIGN_CALLS: StdMutex<Vec<SignCall>> = StdMutex::new(Vec::new());
     static LEVERAGE_SIGN_MODES: StdMutex<Vec<i32>> = StdMutex::new(Vec::new());
+    /// 测试登记过的客户订单号：假签名库能签出这些订单（交易哈希 `orderhash{客户订单号}`）；
+    /// 其余照旧签不出（「假签名库签不出订单」）。按客户订单号区分，并行的测试互不干扰。
+    static SIGNABLE_ORDERS: StdMutex<Vec<i64>> = StdMutex::new(Vec::new());
 
     /// 各测试用不同的账户号，所以按账户号过滤就能互不干扰地断言「签过几次、签了什么」。
     fn sign_calls_for(account: i64) -> Vec<SignCall> {
@@ -2856,7 +3517,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     unsafe extern "C" fn fake_order(
         _: i32,
-        _: i64,
+        client: i64,
         _: i64,
         _: i32,
         _: i32,
@@ -2875,6 +3536,13 @@ mod tests {
         _: i32,
         _: i64,
     ) -> RawSigned {
+        if SIGNABLE_ORDERS.lock().unwrap().contains(&client) {
+            return fake_raw(
+                14,
+                format!("order-info-{client}"),
+                format!("orderhash{client}"),
+            );
+        }
         fake_raw_error()
     }
     unsafe extern "C" fn fake_cancel(_: i32, _: i64, _: u8, _: i64, _: i32, _: i64) -> RawSigned {
@@ -3050,6 +3718,34 @@ mod tests {
         .unwrap()
     }
     #[test]
+    fn free_collateral_for_isolated_excludes_isolated_unrealized_profit() {
+        let account = |extra: &str| -> Account {
+            serde_json::from_str(&format!(r#"{{"index":1,"positions":[]{extra}}}"#)).unwrap()
+        };
+        // 某次实盘 当时的账户：available 含逐仓浮盈，全仓现金比它少。
+        let zec = account(
+            r#","available_balance":"299.021332","collateral":"165.642262","cross_initial_margin_requirement":"0.000000""#,
+        );
+        assert_eq!(zec.free_for_isolated().unwrap(), Some(dec!(165.642262)));
+        // 全仓仓位占用的初始保证金也划不走。
+        let cross = account(
+            r#","available_balance":"500","collateral":"400","cross_initial_margin_requirement":"150""#,
+        );
+        assert_eq!(cross.free_for_isolated().unwrap(), Some(dec!(250)));
+        // 现金比 available 多（有全仓浮亏）时按 available。
+        let loss = account(r#","available_balance":"120","collateral":"300""#);
+        assert_eq!(loss.free_for_isolated().unwrap(), Some(dec!(120)));
+        // 只有一个字段时用它；都没有就是不知道。
+        assert_eq!(
+            account(r#","available_balance":"88""#)
+                .free_for_isolated()
+                .unwrap(),
+            Some(dec!(88))
+        );
+        assert_eq!(account("").free_for_isolated().unwrap(), None);
+    }
+
+    #[test]
     fn leverage_signing_and_readback_include_the_selected_mode() {
         let signer = fake_signer();
         for (mode, wire_mode) in [
@@ -3138,6 +3834,9 @@ mod tests {
             fee: Decimal::ZERO,
             verified_leverage: Verified::new(Duration::from_secs(20)),
             warmed: Verified::new(Duration::from_secs(20)),
+            pushed_recently: Verified::new(PUSHED_VERIFY_AFTER),
+            fills: None,
+            orders: None,
             _registration: Registration::acquire(deployment.chain_id(), account, MARGIN_KEY)
                 .unwrap(),
         };
@@ -3148,6 +3847,769 @@ mod tests {
         }
     }
     const FAST: Duration = Duration::from_millis(5);
+
+    /// 2026-10-15 东京 某合约：订单行已显示全部成交，立刻读 `trades` 明细却还没出齐。
+    fn crcl_exit_order(account: i64) -> RemoteOrder {
+        serde_json::from_str(&format!(
+            r#"{{"order_index":777,"client_order_index":1,"market_index":24,"owner_account_index":{account},"initial_base_amount":"2.573","filled_base_amount":"2.573","filled_quote_amount":"196.870522","price":"80","is_ask":false,"reduce_only":true,"status":"filled"}}"#
+        ))
+        .unwrap()
+    }
+    fn trades_reply(account: i64, sizes_and_amounts: &[(&str, &str)]) -> Reply {
+        let rows: Vec<String> = sizes_and_amounts
+            .iter()
+            .enumerate()
+            .map(|(i, (size, amount))| {
+                format!(
+                    r#"{{"trade_id":{},"market_id":24,"ask_id":5,"bid_id":777,"ask_account_id":9,"bid_account_id":{account},"is_maker_ask":true,"size":"{size}","usd_amount":"{amount}"}}"#,
+                    100 + i
+                )
+            })
+            .collect();
+        (
+            200,
+            format!(
+                r#"{{"code":200,"trades":[{}],"next_cursor":""}}"#,
+                rows.join(",")
+            ),
+        )
+    }
+
+    /// 第一腿下单（`place_for_hedge`）三种情形：推送先到 → 待核实；REST 先到 → 终态落盘；推送没连着 → 只走 REST。
+    #[tokio::test]
+    async fn the_first_leg_takes_whichever_of_the_push_and_the_rest_poll_answers_first() {
+        const ORDERS_PATH: &str = "/api/v1/accountOrders";
+        const MARKETS_PATH: &str = "/api/v1/orderBookDetails";
+        let near = r#"{"market_id":7,"symbol":"NEAR","market_type":"perp","status":"active","supported_size_decimals":2,"supported_price_decimals":4,"size_decimals":2,"price_decimals":4,"min_base_amount":"4.00","min_quote_amount":"10.000000","multiplier":"1.000000000000000000","quote_multiplier":1,"min_initial_margin_fraction":1000}"#;
+        let markets = (
+            200,
+            format!(r#"{{"code":200,"order_book_details":[{near}]}}"#),
+        );
+        let no_order = (200, r#"{"code":200,"orders":[]}"#.to_string());
+        let three_x = |account: i64| -> Reply {
+            (
+                200,
+                format!(
+                    r#"{{"code":200,"total":1,"accounts":[{{"index":{account},"positions":[{{"market_id":7,"symbol":"NEAR","sign":1,"position":"0","avg_entry_price":"0","position_value":"0","initial_margin_fraction":"33.34","margin_mode":1,"allocated_margin":"0"}}]}}]}}"#
+                ),
+            )
+        };
+        let order = NewOrder {
+            post_only: false,
+            client_order_id: ClientOrderId("live-7-sell-0".into()),
+            venue: Venue::Lighter,
+            symbol: Symbol::perp("NEAR", "USDT"),
+            side: Side::Sell,
+            notional_usdt: dec!(536),
+            quantity: Some(dec!(100)),
+            limit_price: Some(dec!(5.36)),
+            reduce_only: false,
+            leverage: Some(dec!(3)),
+            margin_mode: crate::MarginMode::Isolated,
+        };
+        // 交易所报的订单行与逐笔：卖出 100 @ 5.36，交易所订单号 555。
+        let filled_row = |account: i64, index: i64| -> Reply {
+            (
+                200,
+                format!(
+                    r#"{{"code":200,"orders":[{{"order_index":555,"client_order_index":{index},"market_index":7,"owner_account_index":{account},"initial_base_amount":"100.00","filled_base_amount":"100.00","filled_quote_amount":"536.000000","price":"5.3600","is_ask":true,"reduce_only":false,"status":"filled"}}]}}"#
+                ),
+            )
+        };
+        let trade_json = |account: i64, index: i64| {
+            format!(
+                r#"{{"trade_id":1,"market_id":7,"ask_id":555,"bid_id":5,"ask_client_id":{index},"bid_client_id":1,"ask_account_id":{account},"bid_account_id":9,"is_maker_ask":false,"size":"100.00","usd_amount":"536.000000"}}"#
+            )
+        };
+        let routes = |account: i64, index: i64, rest_answers: bool| {
+            let mut orders = vec![no_order.clone()];
+            if rest_answers {
+                orders.extend([no_order.clone(), filled_row(account, index)]);
+            }
+            vec![
+                (ORDERS_PATH, orders),
+                (MARKETS_PATH, vec![markets.clone()]),
+                (ACCOUNT_PATH, vec![three_x(account)]),
+                (NONCE_PATH, vec![nonce_reply(41)]),
+                (
+                    SEND_PATH,
+                    vec![accepted_reply(&format!("orderhash{index}"))],
+                ),
+                (
+                    "/api/v1/trades",
+                    vec![(
+                        200,
+                        format!(
+                            r#"{{"code":200,"trades":[{}],"next_cursor":""}}"#,
+                            trade_json(account, index)
+                        ),
+                    )],
+                ),
+            ]
+        };
+        let setup = |account: i64| {
+            let index = client_index(LighterDeployment::Mainnet, account, &order.client_order_id);
+            SIGNABLE_ORDERS.lock().unwrap().push(index);
+            index
+        };
+        let push_soon = |feed: &Arc<fill_feed::FillFeed>, json: String| {
+            let feed = Arc::clone(feed);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                feed.record([serde_json::from_str::<Trade>(&json).unwrap()]);
+            });
+        };
+
+        // 推送先到（REST 一直查不到）：马上给待核实状态，终态不落盘。
+        let account = 710_201;
+        let index = setup(account);
+        let mut pushed = rig(account, true, routes(account, index, false)).await;
+        let feed = fill_feed::FillFeed::new(account, Decimal::ZERO);
+        feed.set_connected(true);
+        pushed.broker.fills = Some(Arc::clone(&feed));
+        push_soon(&feed, trade_json(account, index));
+        let state = pushed
+            .broker
+            .place_for_hedge(&order)
+            .await
+            .unwrap()
+            .expect("推送给出待核实状态");
+        assert_eq!(
+            (
+                state.status,
+                state.filled_usdt,
+                state.venue_order_id.as_deref()
+            ),
+            (OrderStatus::Filled, dec!(536.000000), Some("7:555"))
+        );
+        assert!(
+            pushed.broker.journal.lock().await.orders[&index]
+                .terminal
+                .is_none()
+        );
+        assert_eq!(pushed.count(SEND_PATH), 1);
+        pushed.finish();
+
+        // REST 先到（推送连着但没来）：照旧按读回落盘，返回 `None`。
+        let account = 710_202;
+        let index = setup(account);
+        let mut rest = rig(account, true, routes(account, index, true)).await;
+        let feed = fill_feed::FillFeed::new(account, Decimal::ZERO);
+        feed.set_connected(true);
+        rest.broker.fills = Some(feed);
+        assert!(rest.broker.place_for_hedge(&order).await.unwrap().is_none());
+        assert!(
+            rest.broker.journal.lock().await.orders[&index]
+                .terminal
+                .is_some()
+        );
+        rest.finish();
+
+        // 推送没连着：不赛跑，推送来了也不看，只走 REST。
+        let account = 710_203;
+        let index = setup(account);
+        let mut offline = rig(account, true, routes(account, index, true)).await;
+        let feed = fill_feed::FillFeed::new(account, Decimal::ZERO);
+        offline.broker.fills = Some(Arc::clone(&feed));
+        push_soon(&feed, trade_json(account, index));
+        assert!(
+            offline
+                .broker
+                .place_for_hedge(&order)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            offline.broker.journal.lock().await.orders[&index]
+                .terminal
+                .is_some()
+        );
+        offline.finish();
+    }
+
+    /// 第二腿、平仓（`place`）：成交推送先报出全部成交，就按推送的数落终态、马上返回；刚记下的那几秒
+    /// `order_state` 不读 REST；之后读 REST 核对 —— 读不到照旧给推送的，读到了换成读回的。
+    #[tokio::test]
+    async fn a_plain_place_is_settled_by_the_fill_push_and_verified_against_rest_later() {
+        const ORDERS_PATH: &str = "/api/v1/accountOrders";
+        const MARKETS_PATH: &str = "/api/v1/orderBookDetails";
+        let near = r#"{"market_id":7,"symbol":"NEAR","market_type":"perp","status":"active","supported_size_decimals":2,"supported_price_decimals":4,"size_decimals":2,"price_decimals":4,"min_base_amount":"4.00","min_quote_amount":"10.000000","multiplier":"1.000000000000000000","quote_multiplier":1,"min_initial_margin_fraction":1000}"#;
+        let markets = (
+            200,
+            format!(r#"{{"code":200,"order_book_details":[{near}]}}"#),
+        );
+        let no_order = (200, r#"{"code":200,"orders":[]}"#.to_string());
+        let json = |state: &OrderState| serde_json::to_value(state).unwrap();
+        let account = 710_204;
+        let order = NewOrder {
+            post_only: false,
+            client_order_id: ClientOrderId("live-8-sell-1".into()),
+            venue: Venue::Lighter,
+            symbol: Symbol::perp("NEAR", "USDT"),
+            side: Side::Sell,
+            notional_usdt: dec!(536),
+            quantity: Some(dec!(100)),
+            limit_price: Some(dec!(5.36)),
+            reduce_only: false,
+            leverage: Some(dec!(3)),
+            margin_mode: crate::MarginMode::Isolated,
+        };
+        let index = client_index(LighterDeployment::Mainnet, account, &order.client_order_id);
+        SIGNABLE_ORDERS.lock().unwrap().push(index);
+        let filled_row = (
+            200,
+            format!(
+                r#"{{"code":200,"orders":[{{"order_index":555,"client_order_index":{index},"market_index":7,"owner_account_index":{account},"initial_base_amount":"100.00","filled_base_amount":"100.00","filled_quote_amount":"536.000000","price":"5.3600","is_ask":true,"reduce_only":false,"status":"filled"}}]}}"#
+            ),
+        );
+        let trade_json = format!(
+            r#"{{"trade_id":1,"market_id":7,"ask_id":555,"bid_id":5,"ask_client_id":{index},"bid_client_id":1,"ask_account_id":{account},"bid_account_id":9,"is_maker_ask":false,"size":"100.00","usd_amount":"536.000000"}}"#
+        );
+        let account_row = (
+            200,
+            format!(
+                r#"{{"code":200,"total":1,"accounts":[{{"index":{account},"positions":[{{"market_id":7,"symbol":"NEAR","sign":1,"position":"0","avg_entry_price":"0","position_value":"0","initial_margin_fraction":"33.34","margin_mode":1,"allocated_margin":"0"}}]}}]}}"#
+            ),
+        );
+        let mut rig = rig(
+            account,
+            true,
+            vec![
+                // 发单前查重 → 没有；核对第一次 → 还查不到；核对第二次 → 查到了。
+                (
+                    ORDERS_PATH,
+                    vec![no_order.clone(), no_order.clone(), filled_row],
+                ),
+                (MARKETS_PATH, vec![markets]),
+                (ACCOUNT_PATH, vec![account_row]),
+                (NONCE_PATH, vec![nonce_reply(41)]),
+                (
+                    SEND_PATH,
+                    vec![accepted_reply(&format!("orderhash{index}"))],
+                ),
+                (
+                    "/api/v1/trades",
+                    vec![(
+                        200,
+                        format!(r#"{{"code":200,"trades":[{trade_json}],"next_cursor":""}}"#),
+                    )],
+                ),
+            ],
+        )
+        .await;
+        let feed = fill_feed::FillFeed::new(account, Decimal::ZERO);
+        feed.set_connected(true);
+        rig.broker.fills = Some(Arc::clone(&feed));
+        {
+            let feed = Arc::clone(&feed);
+            let json = trade_json.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                feed.record([serde_json::from_str::<Trade>(&json).unwrap()]);
+            });
+        }
+
+        // 推送 50ms 就到：不等 REST 第一次轮询（发单后 100ms 才读）。
+        let placed = rig.broker.place(&order).await.unwrap();
+        assert_eq!(
+            (placed.status, placed.venue_order_id.as_str()),
+            (OrderStatus::Filled, "7:555")
+        );
+        assert_eq!(rig.count(ORDERS_PATH), 1, "只有发单前查重那一次");
+        let recorded = rig.broker.journal.lock().await.orders[&index]
+            .terminal
+            .clone()
+            .expect("按推送落了终态");
+        assert_eq!(
+            (
+                recorded.status,
+                recorded.filled_usdt,
+                recorded.average_price,
+                recorded.fee_estimated
+            ),
+            (
+                OrderStatus::Filled,
+                dec!(536.000000),
+                Some(dec!(5.36)),
+                true
+            )
+        );
+
+        // 刚记下：`order_state` 直接给，不读 REST。
+        let state = rig
+            .broker
+            .order_state(&order.client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(json(&state), json(&recorded));
+        assert_eq!(rig.count(ORDERS_PATH), 1);
+
+        // 过了那几秒：读 REST 核对。还查不到这张单 → 照旧给推送的，标记留着。
+        rig.broker.pushed_recently.clear();
+        let state = rig
+            .broker
+            .order_state(&order.client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(json(&state), json(&recorded));
+        assert_eq!(rig.count(ORDERS_PATH), 2);
+
+        // 查到了：换成读回的终态（标记清掉）并落盘，之后不再读。
+        let state = rig
+            .broker
+            .order_state(&order.client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!state.fee_estimated);
+        assert_eq!(pushed_differs(&recorded, &state), None);
+        assert_eq!(rig.count(ORDERS_PATH), 3);
+        assert_eq!(
+            rig.broker.journal.lock().await.orders[&index]
+                .terminal
+                .as_ref()
+                .map(json),
+            Some(json(&state))
+        );
+        let again = rig
+            .broker
+            .order_state(&order.client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(json(&again), json(&state));
+        assert_eq!(rig.count(ORDERS_PATH), 3);
+        assert_eq!(rig.count(SEND_PATH), 1);
+
+        // 重开进程（重放日志）：最后一条终态算数。
+        let dir = rig.dir.clone();
+        drop(rig.broker);
+        let replayed = Journal::open(
+            &dir.join("journal.jsonl"),
+            LighterDeployment::Mainnet,
+            account,
+            MARGIN_KEY,
+        )
+        .unwrap();
+        assert_eq!(
+            replayed.orders[&index].terminal.as_ref().map(json),
+            Some(json(&state))
+        );
+        drop(replayed);
+        let _ = std::fs::remove_dir_all(dir);
+
+        // 哪里不一样要说得出来。
+        let mut other = state.clone();
+        other.fee_usdt = dec!(0.1);
+        assert!(
+            pushed_differs(&recorded, &other)
+                .unwrap()
+                .contains("手续费 0.1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reduce_only_order_rereads_a_lagging_position_before_refusing() {
+        const ORDERS_PATH: &str = "/api/v1/accountOrders";
+        const MARKETS_PATH: &str = "/api/v1/orderBookDetails";
+        let tsla_market = r#"{"market_id":7,"symbol":"TSLA","market_type":"perp","status":"active","supported_size_decimals":2,"supported_price_decimals":2,"size_decimals":2,"price_decimals":2,"min_base_amount":"0.10","min_quote_amount":"10.000000","multiplier":"1.000000000000000000","quote_multiplier":1,"min_initial_margin_fraction":1000}"#;
+        let markets = (
+            200,
+            format!(r#"{{"code":200,"order_book_details":[{tsla_market}]}}"#),
+        );
+        let no_order = (200, r#"{"code":200,"orders":[]}"#.to_string());
+        let flat = |account: i64| -> Reply {
+            (
+                200,
+                format!(
+                    r#"{{"code":200,"total":1,"accounts":[{{"index":{account},"positions":[]}}]}}"#
+                ),
+            )
+        };
+        let order = NewOrder {
+            post_only: false,
+            client_order_id: ClientOrderId("live-1-sell-1".into()),
+            venue: Venue::Lighter,
+            symbol: tsla(),
+            side: Side::Sell,
+            notional_usdt: dec!(500),
+            quantity: Some(dec!(2.5)),
+            limit_price: Some(dec!(190)),
+            reduce_only: true,
+            leverage: None,
+            margin_mode: crate::MarginMode::Isolated,
+        };
+        // 第一次读账户还没有刚成交的持仓，第二次有了：照常往下走（到签名为止，假签名库签不出订单）。
+        let account = 710_191;
+        let lagging = rig(
+            account,
+            true,
+            vec![
+                (ORDERS_PATH, vec![no_order.clone()]),
+                (MARKETS_PATH, vec![markets.clone()]),
+                (
+                    ACCOUNT_PATH,
+                    vec![flat(account), account_reply(account, 1, "100")],
+                ),
+                (NONCE_PATH, vec![nonce_reply(41)]),
+            ],
+        )
+        .await;
+        let error = lagging.broker.place(&order).await.unwrap_err().to_string();
+        assert!(!error.contains("does not reduce"), "{error}");
+        assert_eq!(lagging.count(ACCOUNT_PATH), 2);
+        lagging.finish();
+
+        // 一直没有持仓：重读几次后拒绝，什么都没发。
+        let account = 710_192;
+        let never = rig(
+            account,
+            true,
+            vec![
+                (ORDERS_PATH, vec![no_order]),
+                (MARKETS_PATH, vec![markets]),
+                (ACCOUNT_PATH, vec![flat(account)]),
+                (NONCE_PATH, vec![nonce_reply(41)]),
+            ],
+        )
+        .await;
+        let error = never.broker.place(&order).await.unwrap_err().to_string();
+        assert!(error.contains("does not reduce"), "{error}");
+        assert_eq!(never.count(ACCOUNT_PATH), 1 + POSITION_REREADS.len());
+        assert!(never.server.requests(SEND_PATH).is_empty());
+        never.finish();
+    }
+
+    #[tokio::test]
+    async fn settling_a_pushed_fill_polls_until_the_order_is_queryable_and_records_it() {
+        const ORDERS_PATH: &str = "/api/v1/accountOrders";
+        const MARKETS_PATH: &str = "/api/v1/orderBookDetails";
+        let account = 710_181;
+        let crcl = r#"{"market_id":24,"symbol":"CRCL","market_type":"perp","status":"active","supported_size_decimals":3,"supported_price_decimals":2,"size_decimals":3,"price_decimals":2,"min_base_amount":"0.100","min_quote_amount":"10.000000","multiplier":"1.000000000000000000","quote_multiplier":1,"min_initial_margin_fraction":1000}"#;
+        let order = NewOrder {
+            post_only: false,
+            client_order_id: ClientOrderId("live-9-buy-0".into()),
+            venue: Venue::Lighter,
+            symbol: Symbol::perp("CRCL", "USDT"),
+            side: Side::Buy,
+            notional_usdt: dec!(200),
+            quantity: Some(dec!(2.573)),
+            limit_price: Some(dec!(80)),
+            reduce_only: true,
+            leverage: None,
+            margin_mode: crate::MarginMode::Isolated,
+        };
+        let index = client_index(LighterDeployment::Mainnet, account, &order.client_order_id);
+        let row = format!(
+            r#"{{"code":200,"orders":[{}]}}"#,
+            serde_json::to_string(&serde_json::json!({
+                "order_index": 777, "client_order_index": index, "market_index": 24,
+                "owner_account_index": account, "initial_base_amount": "2.573",
+                "filled_base_amount": "2.573", "filled_quote_amount": "196.870522", "price": "80",
+                "is_ask": false, "reduce_only": true, "status": "filled"
+            }))
+            .unwrap()
+        );
+        let rig = rig(
+            account,
+            true,
+            vec![
+                (
+                    ORDERS_PATH,
+                    vec![(200, r#"{"code":200,"orders":[]}"#.to_string()), (200, row)],
+                ),
+                (
+                    MARKETS_PATH,
+                    vec![(
+                        200,
+                        format!(r#"{{"code":200,"order_book_details":[{crcl}]}}"#),
+                    )],
+                ),
+                (
+                    "/api/v1/trades",
+                    vec![trades_reply(account, &[("2.573", "196.870522")])],
+                ),
+            ],
+        )
+        .await;
+        {
+            let mut journal = rig.broker.journal.lock().await;
+            let intent = Intent {
+                order: order.clone(),
+                market: 24,
+                quantity: dec!(2.573),
+                terminal: None,
+            };
+            journal
+                .append(&JournalRecord::Intent {
+                    index,
+                    intent: intent.clone(),
+                })
+                .unwrap();
+            journal.orders.insert(index, intent);
+        }
+        let pushed = fill_feed::Pushed {
+            order_index: 777,
+            size: dec!(2.573),
+            value: dec!(196.870522),
+            fee: Decimal::ZERO,
+        };
+        let provisional = pushed_state(&order, 24, &pushed);
+        assert_eq!(provisional.venue_order_id.as_deref(), Some("24:777"));
+        assert_eq!(provisional.status, OrderStatus::Filled);
+        // 第一次读还查不到：接着轮询，查到后按 REST 的结果落盘。
+        let settled = rig
+            .broker
+            .settle_hedge(&provisional)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.status, OrderStatus::Filled);
+        assert_eq!(settled.filled_usdt, dec!(196.870522));
+        assert_eq!(settled.venue_order_id, provisional.venue_order_id);
+        assert_eq!(rig.count(ORDERS_PATH), 2);
+        // 已落盘：再核实一次不再请求交易所。
+        let again = rig
+            .broker
+            .settle_hedge(&provisional)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (again.status, again.filled_usdt, again.venue_order_id),
+            (settled.status, settled.filled_usdt, settled.venue_order_id)
+        );
+        assert_eq!(rig.count(ORDERS_PATH), 2);
+        rig.finish();
+    }
+
+    #[tokio::test]
+    async fn trades_that_lag_behind_a_filled_order_are_reread_until_they_match() {
+        let account = 710_061;
+        let lagging = trades_reply(account, &[("1.0", "76.514")]);
+        let full = trades_reply(account, &[("1.0", "76.514"), ("1.573", "120.356522")]);
+        let rig = rig(
+            account,
+            false,
+            vec![("/api/v1/trades", vec![lagging.clone(), lagging, full])],
+        )
+        .await;
+        let fees = rig
+            .broker
+            .order_fees_after(
+                &crcl_exit_order(account),
+                dec!(2.573),
+                dec!(196.870522),
+                &[FAST; 4],
+            )
+            .await
+            .unwrap();
+        assert_eq!(fees, Decimal::ZERO);
+        assert_eq!(rig.count("/api/v1/trades"), 3);
+        rig.finish();
+    }
+
+    #[tokio::test]
+    async fn trades_that_never_catch_up_are_refused_after_the_rereads() {
+        let account = 710_062;
+        let rig = rig(
+            account,
+            false,
+            vec![(
+                "/api/v1/trades",
+                vec![trades_reply(account, &[("1.0", "76.514")])],
+            )],
+        )
+        .await;
+        let error = rig
+            .broker
+            .order_fees_after(
+                &crcl_exit_order(account),
+                dec!(2.573),
+                dec!(196.870522),
+                &[FAST; 4],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not yet consistent"), "{error}");
+        // 先读一次，4 个间隔各重读一次。
+        assert_eq!(rig.count("/api/v1/trades"), 5);
+        rig.finish();
+    }
+
+    #[tokio::test]
+    async fn trades_that_exceed_the_order_or_disagree_on_value_are_refused_at_once() {
+        let account = 710_063;
+        for rows in [
+            // 明细比订单多：不是没出齐，重读也不会变好。
+            vec![("2.573", "196.870522"), ("0.5", "38")],
+            // 数量对上、金额对不上。
+            vec![("2.573", "196.0")],
+        ] {
+            let rig = rig(
+                account,
+                false,
+                vec![("/api/v1/trades", vec![trades_reply(account, &rows)])],
+            )
+            .await;
+            let error = rig
+                .broker
+                .order_fees_after(
+                    &crcl_exit_order(account),
+                    dec!(2.573),
+                    dec!(196.870522),
+                    &[FAST; 4],
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not yet consistent"), "{error}");
+            assert_eq!(rig.count("/api/v1/trades"), 1, "不该重读");
+            rig.finish();
+        }
+    }
+
+    /// 下单时预读的 nonce：杠杆一致时直接用（只读一次 nextNonce）；要先改杠杆（用掉了一个 nonce）时
+    /// 作废、现读一次。假签名库签订单时报错，所以在发单前停下 —— 只看用的是哪个 nonce。
+    #[tokio::test]
+    async fn an_order_uses_the_prefetched_nonce_unless_a_leverage_change_consumed_one() {
+        const ORDERS_PATH: &str = "/api/v1/accountOrders";
+        const MARKETS_PATH: &str = "/api/v1/orderBookDetails";
+        let near = r#"{"market_id":7,"symbol":"NEAR","market_type":"perp","status":"active","supported_size_decimals":2,"supported_price_decimals":4,"size_decimals":2,"price_decimals":4,"min_base_amount":"4.00","min_quote_amount":"10.000000","multiplier":"1.000000000000000000","quote_multiplier":1,"min_initial_margin_fraction":1000}"#;
+        let markets = (
+            200,
+            format!(r#"{{"code":200,"order_book_details":[{near}]}}"#),
+        );
+        let no_order = (200, r#"{"code":200,"orders":[]}"#.to_string());
+        // 3 倍逐仓 = 初始保证金率 3334 / 10000。
+        let leverage = |account: i64, imf: &str| -> Reply {
+            (
+                200,
+                format!(
+                    r#"{{"code":200,"total":1,"accounts":[{{"index":{account},"positions":[{{"market_id":7,"symbol":"NEAR","sign":1,"position":"0","avg_entry_price":"0","position_value":"0","initial_margin_fraction":"{imf}","margin_mode":1,"allocated_margin":"0"}}]}}]}}"#
+                ),
+            )
+        };
+        let order = NewOrder {
+            post_only: false,
+            client_order_id: ClientOrderId("live-1-sell-0".into()),
+            venue: Venue::Lighter,
+            symbol: Symbol::perp("NEAR", "USDT"),
+            side: Side::Sell,
+            notional_usdt: dec!(800),
+            quantity: None,
+            limit_price: Some(dec!(5.36)),
+            reduce_only: false,
+            leverage: Some(dec!(3)),
+            margin_mode: crate::MarginMode::Isolated,
+        };
+
+        // 杠杆已是 3 倍：nextNonce 只读一次（和订单号检查并发），订单用的就是它。
+        let account = 710_911;
+        let unchanged = rig(
+            account,
+            true,
+            vec![
+                (ORDERS_PATH, vec![no_order.clone()]),
+                (MARKETS_PATH, vec![markets.clone()]),
+                (ACCOUNT_PATH, vec![leverage(account, "33.34")]),
+                (NONCE_PATH, vec![nonce_reply(41)]),
+            ],
+        )
+        .await;
+        assert!(
+            unchanged.broker.place(&order).await.is_err(),
+            "假签名库签不出订单"
+        );
+        assert_eq!(unchanged.server.requests(NONCE_PATH).len(), 1);
+        // 订单预留的是 41；签不出来没发出去，又还回去了。
+        let text = std::fs::read_to_string(unchanged.dir.join("journal.jsonl")).unwrap();
+        assert!(
+            text.contains(r#""kind":"nonce_released","nonce":41,"previous":null"#),
+            "{text}"
+        );
+        assert_eq!(unchanged.broker.journal.lock().await.last_nonce, None);
+        assert!(unchanged.server.requests(SEND_PATH).is_empty());
+        unchanged.finish();
+
+        // 杠杆要从 2 倍改成 3 倍：改杠杆用掉 42，预读的 41 作废，订单现读到 43。
+        let account = 710_912;
+        let changed = rig(
+            account,
+            true,
+            vec![
+                (ORDERS_PATH, vec![no_order]),
+                (MARKETS_PATH, vec![markets]),
+                (
+                    ACCOUNT_PATH,
+                    vec![leverage(account, "50.00"), leverage(account, "33.34")],
+                ),
+                (
+                    NONCE_PATH,
+                    vec![nonce_reply(41), nonce_reply(42), nonce_reply(43)],
+                ),
+                (SEND_PATH, vec![accepted_reply("leverage-hash")]),
+            ],
+        )
+        .await;
+        assert!(
+            changed.broker.place(&order).await.is_err(),
+            "假签名库签不出订单"
+        );
+        assert_eq!(changed.server.requests(NONCE_PATH).len(), 3);
+        assert_eq!(
+            changed.server.requests(SEND_PATH).len(),
+            1,
+            "只发了改杠杆那一笔"
+        );
+        // 订单预留的是 43（改杠杆用掉了 42）；签不出来又还回去，停在 42。
+        let text = std::fs::read_to_string(changed.dir.join("journal.jsonl")).unwrap();
+        assert!(
+            text.contains(r#""kind":"nonce_released","nonce":43,"previous":42"#),
+            "{text}"
+        );
+        assert_eq!(changed.broker.journal.lock().await.last_nonce, Some(42));
+        changed.finish();
+    }
+
+    #[tokio::test]
+    async fn a_prefetched_nonce_is_used_without_a_round_trip_and_still_validated() {
+        let account = 710_901;
+        let rig = rig(account, true, vec![(NONCE_PATH, vec![nonce_reply(42)])]).await;
+        let mut journal = rig.broker.journal.lock().await;
+        // 提前读到的 41：不再请求 nextNonce，照常落盘。
+        assert_eq!(
+            rig.broker
+                .reserve_nonce_from(&mut journal, Some(41))
+                .await
+                .unwrap(),
+            41
+        );
+        assert!(rig.server.requests(NONCE_PATH).is_empty());
+        assert_eq!(journal.last_nonce, Some(41));
+        // 不比已预留的大：和现读一样拒绝（上一个 nonce 还没了结）。
+        assert!(
+            rig.broker
+                .reserve_nonce_from(&mut journal, Some(41))
+                .await
+                .is_err()
+        );
+        // 没有提前读到：现读。
+        assert_eq!(
+            rig.broker
+                .reserve_nonce_from(&mut journal, None)
+                .await
+                .unwrap(),
+            42
+        );
+        assert_eq!(rig.server.requests(NONCE_PATH).len(), 1);
+        drop(journal);
+        rig.finish();
+    }
 
     #[tokio::test]
     async fn margin_is_applied_after_readback_and_exactly_one_tx_is_sent() {
@@ -3254,6 +4716,44 @@ mod tests {
         assert_eq!(replayed.last_nonce, None);
         drop(replayed);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 平仓 / 回滚的保护价：盘口第一次被限频、隔 1 秒重读拿到，整次读超过 2 秒也不算盘口旧（10-31 审查：以前把
+    /// 重试等待算进「2 秒往返」，限频时平仓、回滚被自己拒掉）。
+    #[tokio::test]
+    async fn a_rate_limited_book_read_that_retries_still_prices_the_exit() {
+        let account = 710_811;
+        let book = (
+            200,
+            r#"{"code":200,"bids":[{"price":"5.35","remaining_base_amount":"10"}],"asks":[{"price":"5.37","remaining_base_amount":"10"}]}"#
+                .to_string(),
+        );
+        let rig = rig(
+            account,
+            true,
+            vec![(
+                "/api/v1/orderBookOrders",
+                vec![
+                    (429, "Too Many Requests".to_string()),
+                    (429, "Too Many Requests".to_string()),
+                    book,
+                ],
+            )],
+        )
+        .await;
+        let market: Market = serde_json::from_str(
+            r#"{"market_id":7,"symbol":"NEAR","market_type":"perp","status":"active","supported_size_decimals":2,"supported_price_decimals":4,"size_decimals":2,"price_decimals":4,"min_base_amount":"4.00","min_quote_amount":"10.000000","multiplier":"1.000000000000000000","quote_multiplier":1,"min_initial_margin_fraction":1000}"#,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let price = rig.broker.bound_price(&market, Side::Sell).await.unwrap();
+        assert!(
+            started.elapsed() > Duration::from_secs(2),
+            "等过 1 + 2 秒重试"
+        );
+        assert_eq!(price, dec!(5.35) * dec!(0.99));
+        assert_eq!(rig.count("/api/v1/orderBookOrders"), 3);
+        rig.finish();
     }
 
     #[tokio::test]
@@ -3692,7 +5192,12 @@ mod tests {
     fn send_margin_responses_are_classified_conservatively() {
         use reqwest::StatusCode;
         let classify = |status: u16, body: &str| {
-            classify_margin_send(StatusCode::from_u16(status).unwrap(), body.as_bytes(), "h1")
+            classify_send(
+                StatusCode::from_u16(status).unwrap(),
+                body.as_bytes(),
+                "h1",
+                "no margin moved",
+            )
         };
         assert_eq!(
             classify(
@@ -3772,6 +5277,271 @@ mod tests {
         // 回读窗口：6 次、间隔 500ms。
         assert_eq!(MARGIN_POLLS, 6);
         assert_eq!(MARGIN_POLL_INTERVAL, Duration::from_millis(500));
+    }
+
+    /// 某次实盘：补仓单的 nonce 被 sendTx 收下后没有被执行，服务器的下一个 nonce 一直停在它，
+    /// 之后每次预留都被「上一个 nonce 未决」拦住，Lighter 上所有写（含平仓）停了近 5 小时。
+    #[test]
+    fn a_reservation_the_server_never_consumed_is_released_only_when_it_is_provably_stale() {
+        let dir = std::env::temp_dir().join(format!(
+            "arb-lighter-stale-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("journal.jsonl");
+        let mainnet = LighterDeployment::Mainnet;
+        {
+            let mut journal = Journal::open(&path, mainnet, 123_456, 2).unwrap();
+            journal.reserve(26165).unwrap();
+            journal.reserve(26166).unwrap();
+            // 刚预留：不够久，不动。
+            assert!(
+                !journal
+                    .release_if_unconsumed(26166, Duration::from_secs(30))
+                    .unwrap()
+            );
+            assert_eq!(journal.last_nonce, Some(26166));
+            // 服务器已经走过这个 nonce（交易被执行了）、或比 journal 还落后：不动。
+            assert!(
+                !journal
+                    .release_if_unconsumed(26167, Duration::ZERO)
+                    .unwrap()
+            );
+            assert!(
+                !journal
+                    .release_if_unconsumed(26165, Duration::ZERO)
+                    .unwrap()
+            );
+            assert_eq!(journal.last_nonce, Some(26166));
+            // 服务器停在这个 nonce 上且够久：还回去，回到预留前的值。
+            assert!(
+                journal
+                    .release_if_unconsumed(26166, Duration::ZERO)
+                    .unwrap()
+            );
+            assert_eq!(journal.last_nonce, Some(26165));
+            // 释放后没有可再还的预留：重复调用不会连环释放。
+            assert!(
+                !journal
+                    .release_if_unconsumed(26165, Duration::ZERO)
+                    .unwrap()
+            );
+            assert_eq!(journal.last_nonce, Some(26165));
+            // 同一个 nonce 可以再预留。
+            journal.reserve(26166).unwrap();
+            assert_eq!(journal.last_nonce, Some(26166));
+        }
+        // 重放：预留 / 释放 / 再预留的顺序读得回来；重放得到的预留没有时刻，按够久算。
+        let mut journal = Journal::open(&path, mainnet, 123_456, 2).unwrap();
+        assert_eq!(journal.last_nonce, Some(26166));
+        assert!(
+            journal
+                .release_if_unconsumed(26166, Duration::from_secs(3600))
+                .unwrap()
+        );
+        assert_eq!(journal.last_nonce, Some(26165));
+        drop(journal);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    async fn unsent_terminal(rig: &Rig, id: &str) -> Option<OrderState> {
+        let index = client_index(
+            rig.broker.deployment,
+            rig.broker.account,
+            &ClientOrderId(id.into()),
+        );
+        let journal = rig.broker.journal.lock().await;
+        journal.orders.get(&index).and_then(|i| i.terminal.clone())
+    }
+
+    #[tokio::test]
+    async fn an_order_before_sendtx_failure_is_recorded_unsent_and_a_stale_nonce_is_released() {
+        const ORDERS_PATH: &str = "/api/v1/accountOrders";
+        const MARKETS_PATH: &str = "/api/v1/orderBookDetails";
+        let near = r#"{"market_id":7,"symbol":"NEAR","market_type":"perp","status":"active","supported_size_decimals":2,"supported_price_decimals":4,"size_decimals":2,"price_decimals":4,"min_base_amount":"4.00","min_quote_amount":"10.000000","multiplier":"1.000000000000000000","quote_multiplier":1,"min_initial_margin_fraction":1000}"#;
+        let markets = (
+            200,
+            format!(r#"{{"code":200,"order_book_details":[{near}]}}"#),
+        );
+        let no_order = (200, r#"{"code":200,"orders":[]}"#.to_string());
+        let leverage = |account: i64| -> Reply {
+            (
+                200,
+                format!(
+                    r#"{{"code":200,"total":1,"accounts":[{{"index":{account},"positions":[{{"market_id":7,"symbol":"NEAR","sign":1,"position":"0","avg_entry_price":"0","position_value":"0","initial_margin_fraction":"33.34","margin_mode":1,"allocated_margin":"0"}}]}}]}}"#
+                ),
+            )
+        };
+        let order = |id: &str| NewOrder {
+            post_only: false,
+            client_order_id: ClientOrderId(id.into()),
+            venue: Venue::Lighter,
+            symbol: Symbol::perp("NEAR", "USDT"),
+            side: Side::Sell,
+            notional_usdt: dec!(800),
+            quantity: None,
+            limit_price: Some(dec!(5.36)),
+            reduce_only: false,
+            leverage: Some(dec!(3)),
+            margin_mode: crate::MarginMode::Isolated,
+        };
+
+        // 服务器停在 41，journal 上一次预留也是 41（来源是重放：没有时刻 = 够久）：释放后重新预留 41，
+        // 然后假签名库签不出订单 —— 这张单没发出去，意图记成被拒。
+        let account = 710_921;
+        let stale = rig(
+            account,
+            true,
+            vec![
+                (ORDERS_PATH, vec![no_order.clone()]),
+                (MARKETS_PATH, vec![markets.clone()]),
+                (ACCOUNT_PATH, vec![leverage(account)]),
+                (NONCE_PATH, vec![nonce_reply(41)]),
+            ],
+        )
+        .await;
+        {
+            let mut journal = stale.broker.journal.lock().await;
+            journal.reserve(40).unwrap();
+            journal.reserve(41).unwrap();
+            journal.reservation.as_mut().unwrap().at = None;
+        }
+        assert!(stale.broker.place(&order("live-1-sell-0")).await.is_err());
+        // 签不出来 = 没发出去：重新预留的 41 也还回去，下一笔写操作不用等 30 秒。
+        assert_eq!(stale.broker.journal.lock().await.last_nonce, Some(40));
+        let text = std::fs::read_to_string(stale.dir.join("journal.jsonl")).unwrap();
+        assert_eq!(
+            text.matches(r#""kind":"nonce_released","nonce":41,"previous":40"#)
+                .count(),
+            2,
+            "一次自动释放卡住的预留，一次归还没发出去的预留：{text}"
+        );
+        assert!(stale.server.requests(SEND_PATH).is_empty());
+        let state = unsent_terminal(&stale, "live-1-sell-0")
+            .await
+            .expect("unsent order must be closed");
+        assert_eq!(state.status, OrderStatus::Rejected);
+        assert!(state.reject_reason.unwrap().starts_with("not sent"));
+        stale.finish();
+
+        // 服务器的 nonce 落在 journal 后面：仍然 fail closed，但这张单没发出去，同样记成被拒。
+        let account = 710_922;
+        let behind = rig(
+            account,
+            true,
+            vec![
+                (ORDERS_PATH, vec![no_order]),
+                (MARKETS_PATH, vec![markets]),
+                (ACCOUNT_PATH, vec![leverage(account)]),
+                (NONCE_PATH, vec![nonce_reply(39)]),
+            ],
+        )
+        .await;
+        {
+            let mut journal = behind.broker.journal.lock().await;
+            journal.reserve(40).unwrap();
+            journal.reserve(41).unwrap();
+            journal.reservation.as_mut().unwrap().at = None;
+        }
+        let error = behind
+            .broker
+            .place(&order("live-2-sell-0"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("previous nonce is unresolved"));
+        assert_eq!(behind.broker.journal.lock().await.last_nonce, Some(41));
+        let state = unsent_terminal(&behind, "live-2-sell-0")
+            .await
+            .expect("unsent order must be closed");
+        assert_eq!(state.status, OrderStatus::Rejected);
+        behind.finish();
+    }
+
+    /// 下单的 `sendTx` 被 API 服务器明确拒绝（限频 429、业务码）：交易没排队、nonce 没被用掉。意图记成被拒、
+    /// nonce 还回去 —— 以前这张单永远「读不到、不许重发」，开仓腿就此裸着、平仓单永远发不出。
+    /// 5xx（可能已经被处理）仍然是结果不明，意图不落终态、nonce 留着。
+    #[tokio::test]
+    async fn an_order_refused_at_sendtx_is_closed_as_rejected_and_its_nonce_handed_back() {
+        const ORDERS_PATH: &str = "/api/v1/accountOrders";
+        const MARKETS_PATH: &str = "/api/v1/orderBookDetails";
+        let near = r#"{"market_id":7,"symbol":"NEAR","market_type":"perp","status":"active","supported_size_decimals":2,"supported_price_decimals":4,"size_decimals":2,"price_decimals":4,"min_base_amount":"4.00","min_quote_amount":"10.000000","multiplier":"1.000000000000000000","quote_multiplier":1,"min_initial_margin_fraction":1000}"#;
+        let markets = (
+            200,
+            format!(r#"{{"code":200,"order_book_details":[{near}]}}"#),
+        );
+        let no_order = (200, r#"{"code":200,"orders":[]}"#.to_string());
+        let leverage = |account: i64| -> Reply {
+            (
+                200,
+                format!(
+                    r#"{{"code":200,"total":1,"accounts":[{{"index":{account},"positions":[{{"market_id":7,"symbol":"NEAR","sign":1,"position":"0","avg_entry_price":"0","position_value":"0","initial_margin_fraction":"33.34","margin_mode":1,"allocated_margin":"0"}}]}}]}}"#
+                ),
+            )
+        };
+        let order = NewOrder {
+            post_only: false,
+            client_order_id: ClientOrderId("live-9-sell-0".into()),
+            venue: Venue::Lighter,
+            symbol: Symbol::perp("NEAR", "USDT"),
+            side: Side::Sell,
+            notional_usdt: dec!(536),
+            quantity: Some(dec!(100)),
+            limit_price: Some(dec!(5.36)),
+            reduce_only: false,
+            leverage: Some(dec!(3)),
+            margin_mode: crate::MarginMode::Isolated,
+        };
+        let place_with = |account: i64, send: Reply| {
+            let index = client_index(LighterDeployment::Mainnet, account, &order.client_order_id);
+            SIGNABLE_ORDERS.lock().unwrap().push(index);
+            let routes = vec![
+                (ORDERS_PATH, vec![no_order.clone()]),
+                (MARKETS_PATH, vec![markets.clone()]),
+                (ACCOUNT_PATH, vec![leverage(account)]),
+                (NONCE_PATH, vec![nonce_reply(41)]),
+                (SEND_PATH, vec![send]),
+            ];
+            async move { rig(account, true, routes).await }
+        };
+
+        for (account, send) in [
+            (710_931, (429, "Too Many Requests".to_string())),
+            (
+                710_932,
+                (
+                    400,
+                    r#"{"code":21506,"message":"too many pending txs"}"#.to_string(),
+                ),
+            ),
+        ] {
+            let refused = place_with(account, send).await;
+            let error = refused.broker.place(&order).await.unwrap_err();
+            assert!(error.to_string().contains("sendTx"), "{error}");
+            assert_eq!(refused.count(SEND_PATH), 1, "只发一次，不重试");
+            assert_eq!(refused.broker.journal.lock().await.last_nonce, None);
+            let state = unsent_terminal(&refused, "live-9-sell-0")
+                .await
+                .expect("被拒的单要有终态");
+            assert_eq!(state.status, OrderStatus::Rejected);
+            // 读回给的就是这个终态，不再是「不许重发」。
+            let read = refused
+                .broker
+                .order_state(&order.client_order_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.status, OrderStatus::Rejected);
+            refused.finish();
+        }
+
+        // 5xx：请求可能已经被处理，照旧不明。
+        let account = 710_933;
+        let unknown = place_with(account, (502, "Bad Gateway".to_string())).await;
+        assert!(unknown.broker.place(&order).await.is_err());
+        assert_eq!(unknown.broker.journal.lock().await.last_nonce, Some(41));
+        assert!(unsent_terminal(&unknown, "live-9-sell-0").await.is_none());
+        unknown.finish();
     }
 
     #[test]

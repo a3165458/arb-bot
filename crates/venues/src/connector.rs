@@ -15,7 +15,9 @@ use crate::hyperliquid::HyperliquidApi;
 use crate::lighter::LighterApi;
 use crate::mexc::MexcApi;
 use crate::okx::OkxApi;
+use crate::ondo::OndoApi;
 use crate::ourbit::OurbitApi;
+use crate::popdex::PopDexApi;
 use crate::variational::VariationalApi;
 use arb_core::{
     ArbError, ArbResult, Candle, FundingPoint, MarketSnapshot, OrderBook, Settings, Symbol, Venue,
@@ -63,6 +65,13 @@ pub trait VenueApi: Send + Sync + 'static {
             "{} 的连接器尚未实现盘口深度",
             self.venue()
         )))
+    }
+
+    /// 同 [`VenueApi::fetch_depth`]，但允许用本进程里实时维护的盘口（行情 WebSocket）代替一次 REST 往返。
+    /// **只给开仓前的深度核算用**（速度优先）：平仓核对、止盈判断、预检、页面展示仍走 `fetch_depth`。
+    /// 默认就是 `fetch_depth`；Hyperliquid 覆盖它，见 [`crate::live_book`] 的可信条件与取舍。
+    async fn fetch_depth_fast(&self, symbol: &Symbol, levels: u32) -> ArbResult<OrderBook> {
+        self.fetch_depth(symbol, levels).await
     }
 
     /// 这家场所有没有公开的逐合约 K 线。
@@ -149,6 +158,8 @@ pub fn build(venue: Venue, client: Client) -> Arc<dyn VenueApi> {
         Venue::Okx => Arc::new(OkxApi::new(client)),
         Venue::Ourbit => Arc::new(OurbitApi::new(client)),
         Venue::Variational => Arc::new(VariationalApi::new(client)),
+        Venue::Ondo => Arc::new(OndoApi::new(client)),
+        Venue::PopDex => Arc::new(PopDexApi::new(client)),
     }
 }
 
@@ -200,6 +211,10 @@ impl VenueApi for HistoryCached {
 
     async fn fetch_depth(&self, symbol: &Symbol, levels: u32) -> ArbResult<OrderBook> {
         self.inner.fetch_depth(symbol, levels).await
+    }
+
+    async fn fetch_depth_fast(&self, symbol: &Symbol, levels: u32) -> ArbResult<OrderBook> {
+        self.inner.fetch_depth_fast(symbol, levels).await
     }
 
     fn supports_candles(&self) -> bool {

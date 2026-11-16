@@ -53,6 +53,21 @@ impl<K: Hash + Eq> Verified<K> {
             seen.insert(key, Instant::now());
         }
     }
+
+    /// 作废所有满足条件的键：同一个币换了杠杆 / 保证金模式之后，旧的（币, 杠杆, 模式）不能再算「核对过」，
+    /// 否则 TTL 内又要回旧杠杆时会跳过核对，按交易所里实际的新杠杆成交。
+    pub fn forget_where(&self, matches: impl Fn(&K) -> bool) {
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.retain(|key, _| !matches(key));
+        }
+    }
+
+    /// 全部作废：之后每个键都要重新核对。
+    pub fn clear(&self) {
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.clear();
+        }
+    }
 }
 
 /// 带时刻的单值缓存：`get` 只返回不比 `max_age` 更老的值。
@@ -76,6 +91,13 @@ impl<T: Clone> Cached<T> {
     pub fn put(&self, value: T) {
         if let Ok(mut slot) = self.slot.lock() {
             *slot = Some((Instant::now(), value));
+        }
+    }
+
+    /// 作废：下一次 `get` 一定拿不到，调用方重新取。
+    pub fn clear(&self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = None;
         }
     }
 }
@@ -136,9 +158,23 @@ impl LiveOptions {
         best_bid: Option<Decimal>,
         best_ask: Option<Decimal>,
     ) -> ArbResult<Decimal> {
+        self.bound_price_widened(venue, side, best_bid, best_ask, Decimal::ONE)
+    }
+
+    /// 同 [`Self::bound_price`]，价格保护按 `factor` 倍放宽（盘口拉得慢、可能已经旧了的平仓 / 回滚用：
+    /// 宁可多让一点价也要平掉，不能因为网络慢就拒单、让单腿一直裸着）。
+    pub fn bound_price_widened(
+        &self,
+        venue: Venue,
+        side: Side,
+        best_bid: Option<Decimal>,
+        best_ask: Option<Decimal>,
+        factor: Decimal,
+    ) -> ArbResult<Decimal> {
         let slippage = self
             .market_slippage
-            .ok_or_else(|| ArbError::venue(venue.as_str(), "无限价单需要显式的 market_slippage"))?;
+            .ok_or_else(|| ArbError::venue(venue.as_str(), "无限价单需要显式的 market_slippage"))?
+            * factor;
         if let (Some(bid), Some(ask)) = (best_bid, best_ask)
             && (bid <= Decimal::ZERO || ask < bid)
         {
@@ -480,6 +516,7 @@ mod tests {
 
     fn order(quantity: Option<Decimal>, reduce_only: bool) -> NewOrder {
         NewOrder {
+            post_only: false,
             margin_mode: crate::MarginMode::Isolated,
             client_order_id: ClientOrderId("live-1-buy-0".into()),
             venue: Venue::Binance,

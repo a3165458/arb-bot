@@ -12,8 +12,9 @@ use arb_core::{Decimal, Venue};
 
 use crate::arcus_broker::{ArcusBroker, ArcusCredentials};
 use crate::aster_broker::{AsterBroker, AsterCredentials};
-use crate::binance_broker::{BinanceBroker, BinanceCredentials};
+use crate::binance_broker::{BinanceAccount, BinanceBroker, BinanceCredentials};
 use crate::bitget_broker::{BitgetBroker, BitgetCredentials};
+use crate::bitget_uta_broker::{BitgetAccount, BitgetUtaBroker};
 use crate::broker::Broker;
 use crate::bybit_broker::{BybitBroker, BybitCredentials};
 use crate::cli::parse_venue;
@@ -135,6 +136,23 @@ pub fn credential_vars(venue: Venue) -> &'static [&'static str] {
 /// 几家共用、不属于某一个账户的变量：只填了它们不算「填了一部分」。
 const SHARED_VARS: &[&str] = &["ARB_LIGHTER_SIGNER_LIB"];
 
+/// 币安账户类型（可选，不算凭据）：`futures`（默认，经典 U 本位合约账户）或 `unified`（统一账户）。
+pub const BINANCE_ACCOUNT_VAR: &str = "ARB_BINANCE_ACCOUNT";
+
+/// Bitget 账户类型（可选，不算凭据）：`uta`（默认，统一账户，`/api/v3`）或 `classic`（经典账户）。
+/// 升级成统一账户后同一把 Key 访问不了经典接口，所以两种接口必须选对。
+pub const BITGET_ACCOUNT_VAR: &str = "ARB_BITGET_ACCOUNT";
+
+/// 按 [`BINANCE_ACCOUNT_VAR`] 判断币安用的是哪种账户。
+pub fn binance_account(lookup: &dyn Fn(&str) -> Option<String>) -> Result<BinanceAccount, String> {
+    BinanceAccount::parse(lookup(BINANCE_ACCOUNT_VAR).as_deref())
+}
+
+/// 这家场所在当前配置下是否只能全仓开仓（统一账户的 U 本位合约没有逐仓）。
+pub fn cross_only(venue: Venue) -> bool {
+    venue == Venue::Binance && binance_account(&env_lookup) == Ok(BinanceAccount::Unified)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialState {
@@ -252,6 +270,16 @@ fn format_problems(venue: Venue, value: &dyn Fn(&str) -> String) -> Vec<String> 
                     "ARB_ARCUS_API_PRIVATE_KEY 应是 64 位十六进制（网页上的 API Signing Key）"
                         .into(),
                 );
+            }
+        }
+        Venue::Binance => {
+            if let Err(problem) = BinanceAccount::parse(Some(&value(BINANCE_ACCOUNT_VAR))) {
+                problems.push(problem);
+            }
+        }
+        Venue::Bitget => {
+            if let Err(problem) = BitgetAccount::parse(Some(&value(BITGET_ACCOUNT_VAR))) {
+                problems.push(problem);
             }
         }
         _ => {}
@@ -463,6 +491,7 @@ async fn connect_venue(
         }
         Venue::Binance => {
             let [api_key, api_secret] = secrets(venue)?;
+            let account = binance_account(&env_lookup).map_err(anyhow::Error::msg)?;
             Arc::new(
                 BinanceBroker::connect(
                     client.clone(),
@@ -470,6 +499,7 @@ async fn connect_venue(
                         api_key,
                         api_secret,
                     },
+                    account,
                     &journal,
                     options.live_options(),
                 )
@@ -478,19 +508,33 @@ async fn connect_venue(
         }
         Venue::Bitget => {
             let [api_key, api_secret, passphrase] = secrets(venue)?;
-            Arc::new(
-                BitgetBroker::connect(
-                    client.clone(),
-                    BitgetCredentials {
-                        api_key,
-                        api_secret,
-                        passphrase,
-                    },
-                    &journal,
-                    options.live_options(),
-                )
-                .await?,
-            )
+            let credentials = BitgetCredentials {
+                api_key,
+                api_secret,
+                passphrase,
+            };
+            match BitgetAccount::parse(env_lookup(BITGET_ACCOUNT_VAR).as_deref())
+                .map_err(anyhow::Error::msg)?
+            {
+                BitgetAccount::Uta => Arc::new(
+                    BitgetUtaBroker::connect(
+                        client.clone(),
+                        credentials,
+                        &journal,
+                        options.live_options(),
+                    )
+                    .await?,
+                ),
+                BitgetAccount::Classic => Arc::new(
+                    BitgetBroker::connect(
+                        client.clone(),
+                        credentials,
+                        &journal,
+                        options.live_options(),
+                    )
+                    .await?,
+                ),
+            }
         }
         Venue::Bybit => {
             let [api_key, api_secret] = secrets(venue)?;
@@ -761,6 +805,56 @@ mod tests {
         assert!(error.contains("binance"), "{error}");
         assert!(error.contains("okx 缺 ARB_OKX_PASSPHRASE"), "{error}");
         assert!(!auto_venues(&credential_status(&lookup(&[]))).is_ok());
+    }
+
+    #[test]
+    fn the_binance_account_type_is_optional_but_must_be_a_known_one() {
+        let keys = [
+            ("ARB_BINANCE_API_KEY", "k"),
+            ("ARB_BINANCE_API_SECRET", "s"),
+        ];
+        for account in [None, Some("futures"), Some("unified")] {
+            let mut vars = keys.to_vec();
+            vars.extend(account.map(|value| (BINANCE_ACCOUNT_VAR, value)));
+            let env = lookup(&vars);
+            let binance = status(&credential_status(&env), Venue::Binance).clone();
+            assert_eq!(binance.state, CredentialState::Ready, "{account:?}");
+            // The account type is configuration, not a credential.
+            assert!(!binance.vars.contains(&BINANCE_ACCOUNT_VAR));
+        }
+        let mut vars = keys.to_vec();
+        vars.push((BINANCE_ACCOUNT_VAR, "portfolio"));
+        let env = lookup(&vars);
+        let binance = status(&credential_status(&env), Venue::Binance).clone();
+        assert_eq!(binance.state, CredentialState::Invalid);
+        assert!(binance.problems[0].contains(BINANCE_ACCOUNT_VAR));
+        assert_eq!(
+            binance_account(&lookup(&[(BINANCE_ACCOUNT_VAR, "unified")])),
+            Ok(BinanceAccount::Unified)
+        );
+        assert_eq!(binance_account(&lookup(&[])), Ok(BinanceAccount::Futures));
+    }
+
+    /// 统一账户是默认；拼错的账户类型在识别阶段就报出来，不等连接时拖垮整个交易台。
+    #[test]
+    fn the_bitget_account_type_defaults_to_uta_and_must_be_a_known_one() {
+        let keys = [
+            ("ARB_BITGET_API_KEY", "k"),
+            ("ARB_BITGET_API_SECRET", "s"),
+            ("ARB_BITGET_PASSPHRASE", "p"),
+        ];
+        for account in [None, Some("uta"), Some("classic")] {
+            let mut vars = keys.to_vec();
+            vars.extend(account.map(|value| (BITGET_ACCOUNT_VAR, value)));
+            let bitget = status(&credential_status(&lookup(&vars)), Venue::Bitget).clone();
+            assert_eq!(bitget.state, CredentialState::Ready, "{account:?}");
+            assert!(!bitget.vars.contains(&BITGET_ACCOUNT_VAR));
+        }
+        let mut vars = keys.to_vec();
+        vars.push((BITGET_ACCOUNT_VAR, "unified-trading"));
+        let bitget = status(&credential_status(&lookup(&vars)), Venue::Bitget).clone();
+        assert_eq!(bitget.state, CredentialState::Invalid);
+        assert!(bitget.problems[0].contains(BITGET_ACCOUNT_VAR));
     }
 
     #[test]

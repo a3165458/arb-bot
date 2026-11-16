@@ -110,6 +110,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "dotenvy",
  "ed25519-dalek",
  "fs2",
  "futures-util",
@@ -125,6 +126,7 @@ dependencies = [
  "sha2",
  "sha3",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
 ]
 
@@ -135,6 +137,7 @@ dependencies = [
  "anyhow",
  "arb-core",
  "arb-venues",
+ "async-trait",
  "chrono",
  "clap",
  "rust_decimal",
@@ -154,6 +157,7 @@ dependencies = [
  "chrono",
  "reqwest",
  "rust_decimal",
+ "rust_decimal_macros",
  "serde",
  "serde_json",
  "tokio",

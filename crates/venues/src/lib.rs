@@ -13,9 +13,12 @@ pub mod gate;
 pub mod http;
 pub mod hyperliquid;
 pub mod lighter;
+pub mod live_book;
 pub mod mexc;
 pub mod okx;
+pub mod ondo;
 pub mod ourbit;
+pub mod popdex;
 pub mod variational;
 
 pub use connector::{HistoryCached, VenueApi, build, build_all};

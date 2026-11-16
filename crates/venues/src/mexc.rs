@@ -41,6 +41,12 @@
 //!
 //! `time` 是**秒**（`Min60` 相邻两值差 3600），实测按升序返回；代码仍显式排序，
 //! 不依赖这个没写进文档的顺序 —— 顺序反了不会报错，只会把半衰期算成正数。
+//!
+//! **股票等传统资产的合约名不是代码。** 实测（2026-10-21，1088 个 USDT 永续）`NVIDIA_USDT` 是 NVDA、
+//! `AAPLSTOCK_USDT` 是 AAPL、`COINBASE_USDT` 是 某合约，标准代码只在 `displayNameEn`
+//! （`NVDA_USDT PERPETUAL`）里。`tradfi` 板块（股票、ETF、指数、商品、外汇，405 个改名）的 base 取
+//! 显示名里的代码，别家同名合约才对得上（仍要过扫描器的价格核实）；加密币照旧按合约名，不改动已有的
+//! 资金费配对。深度、K 线要的原名按上一轮的对照反查，见 [`MexcApi::native`]。
 
 use std::collections::HashMap;
 
@@ -59,7 +65,26 @@ use crate::http::get_json;
 
 const VENUE: Venue = Venue::Mexc;
 const FUNDING_URL: &str = "https://contract.mexc.com/api/v1/contract/funding_rate";
-const DETAIL_URL: &str = "https://contract.mexc.com/api/v1/contract/detail";
+pub const DETAIL_URL: &str = "https://contract.mexc.com/api/v1/contract/detail";
+/// 传统资产（股票、ETF、指数、商品、外汇）所在的板块：只有它们的 base 取显示名里的代码。
+const TRADFI_PLATE: &str = "mc-trade-zone-tradfi";
+
+/// 我们的 API 账户在 MEXC 实际付的吃单费率。2026-10-26 按合约读 `tiered_fee_rate/v2`：NVIDIA、AAPL、TESLA、
+/// 某合约、QQQ、某合约、XAU、BTC、某合约 全是 `realTakerFee` 0.0008（`level` 9999、`feeRateType` BASE、挂单 0.0006），
+/// 某次实盘 实盘成交也是 0.080%。公开 `contract/detail` 的 `takerFeeRate`（0.0002，偶尔 0.0004）不适用这个账户，
+/// 按它算会把成本低估四倍、开出扣费后不赚的单。
+pub const API_TAKER_FEE: Decimal = Decimal::from_parts(8, 0, 0, false, 4);
+
+/// 公开费率和 [`API_TAKER_FEE`] 取较大的：没给公开费率也按账户费率算（不退化成「不知道」）。
+fn account_taker_fee(public: Option<Decimal>) -> Option<Decimal> {
+    Some(public.map_or(API_TAKER_FEE, |fee| fee.max(API_TAKER_FEE)))
+}
+/// 商品类板块（价差监控的类别用）。
+const COMMODITY_PLATES: [&str; 3] = [
+    "mc-trade-zone-Commodities",
+    "mc-trade-zone-metals",
+    "mc-trade-zone-metalsfutures",
+];
 const TICKER_URL: &str = "https://contract.mexc.com/api/v1/contract/ticker";
 const DEPTH_URL: &str = "https://contract.mexc.com/api/v1/contract/depth";
 const KLINE_URL: &str = "https://contract.mexc.com/api/v1/contract/kline";
@@ -145,11 +170,36 @@ const MAX_INTERVAL_H: u32 = 24;
 
 pub struct MexcApi {
     client: Client,
+    /// 合约名 → base（[`canonical_bases`]），每轮扫描按合约详情刷新；详情这一轮没取到时沿用上一轮，
+    /// 股票类的名字不会在 `NVDA` 和 `NVIDIA` 之间来回跳。
+    bases: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl MexcApi {
     pub fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            bases: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 这一轮的合约名 → base。
+    fn remember_bases(&self, details: &HashMap<String, Detail>) -> HashMap<String, String> {
+        let mut cached = self.bases.lock().unwrap_or_else(|e| e.into_inner());
+        if !details.is_empty() {
+            *cached = canonical_bases(details.values().map(Detail::naming));
+        }
+        cached.clone()
+    }
+
+    /// base 对应的合约名（深度、K 线用）：先查上一轮扫描的对照，没有就按 `{base}_USDT`。
+    fn native(&self, base: &str) -> String {
+        let cached = self.bases.lock().unwrap_or_else(|e| e.into_inner());
+        cached
+            .iter()
+            .find(|(_, known)| known.as_str() == base)
+            .map(|(symbol, _)| symbol.clone())
+            .unwrap_or_else(|| format!("{base}_{QUOTE}"))
     }
 
     /// 面值与吃单费率，按 symbol 索引。失败只影响这两项，不该让整家场所消失。
@@ -242,6 +292,178 @@ struct Detail {
     /// 每张合约的标的数量（如 BTC_USDT 是 0.0001 BTC/张）。
     contract_size: Option<f64>,
     taker_fee_rate: Option<f64>,
+    /// 第一档维持保证金率（我们的单笔远在第一档内：NVIDIA 第一档到 29000 张）。
+    #[serde(default)]
+    maintenance_margin_rate: Option<f64>,
+    #[serde(default)]
+    max_leverage: Option<f64>,
+    #[serde(default)]
+    display_name_en: Option<String>,
+    #[serde(default)]
+    concept_plate: Option<Vec<String>>,
+    #[serde(default)]
+    state: Option<i64>,
+    /// 盘前代币（上线现货前的合约）。
+    #[serde(default)]
+    pre_market: Option<bool>,
+}
+
+impl Detail {
+    fn in_plate(&self, plate: &str) -> bool {
+        self.concept_plate
+            .as_ref()
+            .is_some_and(|plates| plates.iter().any(|p| p == plate))
+    }
+
+    /// 上市前（`mc-trade-zone-preipo`）或盘前（`mc-trade-zone-PreMarket` / `preMarket`）合约。
+    fn pre_ipo(&self) -> bool {
+        self.pre_market == Some(true)
+            || self.concept_plate.as_ref().is_some_and(|plates| {
+                plates.iter().any(|p| {
+                    let p = p.to_ascii_lowercase();
+                    p.ends_with("-preipo") || p.ends_with("-premarket")
+                })
+            })
+    }
+
+    fn naming(&self) -> (&str, Option<&str>, bool) {
+        (
+            &self.symbol,
+            self.display_name_en.as_deref(),
+            self.in_plate(TRADFI_PLATE),
+        )
+    }
+}
+
+/// 合约名里的 base（`BTC_USDT` → `BTC`）；不是 USDT 永续的名字为 `None`。
+fn symbol_base(symbol: &str) -> Option<&str> {
+    symbol
+        .strip_suffix(&format!("_{QUOTE}"))
+        .filter(|base| !base.is_empty() && !base.contains('_'))
+}
+
+/// 显示名里的代码（`NVDA_USDT PERPETUAL` → `NVDA`）。只认大写字母数字：`GOLD(XAU)`、中文名不用。
+fn display_code(display: &str) -> Option<&str> {
+    display
+        .trim()
+        .strip_suffix(" PERPETUAL")?
+        .strip_suffix(&format!("_{QUOTE}"))
+        .filter(|code| {
+            !code.is_empty()
+                && code
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        })
+}
+
+/// 合约名 → base。输入是（合约名, 显示名, 是否 `tradfi` 板块）。`tradfi` 板块用显示名里的代码，
+/// 其余按合约名。改出来的名字和别的合约撞了（两份资产会被认成一个）就不改，保留合约名。
+pub fn canonical_bases<'a>(
+    rows: impl IntoIterator<Item = (&'a str, Option<&'a str>, bool)>,
+) -> HashMap<String, String> {
+    let mut plain: HashMap<String, String> = HashMap::new();
+    let mut wanted: HashMap<String, String> = HashMap::new();
+    for (symbol, display, tradfi) in rows {
+        let Some(base) = symbol_base(symbol) else {
+            continue;
+        };
+        plain.insert(symbol.to_string(), base.to_string());
+        if let Some(code) = display.and_then(display_code).filter(|_| tradfi)
+            && code != base
+        {
+            wanted.insert(symbol.to_string(), code.to_string());
+        }
+    }
+    let mut uses: HashMap<String, usize> = HashMap::new();
+    for (symbol, base) in &plain {
+        *uses
+            .entry(wanted.get(symbol).unwrap_or(base).clone())
+            .or_default() += 1;
+    }
+    plain
+        .into_iter()
+        .map(|(symbol, base)| {
+            let name = match wanted.get(&symbol) {
+                Some(code) if uses.get(code) == Some(&1) => code.clone(),
+                _ => base,
+            };
+            (symbol, name)
+        })
+        .collect()
+}
+
+/// 价差监控要的一个 USDT 永续（`/contract/detail` 全量一次）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Contract {
+    /// 合约名（订阅、下单用），如 `NVIDIA_USDT`。
+    pub symbol: String,
+    /// 标准名，见 [`canonical_bases`]。
+    pub base: String,
+    /// 每张的标的数量：盘口量是张数，乘它才是标的数量。
+    pub contract_size: Decimal,
+    pub taker_fee: Option<Decimal>,
+    /// `tradfi` 板块（股票、ETF、指数、商品、外汇）。
+    pub tradfi: bool,
+    pub commodity: bool,
+    /// 上市前 / 盘前合约（见 `Detail::pre_ipo`）：各家上市换算规则不同，不交易。
+    pub pre_ipo: bool,
+}
+
+fn detail_rows(details: &serde_json::Value) -> ArbResult<Vec<Detail>> {
+    serde_json::from_value::<Envelope<Detail>>(details.clone())
+        .map_err(|error| ArbError::venue(VENUE.as_str(), format!("合约详情格式不对：{error}")))?
+        .into_data("合约详情")
+}
+
+/// 合约名 → 标准名，在详情的**全部**行上算（扫描、价差监控、下单三处同一份输入）：撞名保护看的是
+/// 整张表，先按状态筛再算，某个合约一停牌，和它撞名的那个就会改名，持仓的标的跟着变。
+pub fn bases_of(details: &serde_json::Value) -> ArbResult<HashMap<String, String>> {
+    Ok(canonical_bases(
+        detail_rows(details)?.iter().map(Detail::naming),
+    ))
+}
+
+/// [`bases_of`] 的数据源（下单模块用）。
+pub async fn fetch_bases(client: &Client) -> ArbResult<HashMap<String, String>> {
+    let details: serde_json::Value = get_json(client.get(DETAIL_URL), VENUE).await?;
+    bases_of(&details)
+}
+
+/// 在交易（`state == 0`）、USDT 结算、面值有效的永续。标准名按全部行算（见 [`bases_of`]）。
+pub fn contracts(details: &serde_json::Value) -> ArbResult<Vec<Contract>> {
+    let rows = detail_rows(details)?;
+    let bases = canonical_bases(rows.iter().map(Detail::naming));
+    Ok(rows
+        .iter()
+        .filter(|row| {
+            row.state == Some(0)
+                && row
+                    .settle_coin
+                    .as_deref()
+                    .is_some_and(|coin| coin.eq_ignore_ascii_case(QUOTE))
+        })
+        .filter_map(|row| {
+            let contract_size = row
+                .contract_size
+                .and_then(from_json_f64)
+                .filter(|size| *size > Decimal::ZERO)?;
+            Some(Contract {
+                symbol: row.symbol.clone(),
+                base: bases.get(&row.symbol)?.clone(),
+                contract_size,
+                taker_fee: account_taker_fee(row.taker_fee_rate.and_then(from_json_f64)),
+                tradfi: row.in_plate(TRADFI_PLATE),
+                commodity: COMMODITY_PLATES.iter().any(|plate| row.in_plate(plate)),
+                pre_ipo: row.pre_ipo(),
+            })
+        })
+        .collect())
+}
+
+/// [`contracts`] 的数据源（约 1.2 MB）。
+pub async fn fetch_contracts(client: &Client) -> ArbResult<Vec<Contract>> {
+    let details: serde_json::Value = get_json(client.get(DETAIL_URL), VENUE).await?;
+    contracts(&details)
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,6 +491,7 @@ impl VenueApi for MexcApi {
                 .await?
                 .into_data("资金费")?;
         let details = self.fetch_details().await;
+        let bases = self.remember_bases(&details);
         let tickers = self.fetch_tickers().await;
 
         let mut out = Vec::with_capacity(funding.len());
@@ -290,7 +513,8 @@ impl VenueApi for MexcApi {
                 filtered += 1;
                 continue;
             }
-            match parse_row(&row, detail, tickers.get(&row.symbol)) {
+            let base = bases.get(&row.symbol).map(String::as_str);
+            match parse_row(&row, base, detail, tickers.get(&row.symbol)) {
                 Some(rate) => out.push(rate),
                 None => unusable += 1,
             }
@@ -309,7 +533,7 @@ impl VenueApi for MexcApi {
         if levels == 0 {
             return Err(ArbError::config("levels 必须大于 0"));
         }
-        let native = format!("{}_{QUOTE}", symbol.base);
+        let native = self.native(&symbol.base);
 
         let detail: DepthEnvelope<Detail> = get_json(
             self.client.get(format!("{DETAIL_URL}?symbol={native}")),
@@ -358,7 +582,7 @@ impl VenueApi for MexcApi {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let native = format!("{}_{QUOTE}", symbol.base);
+        let native = self.native(&symbol.base);
         let interval = kline_interval(interval_minutes)?;
         let url = format!("{KLINE_URL}/{native}?interval={interval}");
         let envelope: DepthEnvelope<KlineData> = get_json(self.client.get(&url), VENUE).await?;
@@ -371,12 +595,17 @@ impl VenueApi for MexcApi {
 ///
 /// 费率缺失或不可解析一律丢行：实测该场所会对同一合约在几秒内反复返回 0 与真值，
 /// 把「没给」当成 0 会凭空造出巨大价差并排到榜首。
+/// `base` 是 [`canonical_bases`] 给的标准名；`None` 按合约名。
 fn parse_row(
     row: &FundingRow,
+    base: Option<&str>,
     detail: Option<&Detail>,
     ticker: Option<&Ticker>,
 ) -> Option<MarketSnapshot> {
-    let base = row.symbol.strip_suffix(&format!("_{QUOTE}"))?;
+    let base = match base {
+        Some(base) => base,
+        None => row.symbol.strip_suffix(&format!("_{QUOTE}"))?,
+    };
     let period_rate = row.funding_rate.and_then(from_json_f64)?;
 
     let next_settle = row.next_settle_time.filter(|ms| *ms > 0)?;
@@ -427,9 +656,11 @@ fn parse_row(
         interval_assumed,
         next_funding_at,
         next_funding_estimated: false,
-        taker_fee: detail
-            .and_then(|d| d.taker_fee_rate)
-            .and_then(from_json_f64),
+        taker_fee: account_taker_fee(
+            detail
+                .and_then(|d| d.taker_fee_rate)
+                .and_then(from_json_f64),
+        ),
         mark_price,
         index_price: row.idx_price.and_then(from_json_f64),
         best_bid,
@@ -438,8 +669,15 @@ fn parse_row(
         ask_size_usdt: None,
         open_interest_usdt,
         quote_volume_24h: ticker.and_then(|t| t.amount24).and_then(from_json_f64),
-        max_leverage: None,
-        maintenance_margin: None,
+        max_leverage: detail
+            .and_then(|d| d.max_leverage)
+            .and_then(from_json_f64)
+            .filter(|max| *max >= Decimal::ONE),
+        // 没有它时「自动加保证金」等规则算不出强平距离，MEXC 的每一笔开仓都会被拒。
+        maintenance_margin: detail
+            .and_then(|d| d.maintenance_margin_rate)
+            .and_then(from_json_f64)
+            .filter(|mmr| *mmr > Decimal::ZERO && *mmr < Decimal::ONE),
         oi_capped: false,
     })
 }
@@ -563,7 +801,7 @@ mod tests {
     ]}"#;
 
     const DETAIL_FIXTURE: &str = r#"{"success":true,"code":0,"data":[
-        {"symbol":"BTC_USDT","settleCoin":"USDT","state":0,"contractSize":0.0001,"takerFeeRate":0.0004}
+        {"symbol":"BTC_USDT","settleCoin":"USDT","state":0,"contractSize":0.0001,"takerFeeRate":0.0004,"maintenanceMarginRate":0.004,"maxLeverage":500}
     ]}"#;
 
     const TICKER_FIXTURE: &str = r#"{"success":true,"code":0,"data":[
@@ -604,7 +842,7 @@ mod tests {
         let ticker: Ticker = serde_json::from_str(BOOK_FIXTURE).unwrap();
         let row = funding_rows().remove(0);
         for detail in [Some(detail()), None] {
-            let rate = parse_row(&row, detail.as_ref(), Some(&ticker)).unwrap();
+            let rate = parse_row(&row, None, detail.as_ref(), Some(&ticker)).unwrap();
             assert_eq!(rate.best_bid, Some(Decimal::new(803473, 1)));
             assert_eq!(rate.best_ask, Some(Decimal::new(803474, 1)));
             assert_eq!((rate.bid_size_usdt, rate.ask_size_usdt), (None, None));
@@ -616,7 +854,7 @@ mod tests {
         let row = funding_rows().remove(0);
         let ticker = ticker();
         for ticker in [Some(&ticker), None] {
-            let rate = parse_row(&row, Some(&detail()), ticker).unwrap();
+            let rate = parse_row(&row, None, Some(&detail()), ticker).unwrap();
             assert_eq!(
                 (
                     rate.best_bid,
@@ -642,26 +880,26 @@ mod tests {
         ] {
             ticker.bid1 = invalid;
             ticker.ask1 = Some(80347.4);
-            let rate = parse_row(&row, None, Some(&ticker)).unwrap();
+            let rate = parse_row(&row, None, None, Some(&ticker)).unwrap();
             assert_eq!(rate.best_bid, None);
             assert_eq!(rate.best_ask, Some(Decimal::new(803474, 1)));
 
             ticker.bid1 = Some(80347.3);
             ticker.ask1 = invalid;
-            let rate = parse_row(&row, None, Some(&ticker)).unwrap();
+            let rate = parse_row(&row, None, None, Some(&ticker)).unwrap();
             assert_eq!(rate.best_bid, Some(Decimal::new(803473, 1)));
             assert_eq!(rate.best_ask, None);
         }
 
         ticker.bid1 = Some(80347.5);
         ticker.ask1 = Some(80347.4);
-        let rate = parse_row(&row, None, Some(&ticker)).unwrap();
+        let rate = parse_row(&row, None, None, Some(&ticker)).unwrap();
         assert_eq!((rate.best_bid, rate.best_ask), (None, None));
         assert_eq!(rate.period_rate, Decimal::new(1, 4));
 
         // 锁盘不是交叉盘：确实相等的买卖价必须保留，不能抹掉真实的零价差。
         ticker.bid1 = ticker.ask1;
-        let rate = parse_row(&row, None, Some(&ticker)).unwrap();
+        let rate = parse_row(&row, None, None, Some(&ticker)).unwrap();
         assert_eq!(rate.best_bid, Some(Decimal::new(803474, 1)));
         assert_eq!(rate.best_ask, rate.best_bid);
     }
@@ -681,10 +919,10 @@ mod tests {
     fn the_settlement_cycle_is_read_per_contract() {
         let rows = funding_rows();
         let detail = detail();
-        let btc = parse_row(&rows[0], Some(&detail), None).unwrap();
+        let btc = parse_row(&rows[0], None, Some(&detail), None).unwrap();
         assert_eq!((btc.interval_h, btc.interval_assumed), (8, false));
         // 同一家场所内 1h 合约与 8h 合约并存 —— 这正是不能用固定周期的原因
-        let cvc = parse_row(&rows[1], None, None).unwrap();
+        let cvc = parse_row(&rows[1], None, None, None).unwrap();
         assert_eq!((cvc.interval_h, cvc.interval_assumed), (1, false));
     }
 
@@ -693,7 +931,7 @@ mod tests {
         let mut row = funding_rows().remove(0);
         for cycle in [None, Some(0), Some(-1), Some(48), Some(i64::MAX)] {
             row.collect_cycle = cycle;
-            let rate = parse_row(&row, None, None).unwrap();
+            let rate = parse_row(&row, None, None, None).unwrap();
             assert_eq!(
                 (rate.interval_h, rate.interval_assumed),
                 (DEFAULT_FUNDING_INTERVAL_H, true),
@@ -706,15 +944,15 @@ mod tests {
     fn a_missing_rate_drops_the_row_instead_of_faking_zero() {
         let mut row = funding_rows().remove(0);
         row.funding_rate = None;
-        assert!(parse_row(&row, None, None).is_none());
+        assert!(parse_row(&row, None, None, None).is_none());
 
         row.funding_rate = Some(f64::NAN);
-        assert!(parse_row(&row, None, None).is_none());
+        assert!(parse_row(&row, None, None, None).is_none());
 
         // 真值 0 必须保留 —— 它和「没给」是两回事
         row.funding_rate = Some(0.0);
         assert_eq!(
-            parse_row(&row, None, None).unwrap().period_rate,
+            parse_row(&row, None, None, None).unwrap().period_rate,
             Decimal::ZERO
         );
     }
@@ -724,31 +962,56 @@ mod tests {
         let mut row = funding_rows().remove(0);
         for time in [None, Some(0), Some(-1), Some(i64::MAX)] {
             row.next_settle_time = time;
-            assert!(parse_row(&row, None, None).is_none(), "time={time:?}");
+            assert!(parse_row(&row, None, None, None).is_none(), "time={time:?}");
         }
     }
 
+    /// 维持保证金率与最大杠杆来自合约详情：没有它们「自动加保证金」算不出强平距离，每一笔开仓都会被拒。
     #[test]
-    fn the_per_contract_taker_fee_is_used_verbatim() {
+    fn maintenance_margin_and_max_leverage_come_from_the_detail() {
+        let rows = funding_rows();
+        let row = parse_row(&rows[0], None, Some(&detail()), None).unwrap();
+        assert_eq!(row.maintenance_margin, Some(Decimal::new(4, 3)));
+        assert_eq!(row.max_leverage, Some(Decimal::from(500)));
+        let row = parse_row(&rows[0], None, None, None).unwrap();
+        assert_eq!((row.maintenance_margin, row.max_leverage), (None, None));
+    }
+
+    /// 公开费率比 API 账户实际付的低（0.02% 对 0.08%）：按账户费率算；公开的更高才按公开的。
+    #[test]
+    fn the_taker_fee_is_what_the_api_account_actually_pays() {
         let rows = funding_rows();
         let mut detail = detail();
+        let fee = |detail: Option<&_>| parse_row(&rows[0], None, detail, None).unwrap().taker_fee;
         assert_eq!(
-            parse_row(&rows[0], Some(&detail), None).unwrap().taker_fee,
-            Some(Decimal::new(4, 4))
+            fee(Some(&detail)),
+            Some(API_TAKER_FEE),
+            "公开 0.0004 低于账户的 0.0008"
         );
-        // 实测存在 0 费率的合约：已知为 0 不能退化成「不知道」
         detail.taker_fee_rate = Some(0.0);
         assert_eq!(
-            parse_row(&rows[0], Some(&detail), None).unwrap().taker_fee,
-            Some(Decimal::ZERO)
+            fee(Some(&detail)),
+            Some(API_TAKER_FEE),
+            "网页 0 费率不适用 API 账户"
         );
-        // 详情缺失 → 未知，由排名回落到配置值
-        assert_eq!(parse_row(&rows[0], None, None).unwrap().taker_fee, None);
+        detail.taker_fee_rate = Some(0.001);
+        assert_eq!(
+            fee(Some(&detail)),
+            Some(Decimal::new(1, 3)),
+            "公开的更高按公开的"
+        );
+        assert_eq!(fee(None), Some(API_TAKER_FEE), "没有详情也按账户费率");
     }
 
     #[test]
     fn open_interest_converts_contracts_to_usdt() {
-        let rate = parse_row(&funding_rows().remove(0), Some(&detail()), Some(&ticker())).unwrap();
+        let rate = parse_row(
+            &funding_rows().remove(0),
+            None,
+            Some(&detail()),
+            Some(&ticker()),
+        )
+        .unwrap();
         // 531307174 张 × 0.0001 BTC/张 × 81351.6 ≈ 4.32e9 USDT
         let oi = rate.open_interest_usdt.unwrap();
         assert!(
@@ -762,6 +1025,7 @@ mod tests {
         assert!(
             parse_row(
                 &funding_rows().remove(0),
+                None,
                 Some(&without_size),
                 Some(&ticker())
             )
@@ -781,18 +1045,149 @@ mod tests {
         assert!(!is_usdt_perp("BTCUSD"));
     }
 
+    // 2026-10-21 `/contract/detail` 的真实片段（字段截取）。
+    const NAMING_FIXTURE: &str = r#"{"success":true,"code":0,"data":[
+        {"symbol":"BTC_USDT","displayNameEn":"BTC_USDT PERPETUAL","settleCoin":"USDT","state":0,"contractSize":0.0001,"takerFeeRate":0.0004,"conceptPlate":["mc-trade-zone-mainly","mc-trade-zone-layer2","mc-trade-zone-pow"]},
+        {"symbol":"XAU_USDT","displayNameEn":"GOLD(XAU)_USDT PERPETUAL","settleCoin":"USDT","state":0,"contractSize":0.001,"takerFeeRate":0.0004,"conceptPlate":["mc-trade-zone-metals","mc-trade-zone-tradfi","mc-trade-zone-metalsfutures","mc-trade-zone-Commodities"]},
+        {"symbol":"SOXL_USDT","displayNameEn":"SOXL_USDT PERPETUAL","settleCoin":"USDT","state":0,"contractSize":0.01,"takerFeeRate":0.0004,"conceptPlate":["mc-trade-zone-Stock","mc-trade-zone-0fees","mc-trade-zone-tradfi","mc-trade-zone-ETF","mc-trade-zone-stockindex"]},
+        {"symbol":"FILECOIN_USDT","displayNameEn":"FIL_USDT PERPETUAL","settleCoin":"USDT","state":0,"contractSize":0.01,"takerFeeRate":0.0004,"conceptPlate":["mc-trade-zone-layer2","mc-trade-zone-web3"]},
+        {"symbol":"NVIDIA_USDT","displayNameEn":"NVDA_USDT PERPETUAL","settleCoin":"USDT","state":0,"contractSize":0.01,"takerFeeRate":0.0004,"conceptPlate":["mc-trade-zone-Stock","mc-trade-zone-0fees","mc-trade-zone-tradfi","mc-trade-zone-usstocks"]},
+        {"symbol":"AAPLSTOCK_USDT","displayNameEn":"AAPL_USDT PERPETUAL","settleCoin":"USDT","state":0,"contractSize":0.01,"takerFeeRate":0.0004,"conceptPlate":["mc-trade-zone-Stock","mc-trade-zone-tradfi","mc-trade-zone-usstocks"]},
+        {"symbol":"PAUSED_USDT","displayNameEn":"PAUSED_USDT PERPETUAL","settleCoin":"USDT","state":1,"contractSize":1,"takerFeeRate":0.0004},
+        {"symbol":"BTC_USDC","displayNameEn":"BTC_USDC PERPETUAL","settleCoin":"USDC","state":0,"contractSize":0.0001,"takerFeeRate":0.0004}
+    ]}"#;
+
+    #[test]
+    fn tradfi_contracts_take_the_ticker_from_the_display_name() {
+        let all = contracts(&serde_json::from_str(NAMING_FIXTURE).unwrap()).unwrap();
+        let by: HashMap<&str, &Contract> = all.iter().map(|c| (c.symbol.as_str(), c)).collect();
+        assert_eq!(by["NVIDIA_USDT"].base, "NVDA");
+        assert_eq!(by["AAPLSTOCK_USDT"].base, "AAPL");
+        assert_eq!(by["SOXL_USDT"].base, "SOXL");
+        // 显示名不是代码（GOLD(XAU)）：按合约名。
+        assert_eq!(by["XAU_USDT"].base, "XAU");
+        assert!(by["XAU_USDT"].tradfi && by["XAU_USDT"].commodity);
+        // 加密币不改名（FILECOIN 显示 FIL 也不改：不动已有的资金费配对）。
+        assert_eq!(by["FILECOIN_USDT"].base, "FILECOIN");
+        assert!(!by["BTC_USDT"].tradfi);
+        assert_eq!(by["NVIDIA_USDT"].contract_size, Decimal::new(1, 2));
+        assert_eq!(
+            by["NVIDIA_USDT"].taker_fee,
+            Some(API_TAKER_FEE),
+            "按账户实际费率"
+        );
+        // 不在交易、不是 USDT 结算：不列。
+        assert!(!by.contains_key("PAUSED_USDT") && !by.contains_key("BTC_USDC"));
+    }
+
+    #[test]
+    fn pre_ipo_and_pre_market_contracts_are_flagged() {
+        // 2026-11-04 `/contract/detail` 的真实片段（字段截取）。
+        let rows = serde_json::json!({"success": true, "code": 0, "data": [
+            {"symbol": "OURASTOCK_USDT", "displayNameEn": "OURA_USDT PERPETUAL", "settleCoin": "USDT", "state": 0, "contractSize": 0.01, "takerFeeRate": 0.0004, "preMarket": false,
+             "conceptPlate": ["mc-trade-zone-Stock", "mc-trade-zone-0fees", "mc-trade-zone-preipo", "mc-trade-zone-tradfi", "mc-trade-zone-usstocks"]},
+            {"symbol": "XTEN_USDT", "displayNameEn": "XTEN_USDT PERPETUAL", "settleCoin": "USDT", "state": 0, "contractSize": 1, "takerFeeRate": 0.0004, "preMarket": true,
+             "conceptPlate": ["mc-trade-zone-innovation", "mc-trade-zone-PreMarket"]},
+            {"symbol": "NVIDIA_USDT", "displayNameEn": "NVDA_USDT PERPETUAL", "settleCoin": "USDT", "state": 0, "contractSize": 0.01, "takerFeeRate": 0.0004, "preMarket": false,
+             "conceptPlate": ["mc-trade-zone-Stock", "mc-trade-zone-tradfi", "mc-trade-zone-usstocks"]}
+        ]});
+        let all = contracts(&rows).unwrap();
+        let by: HashMap<&str, &Contract> = all.iter().map(|c| (c.base.as_str(), c)).collect();
+        assert!(by["OURA"].pre_ipo, "上市前板块");
+        assert!(by["XTEN"].pre_ipo, "盘前代币");
+        assert!(!by["NVDA"].pre_ipo);
+    }
+
+    #[test]
+    fn names_do_not_depend_on_which_contracts_are_trading() {
+        // NVDA_USDT（加密币）和 NVIDIA_USDT（股票，显示 NVDA）撞名：NVIDIA 保留合约名。
+        // 那个加密币停牌（state 1）也一样 —— 先筛再算的话，NVIDIA 会在停牌期间变成 NVDA。
+        let rows = |state: i64| {
+            serde_json::json!({"success": true, "code": 0, "data": [
+                {"symbol": "NVDA_USDT", "displayNameEn": "NVDA_USDT PERPETUAL", "settleCoin": "USDT", "state": state, "contractSize": 1, "takerFeeRate": 0.0004},
+                {"symbol": "NVIDIA_USDT", "displayNameEn": "NVDA_USDT PERPETUAL", "settleCoin": "USDT", "state": 0, "contractSize": 0.01, "takerFeeRate": 0.0004, "conceptPlate": ["mc-trade-zone-tradfi"]}
+            ]})
+        };
+        for state in [0, 1] {
+            let names = bases_of(&rows(state)).unwrap();
+            assert_eq!(names["NVIDIA_USDT"], "NVIDIA", "state={state}");
+            let listed = contracts(&rows(state)).unwrap();
+            let nvidia = listed.iter().find(|c| c.symbol == "NVIDIA_USDT").unwrap();
+            assert_eq!(nvidia.base, "NVIDIA", "state={state}");
+        }
+        assert_eq!(
+            contracts(&rows(1)).unwrap().len(),
+            1,
+            "停牌的不列，但还参与命名"
+        );
+    }
+
+    #[test]
+    fn a_display_ticker_that_collides_keeps_the_contract_name() {
+        // 有个加密币就叫 NVDA：NVIDIA 的股票合约不能也叫 NVDA。
+        let bases = canonical_bases([
+            ("NVDA_USDT", Some("NVDA_USDT PERPETUAL"), false),
+            ("NVIDIA_USDT", Some("NVDA_USDT PERPETUAL"), true),
+            ("AAPLSTOCK_USDT", Some("AAPL_USDT PERPETUAL"), true),
+        ]);
+        assert_eq!(bases["NVDA_USDT"], "NVDA");
+        assert_eq!(bases["NVIDIA_USDT"], "NVIDIA");
+        assert_eq!(bases["AAPLSTOCK_USDT"], "AAPL");
+        // 两个股票合约显示同一个代码：都不改。
+        let twins = canonical_bases([
+            ("SKHYSTOCK_USDT", Some("SKHY_USDT PERPETUAL"), true),
+            ("SKHY2STOCK_USDT", Some("SKHY_USDT PERPETUAL"), true),
+        ]);
+        assert_eq!(twins["SKHYSTOCK_USDT"], "SKHYSTOCK");
+        assert_eq!(twins["SKHY2STOCK_USDT"], "SKHY2STOCK");
+    }
+
+    #[test]
+    fn the_scan_reports_the_canonical_base_and_maps_it_back_to_the_contract() {
+        let api = MexcApi::new(Client::new());
+        let details: HashMap<String, Detail> =
+            serde_json::from_str::<Envelope<Detail>>(NAMING_FIXTURE)
+                .unwrap()
+                .into_data("详情")
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.symbol.clone(), row))
+                .collect();
+        let bases = api.remember_bases(&details);
+        let mut row = funding_rows().remove(0);
+        row.symbol = "NVIDIA_USDT".into();
+        let base = bases.get(&row.symbol).map(String::as_str);
+        assert_eq!(
+            parse_row(&row, base, None, None)
+                .unwrap()
+                .symbol
+                .to_string(),
+            "NVDA/USDT"
+        );
+        assert_eq!(api.native("NVDA"), "NVIDIA_USDT");
+        assert_eq!(api.native("BTC"), "BTC_USDT");
+        // 这一轮详情没取到：沿用上一轮，不退回 NVIDIA。
+        assert_eq!(api.remember_bases(&HashMap::new())["NVIDIA_USDT"], "NVDA");
+    }
+
     #[test]
     fn the_underscore_separator_is_stripped_from_the_base() {
         let rows = funding_rows();
         assert_eq!(
-            parse_row(&rows[0], None, None).unwrap().symbol.to_string(),
+            parse_row(&rows[0], None, None, None)
+                .unwrap()
+                .symbol
+                .to_string(),
             "BTC/USDT"
         );
         // 带数字前缀的倍数合约也要还原成完整 base，不能截断
         let mut row = rows[0].clone();
         row.symbol = "1000000BABYDOGE_USDT".into();
         assert_eq!(
-            parse_row(&row, None, None).unwrap().symbol.to_string(),
+            parse_row(&row, None, None, None)
+                .unwrap()
+                .symbol
+                .to_string(),
             "1000000BABYDOGE/USDT"
         );
     }
@@ -809,7 +1204,7 @@ mod tests {
             .is_some_and(|coin| !coin.eq_ignore_ascii_case(QUOTE));
         assert!(mismatch);
         // 解析本身不受影响，过滤发生在 fetch_all 里
-        assert!(parse_row(&row, Some(&detail), None).is_some());
+        assert!(parse_row(&row, None, Some(&detail), None).is_some());
     }
 
     #[test]

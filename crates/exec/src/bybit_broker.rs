@@ -650,6 +650,7 @@ impl Broker for BybitBroker {
     }
 
     async fn place(&self, order: &NewOrder) -> ArbResult<OrderAck> {
+        crate::broker::refuse_post_only(order)?;
         self.options.authorize(Venue::Bybit)?;
         let _submission = self.submit.lock().await;
         if order.venue != Venue::Bybit || order.client_order_id.0.is_empty() {
@@ -1136,6 +1137,7 @@ fn synthetic_order(remote: &RemoteOrder) -> ArbResult<NewOrder> {
     let qty = decimal(&remote.qty)?;
     let price = decimal_opt(&remote.price).filter(|price| *price > Decimal::ZERO);
     Ok(NewOrder {
+        post_only: false,
         margin_mode: crate::MarginMode::Isolated,
         client_order_id: ClientOrderId(format!("{EXTERNAL_PREFIX}{}", remote.order_id)),
         venue: Venue::Bybit,
@@ -1452,6 +1454,7 @@ mod tests {
 
     fn order(quantity: Option<Decimal>, reduce_only: bool) -> NewOrder {
         NewOrder {
+            post_only: false,
             margin_mode: crate::MarginMode::Isolated,
             client_order_id: ClientOrderId("live-1-buy-0".into()),
             venue: Venue::Bybit,

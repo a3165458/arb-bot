@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod logging;
 pub mod money;
+pub mod new_york;
 pub mod types;
 
 pub use config::{

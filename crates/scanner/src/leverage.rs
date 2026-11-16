@@ -438,6 +438,8 @@ mod tests {
             daily_spread: Decimal::ZERO,
             apr: funding_apr,
             round_trip_fee: Decimal::ZERO,
+            long_fee: Decimal::ZERO,
+            short_fee: Decimal::ZERO,
             round_trip_spread: None,
             round_trip_cost: Decimal::ZERO,
             spread_unknown: true,

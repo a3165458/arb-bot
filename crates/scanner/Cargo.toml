@@ -22,4 +22,5 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 rust_decimal_macros = { workspace = true }

@@ -9,9 +9,12 @@
 //!
 //! # 能做什么
 //!
-//! 只有只读查询（状态、持仓与盈亏、今日盈亏、账户可用保证金、当前最优机会）、告警静音，
-//! 以及「暂停 / 恢复开新仓」。**没有下单、也没有平仓**：手机上一个手滑的按钮不该动真钱，
-//! 平仓请到面板里输仓位号确认。暂停的只是「加风险」，平仓、规则、对账照常。
+//! 只读查询（状态、持仓与盈亏、今日盈亏、账户可用保证金、当前最优机会）、告警静音，
+//! 以及「暂停 / 恢复开新仓」。暂停的只是「加风险」，平仓、规则、对账照常。
+//!
+//! **下单只有一个入口**：价差提醒下面的「🛒 下单…」按钮，而且要点两下 —— 第一下只回一条
+//! 按此刻盘口重算的确认消息，第二下「确认」才下单（见 [`order`]）。命令菜单里没有下单命令，
+//! 也**没有平仓**：平仓请到面板里输仓位号确认。`ARB_TELEGRAM_ORDERS=off` 可以去掉这个按钮。
 //!
 //! # 通道
 //!
@@ -22,7 +25,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use rust_decimal::Decimal;
@@ -30,6 +33,8 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::AppState;
+
+pub mod order;
 
 type Fut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -116,6 +121,10 @@ pub trait Backend: Send + Sync + 'static {
     /// 静音（分钟），返回实际时长；取消静音。
     fn mute(&self, minutes: u64) -> Duration;
     fn unmute(&self);
+    /// 价差提醒上的「下单…」：按票据和此刻的盘口算出要下的单，**不下单**。
+    fn order_preview(&self, ticket: String) -> Fut<Result<order::Plan, String>>;
+    /// 确认后下单：先按此刻重算、核对还是同一件事，再走下单路径。返回给人看的结果。
+    fn order_execute(&self, plan: order::Plan) -> Fut<String>;
 }
 
 // ───────────────────────────── 菜单与路由 ─────────────────────────────
@@ -152,6 +161,10 @@ pub struct Bot {
     ignored: AtomicU64,
     /// 只读查询有总时限，交易所慢请求不能永久占住查询槽位。
     query_timeout: Duration,
+    /// 确认消息上「确认」按钮的票据：说好的那一单，单次有效。
+    confirms: std::sync::Mutex<order::Tickets<order::Plan>>,
+    /// 有一单正在执行（同一时刻只下一单；执行在后台，不卡住暂停 / 恢复）。
+    ordering: Arc<AtomicBool>,
 }
 
 impl Bot {
@@ -162,6 +175,8 @@ impl Bot {
             admin,
             ignored: AtomicU64::new(0),
             query_timeout: Duration::from_secs(20),
+            confirms: std::sync::Mutex::new(order::Tickets::new(order::CONFIRM_TTL)),
+            ordering: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -259,7 +274,10 @@ impl Bot {
             // 先应答，按钮上的转圈才会停。
             self.acknowledge(callback.id.clone()).await;
             let data = callback.data.unwrap_or_default();
-            let reply = self.reply_to(&data, "").await;
+            let reply = match self.order_callback(&data).await {
+                Some(reply) => reply,
+                None => self.reply_to(&data, "").await,
+            };
             self.deliver(self.admin, reply).await;
             return;
         }
@@ -287,28 +305,120 @@ impl Bot {
         }
     }
 
-    /// 主菜单按钮。暂停 / 恢复按钮按当前状态换。
-    fn menu(&self) -> Vec<Vec<Button>> {
-        let paused = self.backend.opens_paused();
-        vec![
-            vec![button("📊 状态", "status"), button("📌 持仓", "positions")],
-            vec![
-                button("💰 今日盈亏", "daily"),
-                button("🏦 保证金", "balance"),
-            ],
-            vec![button("🔝 机会", "top")],
-            vec![
-                button("🔕 静音 1 小时", "mute"),
-                button("🔔 取消静音", "unmute"),
-            ],
-            vec![if paused {
-                button("▶️ 恢复开仓", "resume")
-            } else {
-                button("⏸ 暂停开仓", "pause")
-            }],
-        ]
+    /// 下单按钮的回调（`o:` 提醒上的「下单…」、`ok:` 确认、`no:` 取消）。不是这类回调返回 `None`。
+    async fn order_callback(&self, data: &str) -> Option<Reply> {
+        if let Some(ticket) = data.strip_prefix("o:") {
+            let preview = tokio::time::timeout(
+                self.query_timeout,
+                self.backend.order_preview(ticket.to_string()),
+            )
+            .await
+            .unwrap_or_else(|_| Err("读盘口 / 台账超时，稍后重试".into()));
+            return Some(match preview {
+                Ok(plan) => {
+                    let text = plan.prompt.clone();
+                    let button_text = plan.button.clone();
+                    let id = self
+                        .confirms
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .issue(plan, std::time::Instant::now());
+                    Reply {
+                        text,
+                        keyboard: vec![
+                            vec![button(&button_text, &format!("ok:{id}"))],
+                            vec![button("✖ 取消", &format!("no:{id}"))],
+                        ],
+                    }
+                }
+                Err(reason) => self.plain(format!("没法下单：{reason}")),
+            });
+        }
+        if let Some(id) = data.strip_prefix("no:") {
+            self.confirms
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(id);
+            return Some(self.plain("已取消，没下单。".into()));
+        }
+        let id = data.strip_prefix("ok:")?;
+        let plan = self
+            .confirms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take(id, std::time::Instant::now());
+        let Some(plan) = plan else {
+            return Some(self.plain(format!(
+                "这个确认已经过期或用过了（{} 秒内有效、只能点一次），没下单。要下请重新点提醒下面的「下单…」。",
+                order::CONFIRM_TTL.as_secs()
+            )));
+        };
+        if self.ordering.swap(true, Ordering::SeqCst) {
+            return Some(self.plain("已有一单正在执行，等它出结果再来；这次没下单。".into()));
+        }
+        warn!("Telegram 确认下单：{}", plan.summary);
+        let note = format!("⏳ 正在下单：{}…结果出来另发一条。", plan.summary);
+        // 实盘开仓要对账、现扫、两腿下单，几秒到几十秒：放到后台，轮询循环照常收 /pause。
+        let (api, backend, admin, ordering) = (
+            Arc::clone(&self.api),
+            Arc::clone(&self.backend),
+            self.admin,
+            Arc::clone(&self.ordering),
+        );
+        tokio::spawn(async move {
+            // 执行中途 panic 也要复位，否则之后每次确认都会被当成「已有一单正在执行」。
+            let busy = Busy(ordering);
+            let text = backend.order_execute(plan).await;
+            drop(busy);
+            info!("Telegram 下单结果：{text}");
+            let keyboard = menu_keyboard(backend.opens_paused());
+            if let Err(reason) = api.send(admin, text, keyboard).await {
+                warn!("Telegram 下单结果没发出去：{reason}");
+            }
+        });
+        Some(Reply {
+            text: note,
+            keyboard: Vec::new(),
+        })
     }
 
+    /// 主菜单按钮。暂停 / 恢复按钮按当前状态换。
+    fn menu(&self) -> Vec<Vec<Button>> {
+        menu_keyboard(self.backend.opens_paused())
+    }
+}
+
+/// 「有一单正在执行」的标志：离开作用域（含 panic 展开）时复位。
+struct Busy(Arc<AtomicBool>);
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 主菜单按钮（`paused`：开新仓是否已暂停）。
+fn menu_keyboard(paused: bool) -> Vec<Vec<Button>> {
+    vec![
+        vec![button("📊 状态", "status"), button("📌 持仓", "positions")],
+        vec![
+            button("💰 今日盈亏", "daily"),
+            button("🏦 保证金", "balance"),
+        ],
+        vec![button("🔝 机会", "top")],
+        vec![
+            button("🔕 静音 1 小时", "mute"),
+            button("🔔 取消静音", "unmute"),
+        ],
+        vec![if paused {
+            button("▶️ 恢复开仓", "resume")
+        } else {
+            button("⏸ 暂停开仓", "pause")
+        }],
+    ]
+}
+
+impl Bot {
     /// 路由一条命令。命令名不区分大小写；未知命令给出提示而不是沉默。
     pub async fn reply_to(&self, command: &str, args: &str) -> Reply {
         let text = match command.to_ascii_lowercase().as_str() {
@@ -320,7 +430,7 @@ impl Bot {
                 };
                 return Reply {
                     text: format!(
-                        "arb-bot 菜单：点下面的按钮，或用 / 菜单里的命令。\n只有查询和静音、暂停开仓，这里不能下单也不能平仓。{paused}"
+                        "arb-bot 菜单：点下面的按钮，或用 / 菜单里的命令。\n这里是查询、静音和暂停开仓；下单只能点价差提醒下面的「下单…」，还要再点一次确认；不能平仓。{paused}"
                     ),
                     keyboard: self.menu(),
                 };
@@ -736,7 +846,15 @@ impl Backend for AppBackend {
                             )),
                         match live.reconciliation_clean {
                             Some(true) => "✅ 干净".to_string(),
-                            Some(false) => format!("⚠️ 不一致（连续 {} 轮）", live.dirty_rounds),
+                            Some(false) => format!(
+                                "⚠️ 不一致（连续 {} 轮），冻结 {}，其余照常",
+                                live.dirty_rounds,
+                                if live.frozen.is_empty() {
+                                    "未知".to_string()
+                                } else {
+                                    live.frozen.join("、")
+                                }
+                            ),
                             None => "未知".to_string(),
                         }
                     ));
@@ -751,7 +869,7 @@ impl Backend for AppBackend {
                 }
             }
             lines.push(format!(
-                "告警：{} · 已挡掉 {} 条",
+                "告警：{} · 范围 {} · 已挡掉 {} 条",
                 match state.alerts.muted_for() {
                     Some(left) => format!(
                         "🔕 静音中（还剩 {}）",
@@ -759,6 +877,7 @@ impl Backend for AppBackend {
                     ),
                     None => "🔔 开启".to_string(),
                 },
+                state.alerts.mode().as_str(),
                 state.alerts.suppressed()
             ));
             lines.join("\n")
@@ -779,7 +898,11 @@ impl Backend for AppBackend {
                         snapshot.report.generated_at,
                         state.settings.scan_interval_sec
                     ),
-                    render_positions(&view, chrono::Utc::now())
+                    render_positions_with_book(
+                        &view,
+                        chrono::Utc::now(),
+                        &state.trade.live_book_nets().await
+                    )
                 ),
                 Err(reason) => format!("读不出持仓：{reason}"),
             }
@@ -897,12 +1020,134 @@ impl Backend for AppBackend {
     fn unmute(&self) {
         self.state.alerts.unmute();
     }
+
+    fn order_preview(&self, ticket: String) -> Fut<Result<order::Plan, String>> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let intent = state.rh_spread.order_ticket(&ticket).ok_or_else(|| {
+                format!(
+                    "这个按钮已经过期（提醒发出超过 {} 小时，或看板重启过）。等下一条提醒，或在面板上下单。",
+                    order::ALERT_TICKET_TTL.as_secs() / 3600
+                )
+            })?;
+            order_plan(&state, &intent).await
+        })
+    }
+
+    fn order_execute(&self, plan: order::Plan) -> Fut<String> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            // 确认消息发出后可能过了几十秒：重读一遍，事情变了就不下。
+            let fresh = match order_plan(&state, &plan.intent).await {
+                Ok(fresh) => fresh,
+                Err(reason) => return format!("没下单：{reason}"),
+            };
+            if let Err(reason) = order::still_valid(&plan, &fresh) {
+                return format!("没下单：{reason}");
+            }
+            let symbol = format!("{}/USDT", plan.intent.base);
+            let rules = match &plan.action {
+                order::Action::Open { rules } => rules.clone(),
+                order::Action::Add(_) => arb_exec::TaskRules::default(),
+            };
+            let body = crate::trade::auto_open_body(
+                plan.mode,
+                &symbol,
+                plan.long,
+                plan.short,
+                plan.size,
+                plan.leverage,
+                arb_exec::MarginMode::Isolated,
+                &rules,
+            );
+            match &plan.action {
+                order::Action::Open { .. } => {
+                    let body = crate::trade::with_relative_to_normal(body, plan.relative_to_normal);
+                    let (status, response) =
+                        crate::trade::open_for_auto(Arc::clone(&state), body, true).await;
+                    order::open_outcome(plan.mode, status, &response)
+                }
+                order::Action::Add(target) => {
+                    let (status, response) = crate::trade::add_for_auto(
+                        Arc::clone(&state),
+                        body,
+                        target.id.clone(),
+                        plan.max_total,
+                    )
+                    .await;
+                    order::add_outcome(&target.id, status, &response)
+                }
+            }
+        })
+    }
+}
+
+/// 按此刻的价差监控、台账与自动交易设置，算出这张票据要下的单（见 [`order::plan`]）。
+async fn order_plan(state: &AppState, intent: &order::Intent) -> Result<order::Plan, String> {
+    let settings = state.rh_auto.settings().await;
+    let live = settings.mode == crate::trade::Mode::Live;
+    if live {
+        if !state.trade.live_can_trade() {
+            return Err(if state.trade.live_opt().is_some() {
+                "实盘是只读模式（ARB_WEB_LIVE=readonly），不能下单".into()
+            } else {
+                "实盘账户没连上，等重连后再点".into()
+            });
+        }
+        if state.trade.opens_paused() {
+            return Err("开新仓已暂停（/pause）：发 /resume 恢复后再点".into());
+        }
+    }
+    let view = state.rh_spread.view().await;
+    let exposed = state.trade.exposed_positions(live).await?;
+    let targets = state.trade.add_targets(live).await?;
+    let max_size = state
+        .settings
+        .max_position_usdt
+        .and_then(Decimal::from_f64_retain);
+    let venues: Option<Vec<arb_core::Venue>> =
+        state.trade.live_venues().map(<[arb_core::Venue]>::to_vec);
+    let tradable = |venue: arb_core::Venue| {
+        !live
+            || venues
+                .as_ref()
+                .is_some_and(|venues| venues.contains(&venue))
+    };
+    order::plan(
+        &view,
+        intent,
+        &settings,
+        &exposed,
+        &targets,
+        max_size,
+        &tradable,
+        chrono::Utc::now(),
+    )
 }
 
 /// 持仓列表的文字版：每笔一段，价格盈亏、手续费、资金费与合计分开写。
+/// 「净收益」一行：按盘口现在整笔平仓的预估（含平仓费、穿价与资金费）；没核对过写明，不拿标记价顶替。
+fn book_net_line(net: Option<Decimal>) -> String {
+    format!(
+        "净收益（按盘口现在平仓，含平仓费与资金费）：{}",
+        net.map_or("未核对（等下一轮规则轮）".to_string(), money)
+    )
+}
+
+#[cfg(test)]
 pub fn render_positions(
     view: &crate::strategy::Positions,
     now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    render_positions_with_book(view, now, &std::collections::HashMap::new())
+}
+
+/// 同 [`render_positions`]；`book_nets`（仓位 id → 按盘口现在整笔平仓、含资金费的净额）来自上一轮规则轮。
+/// 「净收益」一律按它写，没有的写「未核对」，不拿标记价顶替。
+pub fn render_positions_with_book(
+    view: &crate::strategy::Positions,
+    now: chrono::DateTime<chrono::Utc>,
+    book_nets: &std::collections::HashMap<String, Decimal>,
 ) -> String {
     if view.open.is_empty() {
         return "📌 当前没有未平仓位。".into();
@@ -950,17 +1195,15 @@ pub fn render_positions(
         let funding = item.funding.as_ref().and_then(|funding| funding.total_usdt);
         match (pnl.and_then(|pnl| pnl.price_pnl_usdt), pnl) {
             (Some(price), Some(pnl)) => {
-                let total = item
-                    .evaluation
-                    .as_ref()
-                    .and_then(|evaluation| evaluation.observation.net_with_funding_usdt);
+                // 标记价会偏离真实成交价（某次实盘：标记价净收益为正、盘口净额为负）：
+                // 价格盈亏这行按标记价，只列明细；「净收益」按盘口。
                 lines.push(format!(
-                    "价格 {} · 手续费 -${} · 资金费 {} → 合计 {}",
+                    "标记价盈亏 {} · 手续费 -${} · 资金费 {}",
                     money(price),
                     pnl.fees_usdt.round_dp(2),
                     funding.map_or("未知".to_string(), money),
-                    total.map_or("未知".to_string(), money)
                 ));
+                lines.push(book_net_line(book_nets.get(&position.id).copied()));
             }
             _ => lines.push("盈亏：这一轮缺行情，算不出".into()),
         }
@@ -1049,6 +1292,15 @@ pub fn spawn(state: &Arc<AppState>, client: &reqwest::Client) {
         admin,
     ));
     info!("Telegram 命令机器人已启动（只有管理员的私聊能用）");
+    // 价差提醒下面的「下单…」：点击只有管理员私聊能通过授权，所以告警得正好发到管理员私聊才挂按钮。
+    if var("ARB_TELEGRAM_ORDERS").is_some_and(|value| value.eq_ignore_ascii_case("off")) {
+        info!("价差提醒不挂下单按钮（ARB_TELEGRAM_ORDERS=off）");
+    } else if chat.parse::<i64>().ok() == Some(admin) {
+        state.alerts.enable_actions();
+        info!("价差提醒下面会挂「下单…」按钮：两步确认，按价差自动交易的数量、杠杆与规则下单");
+    } else {
+        info!("价差提醒不挂下单按钮：告警发到的不是管理员私聊，按钮点了也会被忽略");
+    }
     tokio::spawn(run(bot));
 }
 

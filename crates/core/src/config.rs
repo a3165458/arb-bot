@@ -78,6 +78,8 @@ pub struct Settings {
     pub max_position_usdt: Option<f64>,
     /// 单日最大亏损（计价币）。
     pub max_daily_loss_usdt: f64,
+    /// 同时持有的最大仓位数（账户级，手动与自动合计）。`None` = 不限（`ARB_MAX_OPEN_POSITIONS=off`）。
+    pub max_open_positions: Option<usize>,
     /// 价差套利的计划持有天数（预期基差收敛要多久）。
     pub spread_hold_days: Decimal,
     /// 不利入场基差的上限（%，正数）。`None` = 不设门槛。
@@ -107,6 +109,9 @@ impl Settings {
             min_venues: env_usize("ARB_MIN_VENUES", 2)?,
             max_position_usdt: env_optional_f64("ARB_MAX_POSITION_USDT", Some(1_000.0))?,
             max_daily_loss_usdt: env_f64("ARB_MAX_DAILY_LOSS_USDT", 100.0)?,
+            max_open_positions: parse_open_positions(
+                std::env::var("ARB_MAX_OPEN_POSITIONS").ok().as_deref(),
+            )?,
             spread_hold_days: env_decimal("ARB_SPREAD_HOLD_DAYS", DEFAULT_SPREAD_HOLD_DAYS)?,
             max_entry_basis_pct: env_optional_decimal(
                 "ARB_MAX_ENTRY_BASIS_PCT",
@@ -227,6 +232,22 @@ fn env_decimal(name: &str, default: &str) -> ArbResult<Decimal> {
 
 /// 解析可关闭的十进制配置。`off` / `none` / `-` / 空串表示关闭（`None`）。
 /// 数字，或 `off` / `none` / `-`（空串）表示不设。没配用 `default`。
+/// `ARB_MAX_OPEN_POSITIONS`：没设 = 5；`off` = 不限；否则 1～10000 的整数。
+fn parse_open_positions(raw: Option<&str>) -> ArbResult<Option<usize>> {
+    let Some(raw) = raw else {
+        return Ok(Some(5));
+    };
+    let Some(n) = parse_optional_f64("ARB_MAX_OPEN_POSITIONS", raw)? else {
+        return Ok(None);
+    };
+    if n.fract() != 0.0 || !(1.0..=10_000.0).contains(&n) {
+        return Err(ArbError::config(format!(
+            "ARB_MAX_OPEN_POSITIONS 必须是 1 到 10000 的整数或 off，收到 {raw:?}"
+        )));
+    }
+    Ok(Some(n as usize))
+}
+
 fn env_optional_f64(name: &str, default: Option<f64>) -> ArbResult<Option<f64>> {
     let raw = match std::env::var(name) {
         Err(std::env::VarError::NotPresent) => return Ok(default),
@@ -346,12 +367,26 @@ mod tests {
             scan_interval_sec: 60,
             max_position_usdt: Some(1_000.0),
             max_daily_loss_usdt: 100.0,
+            max_open_positions: Some(5),
             spread_hold_days: Decimal::from(3u32),
             min_venues,
             max_entry_basis_pct: Some(Decimal::new(5, 1)),
             leverage: Decimal::from(3u32),
             log_filter: "info".into(),
         }
+    }
+
+    #[test]
+    fn max_open_positions_defaults_to_five_and_off_means_unlimited() {
+        let parse = |raw: &str| parse_open_positions(Some(raw));
+        assert_eq!(parse_open_positions(None).unwrap(), Some(5));
+        assert_eq!(parse("off").unwrap(), None);
+        assert_eq!(parse("").unwrap(), None);
+        assert_eq!(parse("20").unwrap(), Some(20));
+        assert!(parse("0").is_err(), "0 不是「不限」，要写 off");
+        assert!(parse("2.5").is_err());
+        assert!(parse("100000").is_err());
+        assert!(parse("lots").is_err());
     }
 
     #[test]

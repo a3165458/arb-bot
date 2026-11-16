@@ -82,6 +82,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -104,6 +105,8 @@ use crate::live_common::{
 };
 use crate::types::{ClientOrderId, NewOrder, OrderAck, OrderState, OrderStatus};
 
+mod order_feed;
+
 const VENUE: Venue = Venue::Arcus;
 /// 测试网基址。只用于诊断「这把 key 是不是在测试网生成的」，从不在测试网交易。
 const TESTNET_URL: &str = "https://api.testnet.arcus.xyz";
@@ -120,6 +123,15 @@ const PAGE_LIMIT: usize = 1000;
 /// 按 `orderId` 回查：每 200ms 一次，最多 10 秒（每次权重 2）。
 const ORDER_POLL: Duration = Duration::from_millis(200);
 const ORDER_POLLS: usize = 50;
+/// 推送连着时，下单后最多等推送这么久（同时照常轮询，谁先到用谁）；和轮询的上限一样长。
+const PUSH_WAIT: Duration = Duration::from_secs(10);
+/// 只减仓单核对持仓对不上时的重读间隔（共约 1.5 秒），见 [`ArcusBroker::check_reduces`]。
+const POSITION_REREADS: [Duration; 4] = [
+    Duration::from_millis(250),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_millis(500),
+];
 /// 按客户订单号翻历史：每次权重 20+，所以慢一点、少几次。
 const HISTORY_POLL: Duration = Duration::from_millis(1000);
 const HISTORY_POLLS: usize = 6;
@@ -137,11 +149,24 @@ const MARGIN_CONFIRM_RATIO: Decimal = Decimal::from_parts(99, 0, 0, false, 2);
 const MARGIN_PATH: &str = "/v1/adjustIsolatedMargin";
 /// 旧式签名消息里的动作名：路径的最后一段。
 const MARGIN_ACTION: &str = "adjustIsolatedMargin";
-/// 成交记录可能比订单状态晚一点出现：400ms 一次，最多约 5 秒（原来 1 秒一次、5 次）。
-/// 它在下单之后，不影响成交价，但它是 Arcus 当第一腿时两腿之间的一段、也决定下完单要等多久才看到结果。
-/// `/v1/fills` 每次权重 20、出口 IP 的预算是每分钟 1500，所以不再更密。
-const FILLS_POLL: Duration = Duration::from_millis(400);
-const FILLS_POLLS: usize = 12;
+/// 成交记录可能比订单状态晚一点出现：数量对不上就隔一会再查，间隔由短到长、合计约 4.4 秒
+/// （原来固定 400ms 一次、12 次）。推送 0.1 秒就确认全部成交，之后固定等 400ms 让每笔
+/// 第二腿、平仓多花 0.4～0.8 秒（11-07～11-14 一次成交的第二腿 576 / 1001 / 1080ms）。
+/// `/v1/fills` 每次权重 20、出口 IP 的预算是每分钟 1500：最多 13 次、只多一次，密的只有头几次。
+const FILLS_RETRY: [Duration; 12] = [
+    Duration::from_millis(60),
+    Duration::from_millis(100),
+    Duration::from_millis(160),
+    Duration::from_millis(280),
+    Duration::from_millis(400),
+    Duration::from_millis(400),
+    Duration::from_millis(400),
+    Duration::from_millis(400),
+    Duration::from_millis(400),
+    Duration::from_millis(600),
+    Duration::from_millis(600),
+    Duration::from_millis(600),
+];
 /// 市场列表（`/v1/markets`，约 0.3 秒一次）在这个时间内复用：下单前后各要读一次，
 /// 开仓前的预热会强制刷新一遍，所以这一笔用的元数据至多几秒钟。
 const MARKETS_TTL: Duration = Duration::from_secs(20);
@@ -149,6 +174,12 @@ const MARKETS_TTL: Duration = Duration::from_secs(20);
 const LEVERAGE_VERIFIED_TTL: Duration = Duration::from_secs(20);
 /// 查成交时把起点往前放，订单的 `createdAt`（网关时刻）可能比成交时刻还晚几毫秒。
 const FILLS_LOOKBACK_US: i64 = 60_000_000;
+/// 按公开逐笔成交核算成交额（[`ArcusBroker::exact_notional`]）：在订单创建时刻前后各这么久里找。
+/// 下的都是 IOC，成交与创建是同一刻（实测逐笔的时间比 `createdAt` 早几毫秒）。
+const TRADES_WINDOW_US: i64 = 10_000_000;
+/// 逐笔成交可能比 `/v1/fills` 晚一点出现：与成交记录并发查的那一次数量对不上，隔一会再查，
+/// 合计只等 300ms（和原来一样）。平仓、第二腿也走这里，不为它多等。
+const TRADES_RETRY: [Duration; 2] = [Duration::from_millis(80), Duration::from_millis(220)];
 /// API key 剩余有效期低于这个就提醒。
 const KEY_EXPIRY_WARN_MS: i64 = 7 * 86_400_000;
 
@@ -189,12 +220,36 @@ pub struct ArcusBroker {
     markets_cache: Cached<Vec<ArcusMarket>>,
     /// 刚核对（或设置）并读回确认过的（市场, 杠杆）及时刻。
     verified_leverage: Verified<(u16, u32, crate::MarginMode)>,
+    /// 账户订单推送（[`order_feed`]）：开启下单时才连；没有或断了就只靠 REST 轮询。
+    orders: Option<Arc<order_feed::OrderFeed>>,
 }
 
 /// HTTP 状态 + 已解析的 JSON 体（解析失败时是 `Null`）。
 struct Reply {
     status: StatusCode,
     body: Value,
+}
+
+/// [`ArcusBroker::submit_order`] 的结果：一次到位，或待核实（见 [`Broker::place_for_hedge`]）。
+enum Submitted {
+    Ack(OrderAck),
+    Provisional(Box<OrderState>),
+}
+
+/// 订单终态是谁先确认的（[`ArcusBroker::resolve`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Via {
+    Push,
+    Rest,
+}
+
+impl Via {
+    fn label(self) -> &'static str {
+        match self {
+            Via::Push => "推送",
+            Via::Rest => "轮询",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -210,6 +265,9 @@ struct OrderRow {
     original_size: String,
     #[serde(default)]
     filled_size: Option<String>,
+    /// 成交均价。吃了多个价位时是**截到价格小数位**的（见 [`ArcusBroker::exact_notional`]），只当估计用。
+    #[serde(default)]
+    avg_fill_price: Option<String>,
     remaining_size: String,
     #[serde(default)]
     reduce_only: Option<bool>,
@@ -238,6 +296,23 @@ struct FillRow {
 #[derive(Deserialize)]
 struct FillsPage {
     fills: Vec<FillRow>,
+}
+
+/// 公开逐笔成交（`GET /v1/trades`）：一个价位一行，吃单、挂单的订单号都在里面。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TradeRow {
+    size: String,
+    price: String,
+    #[serde(default)]
+    taker_order_id: Option<String>,
+    #[serde(default)]
+    maker_order_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TradesPage {
+    trades: Vec<TradeRow>,
 }
 
 #[derive(Deserialize)]
@@ -345,6 +420,7 @@ impl ArcusBroker {
             submit: Mutex::new(()),
             markets_cache: Cached::new(),
             verified_leverage: Verified::new(LEVERAGE_VERIFIED_TTL),
+            orders: None,
         };
         broker.sync_clock().await?;
         broker.check_api_key(&seed_digest).await?;
@@ -352,6 +428,9 @@ impl ArcusBroker {
         broker.taker_fee = fetch_base_taker_fee(&broker.client).await?;
         if broker.options.trading_enabled {
             broker.signing_self_test().await?;
+            let feed = order_feed::OrderFeed::new(broker.address.clone(), broker.account_index);
+            feed.spawn(order_feed::STREAM_URL.to_string());
+            broker.orders = Some(feed);
         }
         Ok(broker)
     }
@@ -606,16 +685,30 @@ impl ArcusBroker {
         if let Some(limit) = order.limit_price {
             return Ok(limit);
         }
-        let started = Instant::now();
-        let reply = self
-            .get(
-                &format!("/v1/l2OrderBook/{}", instrument.market.market_display_name),
-                &[("nLevels", "5".to_string())],
-            )
-            .await?;
-        if started.elapsed() > Duration::from_secs(2) {
-            return Err(err("盘口往返超过 2 秒，价格已过时"));
+        // 没有限价的都是平仓 / 回滚 / 减仓：盘口往返超过 2 秒（可能已经旧了）就重拉一次，还慢就照样平、价格保护放宽一倍
+        // —— 拒单只会让单腿一直裸着（11-07 审查）。盘口自己的时间戳太旧照旧拒（那是数据旧，不是网络慢）。
+        let mut widen = Decimal::ONE;
+        let mut reply = None;
+        for attempt in 0..2 {
+            let started = Instant::now();
+            let fetched = self
+                .get(
+                    &format!("/v1/l2OrderBook/{}", instrument.market.market_display_name),
+                    &[("nLevels", "5".to_string())],
+                )
+                .await?;
+            let slow = started.elapsed() > Duration::from_secs(2);
+            reply = Some(fetched);
+            if !slow {
+                break;
+            }
+            if attempt == 1 {
+                widen = Decimal::TWO;
+                tracing::warn!(market = %instrument.market.market_display_name,
+                    "盘口往返两次都超过 2 秒：照样平，价格保护放宽一倍");
+            }
         }
+        let reply = reply.ok_or_else(|| err("盘口没拉到"))?;
         if reply.status != StatusCode::OK {
             return Err(http_error("/v1/l2OrderBook", &reply));
         }
@@ -642,7 +735,8 @@ impl ArcusBroker {
         if bid.is_none() || ask.is_none() {
             return Err(err("盘口两侧必须都有挂单"));
         }
-        self.options.bound_price(VENUE, order.side, bid, ask)
+        self.options
+            .bound_price_widened(VENUE, order.side, bid, ask, widen)
     }
 
     /// 读回这个市场的杠杆与保证金模式。
@@ -862,8 +956,27 @@ impl ArcusBroker {
         Ok(found)
     }
 
-    /// 下单后等到终态：有 `orderId` 就按它查，否则翻历史。返回最后一次看到的行。
+    /// 下单后等到终态。推送连着时与轮询赛跑：推送里先看到全部成交就用推送的那一行（和
+    /// `GET /v1/order` 同形状，之后照样按成交记录核算），否则等轮询（[`Self::poll_resolve`]）。
     async fn resolve(
+        &self,
+        market_id: u16,
+        order_id: Option<&str>,
+        client_id: &str,
+    ) -> ArbResult<(Option<OrderRow>, Via)> {
+        let polled = self.poll_resolve(market_id, order_id, client_id);
+        if let Some(feed) = self.orders.as_ref().filter(|feed| feed.is_connected()) {
+            let pushed = feed.wait_filled(client_id, market_id, PUSH_WAIT);
+            tokio::select! {
+                polled = polled => return Ok((polled?, Via::Rest)),
+                Some(row) = pushed => return Ok((Some(row), Via::Push)),
+            }
+        }
+        Ok((polled.await?, Via::Rest))
+    }
+
+    /// 轮询到终态：有 `orderId` 就按它查，否则翻历史。返回最后一次看到的行。
+    async fn poll_resolve(
         &self,
         market_id: u16,
         order_id: Option<&str>,
@@ -898,10 +1011,12 @@ impl ArcusBroker {
 
     /// 一笔订单的全部成交：数量、名义、手续费（正 = 成本）。与订单的已成交量不符时
     /// 等一会再查（成交记录可能晚到），最终不符就报错 —— 手续费不可信就不能记账。
+    /// 成交额按公开逐笔核算（[`Self::exact_notional`]）；手续费以 `/v1/fills` 为准。
     async fn fills_of(
         &self,
         row: &OrderRow,
         filled: Decimal,
+        market_name: &str,
     ) -> ArbResult<(Decimal, Decimal, Decimal)> {
         let from = row
             .created_at
@@ -911,20 +1026,127 @@ impl ArcusBroker {
         query.push(("market", row.market_id.to_string()));
         query.push(("from", from.to_string()));
         query.push(("limit", PAGE_LIMIT.to_string()));
-        for attempt in 0..FILLS_POLLS {
-            if attempt > 0 {
-                tokio::time::sleep(FILLS_POLL).await;
-            }
-            let page: FillsPage = self.get_ok("/v1/fills", &query).await?;
+        // 每次都把逐笔和成交记录并发查：成交记录对上的那一次，逐笔多半也在了，核算成交额
+        // 不多占一个串行往返（逐笔还没到的话 [`Self::exact_notional`] 自己会再查）。
+        let started = Instant::now();
+        let mut waits = FILLS_RETRY.iter();
+        let mut reads = 0_usize;
+        loop {
+            let (page, trades) = tokio::join!(
+                self.get_ok::<FillsPage>("/v1/fills", &query),
+                self.trades_near(row, market_name)
+            );
+            let page = page?;
+            reads += 1;
             if page.fills.len() >= PAGE_LIMIT {
                 return Err(err("成交记录满页，可能被截断，手续费不可信"));
             }
-            let totals = aggregate_fills(page.fills.iter().filter(|f| f.order_id == row.order_id))?;
-            if totals.0 == filled {
-                return Ok(totals);
+            let (quantity, notional, fee) =
+                aggregate_fills(page.fills.iter().filter(|f| f.order_id == row.order_id))?;
+            if quantity == filled {
+                if reads > 1 {
+                    tracing::info!(
+                        order = %row.order_id,
+                        market = market_name,
+                        reads,
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "Arcus 成交记录回查：多读了几次才齐"
+                    );
+                }
+                let notional = self
+                    .exact_notional(row, market_name, quantity, notional, Some(trades))
+                    .await;
+                return Ok((quantity, notional, fee));
+            }
+            match waits.next() {
+                Some(wait) => tokio::time::sleep(*wait).await,
+                None => break,
             }
         }
         Err(err("成交记录与订单成交量不一致，手续费不可信"))
+    }
+
+    /// 订单创建时刻前后 [`TRADES_WINDOW_US`] 内这个市场的公开逐笔成交。
+    async fn trades_near(&self, row: &OrderRow, market_name: &str) -> ArbResult<TradesPage> {
+        let created = row
+            .created_at
+            .ok_or_else(|| err("订单缺创建时刻，无法定位逐笔成交"))?;
+        let query = [
+            ("market", market_name.to_string()),
+            ("from", created.saturating_sub(TRADES_WINDOW_US).to_string()),
+            ("to", created.saturating_add(TRADES_WINDOW_US).to_string()),
+            ("limit", PAGE_LIMIT.to_string()),
+        ];
+        self.get_ok("/v1/trades", &query).await
+    }
+
+    /// 这笔订单按公开逐笔成交（`GET /v1/trades`，按订单号对）算出的精确成交额。
+    ///
+    /// `/v1/fills`、订单的 `avgFillPrice` 与持仓的 `averageEntryPrice` 在一笔订单吃了多个价位时只给
+    /// **截到价格小数位**的均价：某次实盘 买入 130.246331 @ 5.364 + 18.64628 @ 5.363，三处都报
+    /// 5.363，按它算的名义少了 0.13 USDT（持仓的 `borrowedCapital` 798.6413 与按名义收的手续费都是按逐笔算的）。
+    /// 逐笔对不上数量（还没出现、满页、查询失败、偏得离谱）就用 `fallback`（fills 的数）并警告 ——
+    /// 不能因为它让一笔订单查不出来。
+    ///
+    /// `prefetched` 是与成交记录并发查好的第一页（[`Self::fills_of`]）；没有就现查。
+    async fn exact_notional(
+        &self,
+        row: &OrderRow,
+        market_name: &str,
+        quantity: Decimal,
+        fallback: Decimal,
+        mut prefetched: Option<ArbResult<TradesPage>>,
+    ) -> Decimal {
+        let mut last = String::from("逐笔里数量对不上");
+        let mut waits = TRADES_RETRY.iter();
+        let mut first = true;
+        loop {
+            if !first {
+                match waits.next() {
+                    Some(wait) => tokio::time::sleep(*wait).await,
+                    None => break,
+                }
+            }
+            first = false;
+            let page = match prefetched.take() {
+                Some(page) => page,
+                None => self.trades_near(row, market_name).await,
+            };
+            let page = match page {
+                Ok(page) => page,
+                Err(error) => {
+                    last = error.to_string();
+                    continue;
+                }
+            };
+            if page.trades.len() >= PAGE_LIMIT {
+                last = "逐笔成交满页，可能被截断".into();
+                break;
+            }
+            match trade_totals(&page.trades, &row.order_id) {
+                Ok((traded, notional)) if traded == quantity => {
+                    // 截断只差价格的最后一位：差出 1% 说明对错了单，不用。
+                    if fallback > Decimal::ZERO
+                        && ((notional - fallback).abs() / fallback) > Decimal::new(1, 2)
+                    {
+                        last = format!("逐笔算出 {notional}，与成交记录的 {fallback} 差得太多");
+                        break;
+                    }
+                    return notional;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    last = error.to_string();
+                    break;
+                }
+            }
+        }
+        tracing::warn!(
+            order = %row.order_id,
+            market = market_name,
+            "没能按逐笔成交核算成交额（{last}），按成交记录的均价记：吃了多个价位时会差价格的最后一位"
+        );
+        fallback
     }
 
     /// 交易所订单行 → 完整订单状态（含成交与手续费）。
@@ -969,6 +1191,7 @@ impl ArcusBroker {
                 entry.order
             }
             None => NewOrder {
+                post_only: false,
                 margin_mode: crate::MarginMode::Isolated,
                 client_order_id: ClientOrderId(format!("{EXTERNAL_PREFIX}{}", row.order_id)),
                 venue: VENUE,
@@ -983,7 +1206,8 @@ impl ArcusBroker {
         };
 
         let (quantity, notional, fee) = if filled > Decimal::ZERO {
-            self.fills_of(row, filled).await?
+            self.fills_of(row, filled, &market.market_display_name)
+                .await?
         } else {
             (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)
         };
@@ -1021,6 +1245,7 @@ impl ArcusBroker {
         let row = self
             .resolve(market_id, known.as_deref(), &entry.venue_client_id)
             .await?
+            .0
             .ok_or_else(|| err("已预约的订单号在交易所查不到；不能当作从未提交，请人工对账"))?;
         let state = self.state_from_row(&row, &self.market_map().await?).await?;
         if !state.status.is_live() {
@@ -1028,19 +1253,9 @@ impl ArcusBroker {
         }
         Ok(state)
     }
-}
-
-#[async_trait]
-impl Broker for ArcusBroker {
-    fn venue(&self) -> Venue {
-        VENUE
-    }
-
-    fn fee_per_side(&self) -> Decimal {
-        self.taker_fee
-    }
-
-    async fn place(&self, order: &NewOrder) -> ArbResult<OrderAck> {
+    /// [`Broker::place`] 与 [`Broker::place_for_hedge`] 的共同实现。`quick` 时订单一到终态、有成交就返回
+    /// 待核实的状态（[`Self::provisional`]）：不查成交记录与逐笔、不记终态，留给之后的 `order_state`。
+    async fn submit_order(&self, order: &NewOrder, quick: bool) -> ArbResult<Submitted> {
         self.authorize()?;
         let _submission = self.submit.lock().await;
         if order.venue != VENUE || order.client_order_id.0.is_empty() {
@@ -1059,9 +1274,9 @@ impl Broker for ArcusBroker {
                 return Err(err("client id reused with different intent/margin mode"));
             }
             if let Some(terminal) = &entry.terminal {
-                return ack(terminal);
+                return ack(terminal).map(Submitted::Ack);
             }
-            return ack(&self.lookup_reserved(&entry).await?);
+            return ack(&self.lookup_reserved(&entry).await?).map(Submitted::Ack);
         }
 
         let instrument = self.instrument(&order.symbol).await?;
@@ -1071,19 +1286,11 @@ impl Broker for ArcusBroker {
             self.configure_open(market_id, leverage, order.margin_mode)
                 .await?;
         }
-        let position = if order.reduce_only {
-            Some(
-                self.positions()
-                    .await?
-                    .into_iter()
-                    .find(|p| p.symbol == order.symbol)
-                    .ok_or_else(|| err("reduce-only 订单没有对应持仓"))?,
-            )
-        } else {
-            None
-        };
-
-        let raw_price = self.order_price(&instrument, order).await?;
+        let raw_price = bounded_price(
+            &instrument,
+            order,
+            self.order_price(&instrument, order).await?,
+        );
         let price = tiered_price(&instrument, raw_price, order.side)?;
         let units = order_units(
             VENUE,
@@ -1105,12 +1312,8 @@ impl Broker for ArcusBroker {
                 instrument.min_notional
             )));
         }
-        if let Some(position) = position {
-            let closes = (position.net_quantity > Decimal::ZERO && order.side == Side::Sell)
-                || (position.net_quantity < Decimal::ZERO && order.side == Side::Buy);
-            if !closes || units > position.net_quantity.abs() {
-                return Err(err("reduce-only 方向或数量超出持仓"));
-            }
+        if order.reduce_only {
+            self.check_reduces(order, units).await?;
         }
         let price_ticks = exact_units(price, instrument.tick)?;
         let quantity_steps = exact_units(units, instrument.step)?;
@@ -1153,6 +1356,7 @@ impl Broker for ArcusBroker {
             "timeInForce": "IOC",
             "timestamp": timestamp,
         });
+        let sent = Instant::now();
         let outcome = self
             .post_signed(
                 "/v1/placeOrder",
@@ -1180,14 +1384,23 @@ impl Broker for ArcusBroker {
                 .insert(client_id.clone(), id.clone());
         }
 
-        // 明确拒收（没进撮合）：再确认一次历史里没有，才记成拒单。
+        // 明确拒收（没进撮合）：再确认一次历史里没有，才记成拒单。确认这一下本身出错（多半也是限频）时
+        // 照样按拒单记：拒收是 HTTP 状态码给的结论，确认只是多一道保险。以前这里 `?` 直接返回、不记终态，
+        // 订单号从此永远「查不到、不得重发」，做第二腿时第一腿就一直裸着。
         if definitive {
-            if let Some(row) = self.order_by_client_id(market_id, &client_id).await? {
-                let state = self.state_from_row(&row, &self.market_map().await?).await?;
-                if !state.status.is_live() {
-                    self.journal.lock().await.record_terminal(&state)?;
+            match self.order_by_client_id(market_id, &client_id).await {
+                Ok(Some(row)) => {
+                    let state = self.state_from_row(&row, &self.market_map().await?).await?;
+                    if !state.status.is_live() {
+                        self.journal.lock().await.record_terminal(&state)?;
+                    }
+                    return ack(&state).map(Submitted::Ack);
                 }
-                return ack(&state);
+                Ok(None) => {}
+                Err(check) => {
+                    tracing::warn!(order = %order.client_order_id, error = %check,
+                        "Arcus 明确拒收后查历史没查成：按拒收记终态");
+                }
             }
             let reply = outcome.as_ref().map_err(|_| err("内部错误"))?;
             let mut rejected = OrderState::new(order.clone());
@@ -1201,22 +1414,149 @@ impl Broker for ArcusBroker {
             return Err(http_error("/v1/placeOrder", reply));
         }
 
-        match self
+        let (row, via) = self
             .resolve(market_id, order_id.as_deref(), &client_id)
-            .await?
-        {
+            .await?;
+        if let Some(row) = &row {
+            // 谁先确认、用了多久：核对推送是否生效；第二腿的总耗时减去它就是查成交记录的时间。
+            tracing::info!(
+                order = %order.client_order_id,
+                status = %row.status,
+                via = via.label(),
+                ms = sent.elapsed().as_millis() as u64,
+                "Arcus 下单后确认到终态"
+            );
+        }
+        match row {
             Some(row) => {
+                if quick && let Some(state) = self.provisional(order, &row, &instrument, units)? {
+                    return Ok(Submitted::Provisional(Box::new(state)));
+                }
                 let state = self.state_from_row(&row, &self.market_map().await?).await?;
                 if !state.status.is_live() {
                     self.journal.lock().await.record_terminal(&state)?;
                 }
-                ack(&state)
+                ack(&state).map(Submitted::Ack)
             }
             None => match outcome {
                 Err(error) => Err(error),
                 Ok(_) => Err(err("订单提交后查不到；已保留订单号，不得重发，请人工对账")),
             },
         }
+    }
+
+    /// 只减仓单要真能减：账户上有这个合约、方向相反、数量不超过持仓。下单后靠推送确认得早（约 80ms），
+    /// 紧接着的回滚 / 退零头可能赶在持仓接口跟上刚成交的那张单之前：对不上就隔一会儿重读几次（只读），
+    /// 仍对不上才拒绝。
+    async fn check_reduces(&self, order: &NewOrder, units: Decimal) -> ArbResult<()> {
+        let mut rereads = POSITION_REREADS.iter();
+        loop {
+            let position = self
+                .positions()
+                .await?
+                .into_iter()
+                .find(|p| p.symbol == order.symbol);
+            let reduces = position.as_ref().is_some_and(|position| {
+                let closes = (position.net_quantity > Decimal::ZERO && order.side == Side::Sell)
+                    || (position.net_quantity < Decimal::ZERO && order.side == Side::Buy);
+                closes && units <= position.net_quantity.abs()
+            });
+            if reduces {
+                return Ok(());
+            }
+            match rereads.next() {
+                Some(delay) => tokio::time::sleep(*delay).await,
+                None if position.is_none() => return Err(err("reduce-only 订单没有对应持仓")),
+                None => return Err(err("reduce-only 方向或数量超出持仓")),
+            }
+        }
+    }
+
+    /// 订单已到终态、有成交时的待核实状态（[`Broker::place_for_hedge`]）。数量用交易所报的已成交量（准的）；
+    /// 均价用 `avgFillPrice` 往不利方向放一个价格最小位 —— 它是截到价格小数位的（见 [`Self::exact_notional`]），
+    /// 实际均价离它不到一位 —— 且不越过订单限价；手续费按基础吃单费率估。第二腿的数量与保本价
+    /// 就按它算，偏保守只会让第二腿的限价略严，不会放宽。不满足（还活着、没成交、缺均价、和意图对不上）
+    /// 返回 `None`，走完整路径。
+    fn provisional(
+        &self,
+        order: &NewOrder,
+        row: &OrderRow,
+        instrument: &Instrument,
+        units: Decimal,
+    ) -> ArbResult<Option<OrderState>> {
+        let status = map_status(row)?;
+        let filled = filled_size(row)?;
+        if status.is_live()
+            || filled <= Decimal::ZERO
+            || row.market_id != instrument.market.market_id
+            || dec(&row.original_size)? != units
+            || parse_side(&row.side)? != order.side
+        {
+            return Ok(None);
+        }
+        let Some(reported) = row
+            .avg_fill_price
+            .as_deref()
+            .map(dec)
+            .transpose()?
+            .filter(|price| *price > Decimal::ZERO)
+        else {
+            return Ok(None);
+        };
+        let limit = dec(&row.price)?;
+        // 取「这个价位一个 tick」和「回包最后一位」里更细的那个（同 HL）：回包会去掉末尾的 0（5.3600 报成 "5.36"），
+        // 取粗的就一放 0.01（低价合约约 0.2%），第二腿的保本价被白白收紧、多一次回滚。
+        let decimals = tier_tick(instrument, reported)
+            .normalize()
+            .scale()
+            .max(reported.scale());
+        let unit = Decimal::new(1, decimals);
+        let price = match order.side {
+            Side::Buy => (reported + unit).min(limit.max(reported)),
+            Side::Sell => (reported - unit).max(limit.min(reported)),
+        };
+        let notional = multiply(filled, price)?;
+        let mut state = OrderState::new(order.clone());
+        state.venue_order_id = Some(format!("{}:{}", row.market_id, row.order_id));
+        state.status = status;
+        state.filled_usdt = notional;
+        state.average_price = Some(price);
+        state.fee_usdt = multiply(notional, self.taker_fee)?;
+        // 手续费按基础吃单费率估、成交额按回包均价往不利方向放了一个单位：都是估的。`settle` 没核实成、执行器按它
+        // 落账时，靠这个标记让后台的 `correct_estimated_fees` 之后按成交记录改正（不打标记就永远是估的数）。
+        state.fee_estimated = true;
+        Ok(Some(state))
+    }
+}
+
+#[async_trait]
+impl Broker for ArcusBroker {
+    fn venue(&self) -> Venue {
+        VENUE
+    }
+
+    fn fee_per_side(&self) -> Decimal {
+        self.taker_fee
+    }
+
+    async fn place(&self, order: &NewOrder) -> ArbResult<OrderAck> {
+        crate::broker::refuse_post_only(order)?;
+        match self.submit_order(order, false).await? {
+            Submitted::Ack(ack) => Ok(ack),
+            Submitted::Provisional(state) => ack(&state),
+        }
+    }
+
+    async fn place_for_hedge(&self, order: &NewOrder) -> ArbResult<Option<OrderState>> {
+        match self.submit_order(order, true).await? {
+            Submitted::Ack(_) => Ok(None),
+            Submitted::Provisional(state) => Ok(Some(*state)),
+        }
+    }
+
+    /// 下单按 [`order_units`] 把数量向下取整到市场的 `step_size`。
+    async fn quantity_step(&self, symbol: &Symbol) -> ArbResult<Option<Decimal>> {
+        Ok(Some(self.instrument(symbol).await?.step))
     }
 
     async fn warm_reads(&self, symbol: &Symbol, leverage: Option<Decimal>) -> ArbResult<()> {
@@ -1970,6 +2310,27 @@ fn instrument_of(market: ArcusMarket) -> ArbResult<Instrument> {
     })
 }
 
+/// 限价收进成交价限制带（[`arb_venues::arcus::TradingBounds`]）：带外那部分本来就会让整张单被拒
+/// （`FILL_WILL_EXCEED_TRADING_BOUND`），收进来后带内有挂单的还能成交。只会让单子更保守。
+fn bounded_price(instrument: &Instrument, order: &NewOrder, price: Decimal) -> Decimal {
+    let Some(bounds) = instrument.market.trading_bounds() else {
+        return price;
+    };
+    let bounded = bounds.clamp(order.side, price);
+    if bounded != price {
+        tracing::warn!(
+            client_order_id = %order.client_order_id.0,
+            side = ?order.side,
+            limit = %price,
+            bounded = %bounded,
+            lower = %bounds.lower,
+            upper = %bounds.upper,
+            "限价在 Arcus 成交价限制带之外，收进带内"
+        );
+    }
+    bounded
+}
+
 /// 这个价格所在价格段的 tick；没有分段时用顶层 tick。
 fn tier_tick(instrument: &Instrument, price: Decimal) -> Decimal {
     for (limit, tick) in &instrument.tiers {
@@ -2062,6 +2423,24 @@ fn aggregate_fills<'a>(
         fee = add(fee, dec(&row.fee)?)?;
     }
     Ok((quantity, notional, fee))
+}
+
+/// 一笔订单在逐笔成交里的（数量, 名义）。
+fn trade_totals(rows: &[TradeRow], order_id: &str) -> ArbResult<(Decimal, Decimal)> {
+    let (mut quantity, mut notional) = (Decimal::ZERO, Decimal::ZERO);
+    for row in rows.iter().filter(|row| {
+        row.taker_order_id.as_deref() == Some(order_id)
+            || row.maker_order_id.as_deref() == Some(order_id)
+    }) {
+        let size = dec(&row.size)?;
+        let price = dec(&row.price)?;
+        if size <= Decimal::ZERO || price <= Decimal::ZERO {
+            return Err(err("逐笔成交的数量与价格必须为正"));
+        }
+        quantity = add(quantity, size)?;
+        notional = add(notional, multiply(size, price)?)?;
+    }
+    Ok((quantity, notional))
 }
 
 fn positions_from(
@@ -2308,6 +2687,39 @@ mod tests {
         raw.parse().unwrap()
     }
 
+    /// 报给执行器的步长（`stepSize`）和下单取整（[`order_units`]）是同一份规格：步长整数倍的数量原样下出去
+    /// （两腿同时下靠这个对齐数量）。
+    #[test]
+    fn a_quantity_on_the_reported_step_goes_out_unchanged() {
+        let market: ArcusMarket = serde_json::from_str(r#"{"marketDisplayName":"NEAR-USD","marketId":7,"status":"ONLINE","baseAsset":"NEAR","quoteAsset":"USD","type":"PERPETUAL","tickSize":"0.0001","stepSize":"0.1","tickTiers":[],"minOrderNotional":"5","minOrderSize":"0.1","maxOrderSize":"100000","oraclePrice":"5.36","markPrice":"5.36","nextFundingRate":"0","initialMarginFraction":"0.1","maintenanceMarginFraction":"0.05"}"#).unwrap();
+        let instrument = instrument_of(market).unwrap();
+        assert_eq!(instrument.step, dec!(0.1));
+        let quantity = instrument.step * Decimal::from(1488);
+        let order = NewOrder {
+            post_only: false,
+            client_order_id: ClientOrderId("live-1-buy-0".into()),
+            venue: VENUE,
+            symbol: Symbol::perp("NEAR", "USDT"),
+            side: Side::Buy,
+            notional_usdt: quantity * dec!(5.3737),
+            quantity: Some(quantity),
+            limit_price: Some(dec!(5.3737)),
+            reduce_only: false,
+            leverage: Some(dec!(3)),
+            margin_mode: crate::MarginMode::Isolated,
+        };
+        let units = order_units(
+            VENUE,
+            &order,
+            dec!(5.3737),
+            Decimal::ONE,
+            instrument.step,
+            instrument.min_size,
+        )
+        .unwrap();
+        assert_eq!(units, dec!(148.8));
+    }
+
     #[test]
     fn a_topped_up_isolated_position_reports_its_real_margin() {
         // 2026-09-30 实测 `GET /v1/positions`（LIT 空腿，补过约 785 USDT 保证金后；开仓时是 999.14）。
@@ -2528,6 +2940,52 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_outside_the_trading_band_is_pulled_inside_it_and_unknown_bands_change_nothing() {
+        // 某次实盘：强制补腿卖价 816.67 在下限 831.38 之下，整张被拒 FILL_WILL_EXCEED_TRADING_BOUND。
+        let banded = instrument_of(
+            serde_json::from_value::<ArcusMarket>(json!({
+                "marketDisplayName": "MU-USD", "marketId": 16, "status": "ONLINE",
+                "baseAsset": "MU", "quoteAsset": "USD", "type": "PERPETUAL", "tickSize": "0.01",
+                "stepSize": "0.0000001", "minOrderNotional": "5", "minOrderSize": "0.01",
+                "maxOrderSize": "100000", "oraclePrice": "858.56", "markPrice": "859.66",
+                "nextFundingRate": "0.00001", "initialMarginFraction": "0.1",
+                "maintenanceMarginFraction": "0.066667",
+                "lowerTradingBound": "831.38", "upperTradingBound": "918.88"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut sell = near_order();
+        sell.side = Side::Sell;
+        assert_eq!(
+            bounded_price(&banded, &sell, dec!(816.666320519222)),
+            dec!(832.21138),
+            "收到下限往里 0.1%：带边本身也成交不了（2026-11-04 SLV/SPCX/SKHY）"
+        );
+        assert_eq!(bounded_price(&banded, &sell, dec!(850)), dec!(850));
+        let buy = near_order();
+        assert_eq!(bounded_price(&banded, &buy, dec!(930)), dec!(917.96112));
+        assert_eq!(bounded_price(&banded, &buy, dec!(850)), dec!(850));
+        // 没报带的市场原样。
+        let near = instrument_of(market(56, "NEAR")).unwrap();
+        assert_eq!(bounded_price(&near, &sell, dec!(1)), dec!(1));
+    }
+
+    #[test]
+    fn a_long_breakeven_limit_rounds_to_the_tick_without_getting_worse() {
+        // 第二腿的保本价（`Plan::hedged_after`）有十几位小数。
+        let near = instrument_of(market(56, "NEAR")).unwrap();
+        assert_eq!(
+            tiered_price(&near, dec!(5.364712345678), Side::Sell).unwrap(),
+            dec!(5.365)
+        );
+        assert_eq!(
+            tiered_price(&near, dec!(5.364712345678), Side::Buy).unwrap(),
+            dec!(5.364)
+        );
+    }
+
+    #[test]
     fn prices_round_within_their_tier_without_getting_worse() {
         let btc = btc_instrument();
         assert_eq!(
@@ -2675,6 +3133,7 @@ mod tests {
             submit: Mutex::new(()),
             markets_cache: Cached::new(),
             verified_leverage: Verified::new(LEVERAGE_VERIFIED_TTL),
+            orders: None,
         };
         broker.sync_clock().await.unwrap();
         assert!(broker.clock_offset_ns.abs() < 5_000_000_000);
@@ -3201,6 +3660,7 @@ mod tests {
             submit: Mutex::new(()),
             markets_cache: Cached::new(),
             verified_leverage: Verified::new(LEVERAGE_VERIFIED_TTL),
+            orders: None,
         };
         broker
             .markets_cache
@@ -3517,5 +3977,522 @@ mod tests {
         );
         assert!(!reason.contains(MARGIN_ADDRESS), "错误文本不带地址");
         assert_eq!(fake.seen("POST").len(), 1);
+    }
+
+    /// 某次实盘 买入（订单 00000000000000a1）的形状：吃了 5.364、5.363 两个价位，`avgFillPrice`、
+    /// `/v1/fills` 都报截断的 5.363。数量按本测试的步长（0.01）取整成 148.89，价位上的数量相应缩放。
+    const NEAR_ORDER: &str = "00000000000000a1";
+
+    fn near_order() -> NewOrder {
+        NewOrder {
+            post_only: false,
+            client_order_id: ClientOrderId("live-1791648010637-buy-0".into()),
+            venue: VENUE,
+            symbol: Symbol::perp("NEAR", "USDT"),
+            side: Side::Buy,
+            notional_usdt: dec!(800),
+            quantity: None,
+            limit_price: Some(dec!(5.373726)),
+            reduce_only: false,
+            leverage: Some(dec!(3)),
+            margin_mode: crate::MarginMode::Isolated,
+        }
+    }
+
+    fn near_row(client_id: &str) -> Value {
+        json!({
+            "orderId": NEAR_ORDER, "clientId": client_id, "marketId": 56,
+            "marketDisplayName": "NEAR-USD", "side": "BUY", "type": "LIMIT", "status": "FILLED",
+            "price": "5.373", "originalSize": "148.89", "filledSize": "148.89", "remainingSize": "0",
+            "avgFillPrice": "5.363", "timeInForce": "IOC", "createdAt": 1791648011437186_i64,
+            "updatedAt": 1791648011433769_i64
+        })
+    }
+
+    fn near_trades() -> Value {
+        json!({"trades": [
+            {"marketDisplayName": "NEAR-USD", "marketId": 56, "side": "BUY", "price": "5.364",
+             "size": "130.24", "timestamp": 1791648011433769_i64, "takerOrderId": NEAR_ORDER,
+             "makerOrderId": "aaaa000000000001"},
+            {"marketDisplayName": "NEAR-USD", "marketId": 56, "side": "BUY", "price": "5.363",
+             "size": "18.65", "timestamp": 1791648011433769_i64, "takerOrderId": NEAR_ORDER,
+             "makerOrderId": "aaaa000000000002"},
+            // 同一时段别人的成交：不能算进来。
+            {"marketDisplayName": "NEAR-USD", "marketId": 56, "side": "BUY", "price": "5.359",
+             "size": "507.03", "timestamp": 1791648006299192_i64, "takerOrderId": "bbbb000000000003",
+             "makerOrderId": "aaaa000000000004"}
+        ]})
+    }
+
+    /// 130.24 × 5.364 + 18.65 × 5.363。
+    fn near_exact_notional() -> Decimal {
+        dec!(130.24) * dec!(5.364) + dec!(18.65) * dec!(5.363)
+    }
+
+    async fn near_fake(trades: Value) -> (FakeArcus, String) {
+        let client_id = venue_client_id(
+            CLIENT_ID_PREFIX,
+            &near_order().client_order_id,
+            MAX_CLIENT_ID,
+        );
+        let fake = FakeArcus::start(vec![
+            (
+                "POST",
+                "/v1/placeOrder",
+                vec![(200, json!({"orderId": NEAR_ORDER}))],
+            ),
+            (
+                "GET",
+                "/v1/order/00000000000000a1",
+                vec![(200, near_row(&client_id))],
+            ),
+            (
+                "GET",
+                "/v1/fills",
+                vec![(
+                    200,
+                    json!({"fills": [{
+                        "tradeId": "15514212", "orderId": NEAR_ORDER, "marketId": 56, "side": "BUY",
+                        "size": "148.89", "price": "5.363", "fee": "0.1701", "role": "TAKER"
+                    }]}),
+                )],
+            ),
+            ("GET", "/v1/trades", vec![(200, trades)]),
+        ])
+        .await;
+        (fake, client_id)
+    }
+
+    fn near_broker(base_url: &str) -> (ArcusBroker, TempJournal) {
+        let (mut broker, journal) = margin_broker(base_url, true);
+        broker.taker_fee = dec!(0.000213);
+        broker.markets_cache.put(vec![market(56, "NEAR")]);
+        broker
+            .verified_leverage
+            .mark((56, 3, crate::MarginMode::Isolated));
+        (broker, journal)
+    }
+
+    #[test]
+    fn trade_totals_count_only_this_orders_rows() {
+        let page: TradesPage = serde_json::from_value(near_trades()).unwrap();
+        let (quantity, notional) = trade_totals(&page.trades, NEAR_ORDER).unwrap();
+        assert_eq!(quantity, dec!(148.89));
+        assert_eq!(notional, near_exact_notional());
+        // 挂单那一侧的订单号也认。
+        assert_eq!(
+            trade_totals(&page.trades, "aaaa000000000002").unwrap(),
+            (dec!(18.65), dec!(18.65) * dec!(5.363))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hedge_first_leg_returns_the_quantity_before_fills_and_settles_to_the_exact_notional()
+    {
+        let (fake, _) = near_fake(near_trades()).await;
+        let (broker, _journal) = near_broker(&fake.base_url);
+        let order = near_order();
+
+        let provisional = broker
+            .place_for_hedge(&order)
+            .await
+            .unwrap()
+            .expect("IOC 已成交：应先给出待核实的状态");
+        // 数量是准的；均价往不利方向放一位（5.363 → 5.364），不低于实际均价 5.36387。
+        assert_eq!(provisional.average_price, Some(dec!(5.364)));
+        assert_eq!(provisional.filled_usdt, dec!(148.89) * dec!(5.364));
+        assert!(provisional.filled_usdt >= near_exact_notional());
+        assert_eq!(
+            provisional.fee_usdt,
+            dec!(148.89) * dec!(5.364) * dec!(0.000213)
+        );
+        assert_eq!(provisional.status, OrderStatus::Filled);
+        assert_eq!(
+            provisional.venue_order_id.as_deref(),
+            Some("56:00000000000000a1")
+        );
+        // 第二腿发出之前不查成交记录、不查逐笔，也不记终态。
+        let targets: Vec<String> = fake
+            .seen("GET")
+            .into_iter()
+            .map(|seen| seen.target)
+            .collect();
+        assert!(
+            targets
+                .iter()
+                .all(|target| !target.starts_with("/v1/fills") && !target.starts_with("/v1/trades")),
+            "{targets:?}"
+        );
+        assert!(
+            broker
+                .journal
+                .lock()
+                .await
+                .get(&order.client_order_id)
+                .unwrap()
+                .terminal
+                .is_none()
+        );
+
+        // 之后的 order_state 去交易所拿最终状态：成交额按逐笔，手续费按成交记录。
+        let settled = broker
+            .order_state(&order.client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.filled_usdt, near_exact_notional());
+        assert_eq!(settled.fee_usdt, dec!(0.1701));
+        assert_eq!(
+            settled.average_price,
+            Some(near_exact_notional() / dec!(148.89))
+        );
+        let trades = fake
+            .seen("GET")
+            .into_iter()
+            .find(|seen| seen.target.starts_with("/v1/trades"))
+            .expect("按逐笔核算成交额");
+        assert!(
+            trades.target.contains("market=NEAR-USD"),
+            "{}",
+            trades.target
+        );
+        assert!(
+            trades.target.contains("from=1791648001437186"),
+            "{}",
+            trades.target
+        );
+        assert!(
+            trades.target.contains("to=1791648021437186"),
+            "{}",
+            trades.target
+        );
+        // 终态记下了：再查不再联网。
+        let before = fake.requests();
+        let again = broker
+            .order_state(&order.client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.filled_usdt, near_exact_notional());
+        assert_eq!(fake.requests(), before);
+    }
+
+    #[tokio::test]
+    async fn a_plain_place_records_the_exact_notional_and_falls_back_when_trades_do_not_match() {
+        let (fake, _) = near_fake(near_trades()).await;
+        let (broker, _journal) = near_broker(&fake.base_url);
+        broker.place(&near_order()).await.unwrap();
+        let state = broker
+            .order_state(&near_order().client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.filled_usdt, near_exact_notional());
+
+        // 逐笔里只有一部分（数量对不上）：按成交记录的数记，不让订单查不出来。
+        let partial = json!({"trades": [near_trades()["trades"][0].clone()]});
+        let (fake, _) = near_fake(partial).await;
+        let (broker, _journal) = near_broker(&fake.base_url);
+        broker.place(&near_order()).await.unwrap();
+        let state = broker
+            .order_state(&near_order().client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.filled_usdt, dec!(148.89) * dec!(5.363));
+        assert_eq!(state.fee_usdt, dec!(0.1701));
+        let polls = fake
+            .seen("GET")
+            .iter()
+            .filter(|seen| seen.target.starts_with("/v1/trades"))
+            .count();
+        // 与成交记录并发查的一次 + 之后每个间隔各一次。
+        assert_eq!(polls, 1 + TRADES_RETRY.len());
+    }
+
+    /// 某合约 那张单在交易所的几种样子：`status`、已成交、剩余。
+    fn near_row_as(client_id: &str, status: &str, filled: &str, remaining: &str) -> Value {
+        let mut row = near_row(client_id);
+        row["status"] = json!(status);
+        row["filledSize"] = json!(filled);
+        row["remainingSize"] = json!(remaining);
+        row
+    }
+
+    fn near_client_id() -> String {
+        venue_client_id(
+            CLIENT_ID_PREFIX,
+            &near_order().client_order_id,
+            MAX_CLIENT_ID,
+        )
+    }
+
+    /// `GET /v1/order`、`/v1/fills`、`/v1/trades` 依次给出的回复（最后一个重复）。
+    async fn near_fake_with(
+        orders: Vec<Value>,
+        fills: Vec<Value>,
+        trades: Vec<Value>,
+    ) -> FakeArcus {
+        let ok = |bodies: Vec<Value>| bodies.into_iter().map(|body| (200, body)).collect();
+        FakeArcus::start(vec![
+            (
+                "POST",
+                "/v1/placeOrder",
+                vec![(200, json!({"orderId": NEAR_ORDER}))],
+            ),
+            ("GET", "/v1/order/00000000000000a1", ok(orders)),
+            ("GET", "/v1/fills", ok(fills)),
+            ("GET", "/v1/trades", ok(trades)),
+        ])
+        .await
+    }
+
+    fn near_fills() -> Value {
+        json!({"fills": [{
+            "tradeId": "15514212", "orderId": NEAR_ORDER, "marketId": 56, "side": "BUY",
+            "size": "148.89", "price": "5.363", "fee": "0.1701", "role": "TAKER"
+        }]})
+    }
+
+    /// 推送连着、已经推来了 `pushed` 这一行。
+    fn with_feed(broker: &mut ArcusBroker, connected: bool, pushed: Value) {
+        let feed = order_feed::OrderFeed::new(MARGIN_ADDRESS.into(), 3);
+        feed.set_connected(connected);
+        feed.record([serde_json::from_value::<OrderRow>(pushed).unwrap()]);
+        broker.orders = Some(feed);
+    }
+
+    fn order_polls(fake: &FakeArcus) -> usize {
+        fake.seen("GET")
+            .iter()
+            .filter(|seen| seen.target.starts_with("/v1/order/"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_pushed_fill_releases_the_first_leg_while_rest_still_shows_the_order_open() {
+        let client_id = near_client_id();
+        // REST 一直落后（还显示 OPEN）：没有推送的话要轮询满 10 秒。
+        let fake = near_fake_with(
+            vec![near_row_as(&client_id, "OPEN", "0", "148.89")],
+            vec![near_fills()],
+            vec![near_trades()],
+        )
+        .await;
+        let (mut broker, _journal) = near_broker(&fake.base_url);
+        with_feed(&mut broker, true, near_row(&client_id));
+        let order = near_order();
+
+        let provisional =
+            tokio::time::timeout(Duration::from_secs(2), broker.place_for_hedge(&order))
+                .await
+                .expect("推送已到：不该等轮询")
+                .unwrap()
+                .expect("全部成交：给待核实状态");
+        assert_eq!(provisional.status, OrderStatus::Filled);
+        assert_eq!(provisional.average_price, Some(dec!(5.364)));
+        assert!(
+            provisional.fee_estimated,
+            "估的手续费要打标记，后台才会改正"
+        );
+        assert_eq!(provisional.filled_usdt, dec!(148.89) * dec!(5.364));
+        assert!(order_polls(&fake) <= 1, "{}", order_polls(&fake));
+        assert!(
+            broker
+                .journal
+                .lock()
+                .await
+                .get(&order.client_order_id)
+                .unwrap()
+                .terminal
+                .is_none(),
+            "待核实的不记终态"
+        );
+
+        // 之后的核实同样不等 REST 的订单行，成交额、手续费照旧按逐笔与成交记录。
+        let settled =
+            tokio::time::timeout(Duration::from_secs(2), broker.settle_hedge(&provisional))
+                .await
+                .expect("核实不该等轮询")
+                .unwrap()
+                .unwrap();
+        assert_eq!(settled.filled_usdt, near_exact_notional());
+        assert_eq!(settled.fee_usdt, dec!(0.1701));
+        assert!(
+            broker
+                .journal
+                .lock()
+                .await
+                .get(&order.client_order_id)
+                .unwrap()
+                .terminal
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_feed_or_a_partial_push_leaves_the_order_to_rest_polling() {
+        let client_id = near_client_id();
+        let cases = [
+            // 推送断了：推来过的全部成交也不用。
+            (false, near_row(&client_id)),
+            // 连着，但推来的是部分成交后撤销（IOC 没吃满）：交给 REST。
+            (true, near_row_as(&client_id, "CANCELED", "60", "88.89")),
+        ];
+        for (connected, pushed) in cases {
+            let fake = near_fake_with(
+                vec![
+                    near_row_as(&client_id, "OPEN", "0", "148.89"),
+                    near_row(&client_id),
+                ],
+                vec![near_fills()],
+                vec![near_trades()],
+            )
+            .await;
+            let (mut broker, _journal) = near_broker(&fake.base_url);
+            with_feed(&mut broker, connected, pushed);
+            let provisional = tokio::time::timeout(
+                Duration::from_secs(3),
+                broker.place_for_hedge(&near_order()),
+            )
+            .await
+            .expect("轮询第二次就到终态")
+            .unwrap()
+            .expect("REST 显示全部成交");
+            assert_eq!(provisional.filled_usdt, dec!(148.89) * dec!(5.364));
+            assert!(order_polls(&fake) >= 2, "connected={connected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_leg_confirmed_by_push_still_books_the_fee_and_exact_notional_from_rest() {
+        let client_id = near_client_id();
+        let others_only = json!({"trades": [near_trades()["trades"][2].clone()]});
+        // 推送确认得早：第一次查成交记录还没有这笔，逐笔也要晚两次才出现。
+        let fake = near_fake_with(
+            vec![near_row_as(&client_id, "OPEN", "0", "148.89")],
+            vec![json!({"fills": []}), near_fills()],
+            vec![others_only.clone(), others_only, near_trades()],
+        )
+        .await;
+        let (mut broker, _journal) = near_broker(&fake.base_url);
+        with_feed(&mut broker, true, near_row(&client_id));
+
+        tokio::time::timeout(Duration::from_secs(5), broker.place(&near_order()))
+            .await
+            .expect("推送已到：不该等轮询")
+            .unwrap();
+        assert!(order_polls(&fake) <= 1, "{}", order_polls(&fake));
+        let state = broker
+            .order_state(&near_order().client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // 不是退回成交记录的截断均价（148.89 × 5.363）：成交记录对上之后重新拉了逐笔。
+        assert_eq!(state.filled_usdt, near_exact_notional());
+        assert_eq!(state.fee_usdt, dec!(0.1701));
+        assert_eq!(state.status, OrderStatus::Filled);
+    }
+
+    /// 买回 100 某合约 平一部分空腿（只减仓）。
+    fn lit_buy_back() -> NewOrder {
+        NewOrder {
+            post_only: false,
+            client_order_id: ClientOrderId("live-1792700000000-buy-undo1".into()),
+            venue: VENUE,
+            symbol: lit(),
+            side: Side::Buy,
+            notional_usdt: dec!(410),
+            quantity: Some(dec!(100)),
+            limit_price: Some(dec!(4.1)),
+            reduce_only: true,
+            leverage: None,
+            margin_mode: crate::MarginMode::Isolated,
+        }
+    }
+
+    fn position_reads(fake: &FakeArcus) -> usize {
+        fake.seen("GET")
+            .iter()
+            .filter(|seen| seen.target.starts_with("/v1/positions"))
+            .count()
+    }
+
+    /// 下单被明确拒收（429），紧接着确认历史的那一下也被限频：照样记成拒单。以前这里直接返回、不记终态，
+    /// 订单号从此永远「查不到、不得重发」。
+    #[tokio::test]
+    async fn a_refusal_is_recorded_even_when_the_history_check_also_fails() {
+        let fake = FakeArcus::start(vec![
+            (
+                "GET",
+                "/v1/positions",
+                vec![(
+                    200,
+                    lit_positions(Some("ISOLATED"), Some("1000"), "-751.99"),
+                )],
+            ),
+            (
+                "POST",
+                "/v1/placeOrder",
+                vec![(429, json!({"error": "RATE_LIMITED"}))],
+            ),
+            (
+                "GET",
+                "/v1/orders",
+                vec![(429, json!({"error": "RATE_LIMITED"}))],
+            ),
+        ])
+        .await;
+        let (broker, _journal) = margin_broker(&fake.base_url, true);
+        let order = lit_buy_back();
+        let error = broker.place(&order).await.unwrap_err().to_string();
+        assert!(error.contains("/v1/placeOrder"), "{error}");
+        assert_eq!(fake.seen("POST").len(), 1);
+        let state = broker
+            .order_state(&order.client_order_id)
+            .await
+            .unwrap()
+            .expect("拒单有终态");
+        assert_eq!(state.status, OrderStatus::Rejected);
+    }
+
+    #[tokio::test]
+    async fn a_reduce_only_order_rereads_a_lagging_position_before_refusing() {
+        let none = json!({"positions": {}});
+        // 持仓接口还没跟上：先是没有，再是数量不够，第三次才是完整的空腿 —— 照常发单。
+        let lagging = FakeArcus::start(vec![
+            (
+                "GET",
+                "/v1/positions",
+                vec![
+                    (200, none.clone()),
+                    (200, lit_positions(Some("ISOLATED"), Some("1000"), "-50")),
+                    (
+                        200,
+                        lit_positions(Some("ISOLATED"), Some("1000"), "-751.99"),
+                    ),
+                ],
+            ),
+            (
+                "POST",
+                "/v1/placeOrder",
+                vec![(400, json!({"error": "VALIDATION_ERROR"}))],
+            ),
+            ("GET", "/v1/orders", vec![(200, json!({"orders": []}))]),
+        ])
+        .await;
+        let (broker, _journal) = margin_broker(&lagging.base_url, true);
+        let error = broker.place(&lit_buy_back()).await.unwrap_err().to_string();
+        assert!(error.contains("/v1/placeOrder"), "{error}");
+        assert_eq!(position_reads(&lagging), 3);
+        assert_eq!(lagging.seen("POST").len(), 1, "持仓跟上了就发单");
+
+        // 一直没有持仓：重读完才拒绝，不发单。
+        let never = FakeArcus::start(vec![("GET", "/v1/positions", vec![(200, none)])]).await;
+        let (broker, _journal) = margin_broker(&never.base_url, true);
+        let error = broker.place(&lit_buy_back()).await.unwrap_err().to_string();
+        assert!(error.contains("没有对应持仓"), "{error}");
+        assert_eq!(position_reads(&never), 1 + POSITION_REREADS.len());
+        assert!(never.seen("POST").is_empty());
     }
 }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arb_core::Settings;
-use arb_scanner::{ScanReport, scan};
+use arb_scanner::{RatesCache, ScanReport, scan_into};
 use arb_venues::VenueApi;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -31,6 +31,9 @@ impl Snapshot {
 #[derive(Default)]
 pub struct ScanCache {
     inner: RwLock<Option<Arc<Snapshot>>>,
+    /// 每一轮各场所的原始读数：实盘下单前的现扫只现拉两腿，其余场所沿用这里的（见
+    /// [`arb_scanner::scan_reusing`]）。
+    pub rates: Arc<RatesCache>,
 }
 
 impl ScanCache {
@@ -65,7 +68,8 @@ pub fn spawn_refresher(
             let round = {
                 let apis = Arc::clone(&apis);
                 let settings = settings.clone();
-                tokio::spawn(async move { scan(&apis, &settings).await })
+                let rates = Arc::clone(&cache.rates);
+                tokio::spawn(async move { scan_into(&apis, &settings, &rates).await })
             };
             let report = match round.await {
                 Ok(report) => report,

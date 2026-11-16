@@ -28,12 +28,17 @@ use tracing::{error, info, warn};
 mod alert;
 mod board;
 mod cache;
+mod dismissed;
+mod funding_chart;
 mod metrics;
 mod pause;
 mod precheck;
+mod preipo;
 mod rh_auto;
 mod rh_spread;
 mod shutdown;
+mod spread_chart;
+mod stats;
 mod strategy;
 mod telegram;
 mod trade;
@@ -43,6 +48,9 @@ use cache::{ScanCache, spawn_refresher};
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const STYLE_CSS: &str = include_str!("../web/style.css");
+/// TradingView Lightweight Charts v5.2.1（Apache-2.0，原样打包，不从外网加载）。许可证见
+/// `web/vendor/LICENSE.lightweight-charts`。
+const CHARTS_JS: &str = include_str!("../web/vendor/lightweight-charts.standalone.production.js");
 
 /// 前端资源随二进制一起编译进去。
 ///
@@ -81,10 +89,18 @@ async fn main() -> anyhow::Result<()> {
         .map(|ip| ip.is_loopback())
         .unwrap_or(host == "localhost");
     let alerts = alert::Alerter::from_env(&client);
-    let trade = trade::Trade::from_env(&settings, &client, &apis, loopback, &alerts).await?;
+    let trade = trade::Trade::from_env(
+        &settings,
+        &client,
+        &apis,
+        loopback,
+        &alerts,
+        Arc::clone(&cache.rates),
+    )
+    .await?;
 
     // 先跑一轮再开始服务：否则启动瞬间的请求只能拿到 503。
-    let first = arb_scanner::scan(&apis, &settings).await;
+    let first = arb_scanner::scan_into(&apis, &settings, &cache.rates).await;
     info!(
         venues_ok = first.totals.venues_ok,
         symbols = first.totals.symbols,
@@ -124,6 +140,15 @@ async fn main() -> anyhow::Result<()> {
     // Lighter RH ↔ Arcus 价差监控（只读）：行情走 WebSocket，不占 REST 限频额度。
     let rh_auto = rh_auto::AutoTrader::load(&rh_spread_config.dir);
     let rh_spread = rh_spread::Monitor::new(rh_spread_config, Arc::clone(&alerts));
+    {
+        let auto = Arc::clone(&rh_auto);
+        rh_spread.set_auto_note(Box::new(move |line, best| auto.alert_note(line, best)));
+    }
+    // 估算名义跟着自动交易的单腿名义走（面板改了也会同步，见 rh_auto::api_set）。
+    rh_spread.set_size_usdt(rh_auto.settings().await.size_usdt);
+    // 分批平仓测算：盯实盘规则轮交过来的持仓；盘口整笔到止盈的交给实盘交易台现拉盘口核对后平仓。
+    rh_spread.set_exit_source(trade.exit_source());
+    rh_spread.set_exit_trigger(trade.exit_trigger());
     rh_spread.spawn(client.clone(), Arc::clone(&cache));
 
     let bind = format!("{host}:{}", settings.http_port);
@@ -139,8 +164,11 @@ async fn main() -> anyhow::Result<()> {
     });
     let app = Router::new()
         .route("/", get(index))
+        // zuudot 风格的链接（/trading?symbol=…&exchange1=…）直接打开价差图页。
+        .route("/trading", get(index))
         .route("/app.js", get(app_js))
         .route("/style.css", get(style_css))
+        .route("/vendor/lightweight-charts.js", get(charts_js))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_page))
         .route("/api/config", get(api_config))
@@ -151,6 +179,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/plan", get(api_plan))
         .route("/api/positions", get(api_positions))
         .route("/api/rh-spread", get(api_rh_spread))
+        .route("/api/spread-chart", get(spread_chart::api_chart))
+        .route("/api/spread-chart/funding", get(funding_chart::api_funding))
         .route(
             "/api/rh-spread/auto",
             get(rh_auto::api_get).post(rh_auto::api_set),
@@ -160,6 +190,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/trade/preview", post(trade::api_trade_preview))
         .route("/api/trade/open", post(trade::api_trade_open))
         .route("/api/trade/close", post(trade::api_trade_close))
+        .route("/api/trade/add", post(trade::api_trade_add))
+        .route("/api/trade/dismiss", post(dismissed::api_dismiss))
         .route("/api/trade/monitor", post(trade::api_trade_monitor))
         .route("/api/trade/rules", post(trade::api_trade_rules))
         .route("/api/trade/round", get(trade::api_trade_round))
@@ -310,6 +342,19 @@ async fn app_js() -> impl IntoResponse {
     )
 }
 
+async fn charts_js() -> impl IntoResponse {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            NO_STORE,
+        ],
+        CHARTS_JS,
+    )
+}
+
 async fn style_css() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8"), NO_STORE],
@@ -339,6 +384,7 @@ async fn healthz(State(state): State<Arc<AppState>>) -> Response {
                 "live": live,
                 "alerts": {
                     "enabled": state.alerts.enabled(),
+                    "mode": state.alerts.mode().as_str(),
                     "suppressed": state.alerts.suppressed(),
                 },
             });
@@ -766,14 +812,19 @@ async fn api_strategy(
             // 预检结论只用公开行情；实盘的持仓数与对账结果是账户状态，和 /api/positions、
             // 实盘账户接口一样要令牌才给。
             let authorized = state.trade.authorize(&headers).is_ok();
-            let mut notes = Vec::new();
+            let mut notes: Vec<String> = Vec::new();
             if !key.live || authorized {
                 check.account_block = account_block(&state, key.live).await;
+                if key.live
+                    && let Some(note) = state.trade.live_reconcile_note().await
+                {
+                    notes.push(note);
+                }
             } else {
-                notes.push("实盘的持仓数与对账要令牌才能核对：在右上角「令牌」里填好后，挡住整张表的原因会一并显示");
+                notes.push("实盘的持仓数与对账要令牌才能核对：在右上角「令牌」里填好后，挡住整张表的原因会一并显示".into());
             }
             if key.live && state.trade.live_readonly() {
-                notes.push("实盘当前是只读（ARB_WEB_LIVE=readonly）：列出的是开启下单后能下的，现在只能预览、不能下单");
+                notes.push("实盘当前是只读（ARB_WEB_LIVE=readonly）：列出的是开启下单后能下的，现在只能预览、不能下单".into());
             }
             check.note = (!notes.is_empty()).then(|| notes.join("；"));
             check
@@ -859,7 +910,7 @@ fn precheck_rules(query: &StrategyQuery) -> Result<arb_exec::TaskRules, String> 
 /// 账户级的关：挡住的是这张表上的每一行，与合约无关。
 ///
 /// - 持仓数已到上限（与预览同一个 `max_open_positions`）；
-/// - 实盘：最近一次对账不干净或没做成（实盘预览开仓前必须对账干净）。
+/// - 实盘：最近一次对账没做成，或有归不到哪个币的不一致（只冻结了部分币时不挡整张表，另有说明）。
 async fn account_block(state: &AppState, live: bool) -> Option<String> {
     let limit = arb_exec::cli::limits_from(&state.settings).max_open_positions;
     match state.trade.open_positions(live).await {
@@ -1021,7 +1072,7 @@ fn precheck_state_path() -> std::path::PathBuf {
 }
 
 /// 纸面台账路径，与 `arb-paper --ledger` 的默认值一致。
-fn ledger_path() -> String {
+pub(crate) fn ledger_path() -> String {
     std::env::var("ARB_LEDGER").unwrap_or_else(|_| "arb-ledger.jsonl".into())
 }
 
@@ -1029,6 +1080,11 @@ fn ledger_path() -> String {
 struct PositionsQuery {
     /// `paper`（默认）或 `live`。
     mode: Option<String>,
+    /// 「最近结束」第几页（从 1 起，默认 1）、每页几笔（默认 20，最多 100）。
+    closed_page: Option<usize>,
+    closed_per_page: Option<usize>,
+    /// 「最近结束」连用户移除（隐藏）了的也列出来。
+    show_dismissed: Option<bool>,
 }
 
 /// 台账里的持仓 + 按当前快照的监控评估。只读：不创建、不修补台账文件。
@@ -1059,9 +1115,15 @@ async fn api_positions(
         }
         other => return bad_request(&format!("mode 只能是 paper 或 live，收到 {other:?}")),
     };
+    let page = strategy::ClosedPage::from_query(query.closed_page, query.closed_per_page)
+        .with_dismissed(query.show_dismissed.unwrap_or(false));
     // 实盘：带上交易所实际的保证金状态与开仓以来的资金费（读交易所，有缓存）。
     if query.mode.as_deref() == Some("live") {
-        return match state.trade.live_positions(&snapshot.report).await {
+        return match state
+            .trade
+            .live_positions_page(&snapshot.report, page)
+            .await
+        {
             Ok(view) => Json(view).into_response(),
             Err(message) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1071,13 +1133,15 @@ async fn api_positions(
         };
     }
     match arb_exec::replay_file(&path).await {
-        Ok((replayed, broken)) => Json(strategy::positions(
+        Ok((replayed, broken)) => Json(strategy::positions_page_with(
             &replayed,
             broken,
             &path,
             &snapshot.report,
             &strategy::LegStates::new(),
             None,
+            page,
+            &dismissed::load(&path),
         ))
         .into_response(),
         Err(error) => (
@@ -1234,8 +1298,52 @@ struct DepthQuery {
 }
 
 /// Lighter RH ↔ Arcus 价差监控的当前状态（只读，不含账户信息）。
-async fn api_rh_spread(State(state): State<Arc<AppState>>) -> Response {
-    Json(state.rh_spread.view().await).into_response()
+///
+/// 不带参数 = 整份（两千多行、约 2.5MB，脚本 / 排查用）。页面带筛选参数，只取要显示的那些行：
+/// `pair`（某一组）、`base`（某个合约）、`signal=1`（只要信号行）、`watch=1`（带观察组的行）、
+/// `limit`（最多多少行，按净收益从高到低）。
+async fn api_rh_spread(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RhSpreadQuery>,
+) -> Response {
+    Json(state.rh_spread.panel(&query.filter()).await).into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RhSpreadQuery {
+    pair: Option<String>,
+    base: Option<String>,
+    signal: Option<String>,
+    watch: Option<String>,
+    limit: Option<usize>,
+}
+
+impl RhSpreadQuery {
+    fn filter(self) -> rh_spread::PanelFilter {
+        let on = |flag: &Option<String>| matches!(flag.as_deref(), Some("1" | "true" | "on"));
+        let text = |value: Option<String>| {
+            value
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty() && value != "all")
+        };
+        if self.pair.is_none()
+            && self.base.is_none()
+            && self.signal.is_none()
+            && self.watch.is_none()
+            && self.limit.is_none()
+        {
+            return rh_spread::PanelFilter::full();
+        }
+        rh_spread::PanelFilter {
+            signal_only: on(&self.signal),
+            watch: on(&self.watch),
+            // 0 = 不限。
+            limit: self.limit.filter(|limit| *limit > 0),
+            pair: text(self.pair),
+            base: text(self.base),
+            full: false,
+        }
+    }
 }
 
 fn bad_request(message: &str) -> Response {

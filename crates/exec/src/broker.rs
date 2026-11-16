@@ -51,6 +51,22 @@ pub struct VenuePosition {
 pub trait Broker: Send + Sync + 'static {
     fn venue(&self) -> Venue;
     async fn place(&self, order: &NewOrder) -> ArbResult<OrderAck>;
+    /// 双腿开仓、补仓的**第一腿**用：成交数量一确定就返回，不等手续费与精确成交额 —— 第二腿只需要
+    /// 数量，早一点发出去，只有一条腿的窗口就短一点。
+    ///
+    /// 返回 `Some(状态)` = **待核实**的终态：成交数量是交易所报的准数；成交额与均价是偏保守的估计
+    /// （买单不低于、卖单不高于实际均价），手续费按费率估。券商**不得**把它当终态记下，之后的
+    /// [`Broker::settle_hedge`] 必须去交易所拿完整结果。返回 `None` = 已经一次到位，照常用
+    /// `order_state` 读。幂等与 `place` 相同。默认实现就是 `place`。
+    async fn place_for_hedge(&self, order: &NewOrder) -> ArbResult<Option<OrderState>> {
+        self.place(order).await.map(|_| None)
+    }
+    /// [`Broker::place_for_hedge`] 给出的待核实状态：去交易所读回这笔订单的完整结果（手续费、精确
+    /// 成交额）。和第二腿并行做，不在只有一条腿的窗口里。默认就是 [`Broker::order_state`]；
+    /// 读节点会落后于撮合的券商（Hyperliquid）覆盖成带轮询的版本。
+    async fn settle_hedge(&self, provisional: &OrderState) -> ArbResult<Option<OrderState>> {
+        self.order_state(&provisional.order.client_order_id).await
+    }
     /// 查一笔订单的当前状态（含累计成交与均价）。
     ///
     /// 执行层靠它判断「这条腿到底成了多少」；对账靠它发现本地不知道的订单。
@@ -61,6 +77,11 @@ pub trait Broker: Send + Sync + 'static {
     async fn positions(&self) -> ArbResult<Vec<VenuePosition>>;
     /// 单边吃单费率的回落值。风控算成本时要用。
     fn fee_per_side(&self) -> Decimal;
+    /// 这个券商能不能下**只挂单**（[`NewOrder::post_only`]）。默认不能：执行器在下单前就拒绝，
+    /// 券商自己的 `place` 也要拒绝（[`refuse_post_only`]）—— 悄悄按 IOC 发出去，等于把挂单变成吃单。
+    fn supports_post_only(&self) -> bool {
+        false
+    }
     /// 开仓前的**只读**预热：预取下单要用的市场元数据，并核对这个合约的逐仓杠杆是不是已经是目标值
     /// （是就记下，之后 [`Broker::prepare_open`] 与 `place` 不必再往返）。**不改任何设置、不下单。**
     /// 默认什么都不做。
@@ -70,6 +91,16 @@ pub trait Broker: Send + Sync + 'static {
     async fn warm_reads(&self, symbol: &Symbol, leverage: Option<Decimal>) -> ArbResult<()> {
         let _ = (symbol, leverage);
         Ok(())
+    }
+
+    /// 这个合约下单数量的步长：给 `quantity` 的开仓单，券商把数量**向零**取整到它的整数倍再发，所以给的数量
+    /// 本身就是步长的整数倍时原样下出去。必须和 `place` 取整用同一份市场规格。
+    ///
+    /// 执行器「两腿同时下」时用它把两腿凑成同一个数量（见 [`crate::executor::Executor::open`]）。默认 `None` =
+    /// 不知道：两腿照旧顺序下（第二腿按第一腿的实际成交量下）。
+    async fn quantity_step(&self, symbol: &Symbol) -> ArbResult<Option<Decimal>> {
+        let _ = symbol;
+        Ok(None)
     }
 
     /// 开仓前的准备：核对（必要时设置）这个合约的逐仓杠杆，并预取下单要用的市场元数据，
@@ -98,6 +129,20 @@ pub trait Broker: Send + Sync + 'static {
             ));
         }
         self.prepare_open(symbol, leverage).await
+    }
+
+    /// 这个合约现在在这家下不下得了单：`Some(原因)` = 下不了（休市、维护、只能平不能开……），
+    /// 这时**一单都不要发** —— 两条腿的单子只有一条下得去，就是裸着的一条腿。`reduce_only` 为真时
+    /// 只问平仓 / 减仓。默认 `None`：这家没有休市的说法。
+    ///
+    /// 查不到（列表没取到）时返回错误，由调用方决定：开仓按下不了处理，平仓照常试。
+    async fn trading_halted(
+        &self,
+        symbol: &Symbol,
+        reduce_only: bool,
+    ) -> ArbResult<Option<String>> {
+        let _ = (symbol, reduce_only);
+        Ok(None)
     }
 
     /// 这个账户在这个合约上自 `since` 起实际收付的资金费（交易所结算流水）。
@@ -441,6 +486,7 @@ impl Broker for PaperBroker {
     }
 
     async fn place(&self, order: &NewOrder) -> ArbResult<OrderAck> {
+        refuse_post_only(order)?;
         let mut state = self.state.lock().await;
 
         // 幂等：同一个 client_order_id 直接返回已有的确认。
@@ -667,6 +713,17 @@ fn estimate_quantity(
         },
         exhausted: remaining > Decimal::ZERO,
     })
+}
+
+/// 不支持只挂单的券商，在 `place` 开头调用：收到 [`NewOrder::post_only`] 就拒绝（没发出任何请求）。
+pub fn refuse_post_only(order: &NewOrder) -> ArbResult<()> {
+    if order.post_only {
+        return Err(ArbError::venue(
+            order.venue.as_str(),
+            "这个场所没有接入只挂单（post-only），不能当 IOC 悄悄发出去",
+        ));
+    }
+    Ok(())
 }
 
 /// 从批量快照里取某个场所某个合约的标记价，用于给持仓估值。

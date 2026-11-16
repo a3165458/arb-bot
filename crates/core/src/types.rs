@@ -44,11 +44,15 @@ pub enum Venue {
     Okx,
     Ourbit,
     Variational,
+    /// Ondo Perps：Ondo 的美股代币化永续（USDC 保证金，1 小时结算）。
+    Ondo,
+    /// PopDEX：链上订单簿永续（USDT 保证金，加密币与美股 / 指数 / 商品，1 小时结算）。
+    PopDex,
 }
 
 impl Venue {
     /// 全部已接入场所。用于「默认扫描全部」与配置校验。
-    pub const ALL: [Venue; 15] = [
+    pub const ALL: [Venue; 17] = [
         Venue::Arcus,
         Venue::Aster,
         Venue::Binance,
@@ -64,6 +68,8 @@ impl Venue {
         Venue::Okx,
         Venue::Ourbit,
         Venue::Variational,
+        Venue::Ondo,
+        Venue::PopDex,
     ];
 
     /// 稳定标识符。它会出现在配置、JSON 与看板里 —— 改名等于破坏下游。
@@ -84,6 +90,8 @@ impl Venue {
             Venue::Okx => "okx",
             Venue::Ourbit => "ourbit",
             Venue::Variational => "variational",
+            Venue::Ondo => "ondo",
+            Venue::PopDex => "popdex",
         }
     }
 
@@ -99,6 +107,8 @@ impl Venue {
                 | Venue::Lighter
                 | Venue::LighterRh
                 | Venue::Variational
+                | Venue::Ondo
+                | Venue::PopDex
         )
     }
 

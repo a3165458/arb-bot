@@ -246,12 +246,16 @@ fn execution_plan() -> Plan {
         expected_price: dec!(100),
         slippage: Decimal::ZERO,
         book_notional: dec!(10000),
+        fee: Decimal::ZERO,
+        maker_rest_ms: None,
     };
     Plan {
         symbol: Symbol::perp("BTC", "USDT"),
         long: leg(Venue::Binance, Side::Buy),
         short: leg(Venue::Okx, Side::Sell),
         expected_cost: Decimal::ZERO,
+        min_locked_basis: None,
+        leg_order: arb_exec::preflight::LegOrder::Slippage,
     }
 }
 async fn fixture(
@@ -367,6 +371,42 @@ async fn failed_mode_readback_or_existing_exposure_prevents_both_orders() {
         drop(ledger);
         tokio::fs::remove_file(path).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn positions_checked_by_the_caller_are_not_queried_again_before_the_first_order() {
+    // OKX 上「有持仓」只在执行器自己去查时才会挡住：调用方说已经查过（看板在拉盘口时查掉），
+    // 执行器就不再在报价之后多等这一个往返，直接做杠杆准备、下单。
+    let (executor, ledger, events, path) = fixture(false, true).await;
+    let setup = PositionSetup {
+        margin_mode: MarginMode::Isolated,
+        leverage: Some(dec!(5)),
+        positions_checked: true,
+        ..PositionSetup::default()
+    };
+    let outcome = executor
+        .open(
+            &execution_plan(),
+            Strategy::Funding,
+            Decimal::ZERO,
+            "checked",
+            &setup,
+        )
+        .await
+        .unwrap();
+    assert!(outcome.is_open());
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .prepared
+            .iter()
+            .any(|(venue, _)| *venue == Venue::Okx),
+        "杠杆准备照做"
+    );
+    drop(executor);
+    drop(ledger);
+    tokio::fs::remove_file(path).await.unwrap();
 }
 
 #[tokio::test]
